@@ -151,9 +151,7 @@ class TestEmbeddingTextConstruction:
 
         embedding_msg = updater._vikingdb.enqueue_embedding_msg.await_args.args[0]
         assert embedding_msg.context_data["search_tags"] == tags
-        assert embedding_msg.context_data["_upsert_options"] == {
-            "search_tag_mode": expected_mode
-        }
+        assert embedding_msg.context_data["_upsert_options"] == {"search_tag_mode": expected_mode}
 
     @pytest.mark.asyncio
     async def test_trajectory_vectorization_adds_source_experience_search_tags(self):
@@ -548,3 +546,29 @@ class TestEmbeddingTextConstruction:
         memory_context = mock_from_context.call_args[0][0]
         assert len(memory_context.abstract.encode("utf-8")) <= 50_000
         assert memory_context.abstract.encode("utf-8").decode("utf-8") == memory_context.abstract
+
+
+@pytest.mark.asyncio
+async def test_work_item_embedding_enqueues_the_version_of_its_source_body():
+    uri = "viking://user/alice/memories/work_item/wi_a.md"
+    updater = MemoryUpdater(registry=MemoryTypeRegistry(load_schemas=False), vikingdb=Mock())
+    updater._viking_fs = SimpleNamespace(
+        read_file=AsyncMock(
+            return_value=MemoryFileUtils.write(
+                MemoryFile(uri=uri, content="Status: waiting", extra_fields={"version": 7})
+            )
+        )
+    )
+    updater._vikingdb.enqueue_embedding_msg = AsyncMock(return_value=True)
+    result = MemoryUpdateResult()
+    result.add_written(uri)
+
+    await updater._vectorize_memories(
+        result,
+        SimpleNamespace(user=None, account_id="acme"),
+        uri_memory_type_map={uri: "work_item"},
+    )
+
+    message = updater._vikingdb.enqueue_embedding_msg.await_args.args[0]
+    assert message.context_data["meta"]["work_item_version"] == 7
+    assert "Status: waiting" in message.message

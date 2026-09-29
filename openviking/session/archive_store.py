@@ -206,6 +206,16 @@ class ArchiveStore:
                 continue
         return "pending"
 
+    async def read_done(self, archive_uri: str) -> Dict[str, Any]:
+        """Read the publication record; partial/unreadable records are not ready."""
+        try:
+            value = json.loads(
+                await self._viking_fs.read_file(f"{archive_uri}/.done", ctx=self._ctx)
+            )
+            return value if isinstance(value, dict) else {}
+        except (ValueError, FileNotFoundError, NotFoundError):
+            return {}
+
     async def list_refs(self) -> List[Dict[str, Any]]:
         """List archive refs sorted by archive index descending."""
         if not self._viking_fs:
@@ -362,7 +372,9 @@ class ArchiveStore:
     async def is_context_reset_archive(self, archive_uri: str) -> bool:
         """Return True when the archive's ``.done`` marks a context reset boundary."""
         try:
-            done = json.loads(await self._viking_fs.read_file(f"{archive_uri}/.done", ctx=self._ctx))
+            done = json.loads(
+                await self._viking_fs.read_file(f"{archive_uri}/.done", ctx=self._ctx)
+            )
         except Exception:
             return False
         return isinstance(done, dict) and done.get("context_reset") is True
@@ -374,9 +386,7 @@ class ArchiveStore:
     async def read_overview(self, archive_uri: str) -> str:
         """Read archive overview text."""
         try:
-            overview = await self._viking_fs.read_file(
-                f"{archive_uri}/.overview.md", ctx=self._ctx
-            )
+            overview = await self._viking_fs.read_file(f"{archive_uri}/.overview.md", ctx=self._ctx)
         except Exception:
             return ""
         return body_for_preview(overview or "")
@@ -384,9 +394,7 @@ class ArchiveStore:
     async def read_abstract(self, archive_uri: str, overview: str = "") -> str:
         """Read archive abstract text, falling back to summary extraction."""
         try:
-            abstract = await self._viking_fs.read_file(
-                f"{archive_uri}/.abstract.md", ctx=self._ctx
-            )
+            abstract = await self._viking_fs.read_file(f"{archive_uri}/.abstract.md", ctx=self._ctx)
         except Exception:
             abstract = ""
 

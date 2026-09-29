@@ -1,6 +1,7 @@
 import type { OVConfig } from "./config.js";
 import type { OvHttpRequestOptions } from "./shared/ov-http.mjs";
 import { createOvHttp } from "./shared/ov-http.mjs";
+import { isReadyWorkItemCheckpoint, type WorkItemCheckpoint } from "./lib/takeover-core.mjs";
 
 // --- OV API Response Shapes ---
 // All OV responses wrap in: { status: "ok"|"error", result: T, error?: {...}, ... }
@@ -19,6 +20,7 @@ export interface OVSessionMeta {
   total_message_count?: number;
   commit_count: number;
   pending_tokens?: number;
+  memory_policy?: { working_memory?: { mode?: string } } | null;
   memories_extracted?: Record<string, number>;
   last_commit_at?: string;
 }
@@ -98,6 +100,38 @@ export class OVClient {
   }
 
   // ========== Sessions ==========
+
+  /** Select the opt-in policy before message delivery can auto-create a session. */
+  async createSession(sessionId: string): Promise<OVResponse<OVSessionMeta>> {
+    return this.fetchJSON<OVSessionMeta>("/api/v1/sessions", {
+      method: "POST",
+      body: JSON.stringify({
+        session_id: sessionId,
+        memory_policy: { working_memory: { mode: this.cfg.workingMemoryMode || "legacy" } },
+      }),
+    }, { timeoutMs: 5000 });
+  }
+
+  /** A work-item overview is usable only after the archive API verifies `.done`. */
+  async readArchiveCheckpoint(archiveUri: string): Promise<{ overview: string; checkpoint: WorkItemCheckpoint } | null> {
+    const match = /^viking:\/\/[^?#]+\/sessions\/([^/]+)\/history\/(archive_[^/]+)\/?$/.exec(archiveUri);
+    if (!match) return null;
+    const [, sessionId, archiveId] = match;
+    const res = await this.fetchJSON<any>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/archives/${encodeURIComponent(archiveId)}`,
+      undefined, { timeoutMs: 5000 },
+    );
+    if (!res.ok) {
+      if (res.status === 404) return null;
+      throw new Error(`archive checkpoint read failed: ${res.error?.message || res.status || "unknown"}`);
+    }
+    const result = res.result;
+    if (["not_ready", "failed"].includes(result?.status) || result?.archive_id !== archiveId ||
+        result?.checkpoint?.archive_id !== archiveId ||
+        !isReadyWorkItemCheckpoint(result?.checkpoint) || typeof result?.overview !== "string") return null;
+    const overview = stripFrontmatter(result.overview).trim();
+    return overview ? { overview, checkpoint: result.checkpoint } : null;
+  }
 
   /** GET /api/v1/sessions/{id} — session metadata */
   async getSession(sessionId: string, autoCreate = false): Promise<OVSessionMeta | null> {

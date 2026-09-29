@@ -1359,7 +1359,19 @@ class MemoryUpdater:
         """Apply upsert operation from a flat model."""
         viking_fs = self._get_viking_fs()
 
+        from openviking.session.memory.work_item import (
+            WORK_ITEM_BODY_TOKEN_CAP,
+            is_work_item_uri,
+            validate_work_item_update,
+        )
+        from openviking.utils.token_estimation import estimate_text_tokens
+
         memory_type = resolved_op.memory_type
+        is_work_item = memory_type == "work_item"
+        if any(is_work_item_uri(uri) != is_work_item for uri in resolved_op.uris):
+            raise ValueError("work_item writes must use their canonical memory type")
+        if is_work_item and len(resolved_op.uris) != 1:
+            raise ValueError("work_item writes require exactly one canonical user URI")
         schema = self._registry.get(memory_type)
         # Process each URI independently
         for uri in resolved_op.uris:
@@ -1385,7 +1397,7 @@ class MemoryUpdater:
                 # File doesn't exist yet, that's okay
                 pass
             except Exception:
-                if is_uri_migration:
+                if is_uri_migration or is_work_item:
                     raise
                 # Preserve the legacy in-place update fallback to the prefetched
                 # snapshot when a fresh disk read is unavailable.
@@ -1400,7 +1412,7 @@ class MemoryUpdater:
                         resource=source_content.uri,
                     ) from None
             # Fall back to pre-fetched content if disk read failed
-            if old_content is None:
+            if old_content is None and not is_work_item:
                 old_content = source_content
 
             metadata: Dict[str, Any] = {}
@@ -1413,7 +1425,10 @@ class MemoryUpdater:
                     old_content.uri,
                     old_content.links,
                 )
-            metadata.update(resolved_op.memory_fields)
+            if is_work_item:
+                metadata = validate_work_item_update(resolved_op, old_content, ctx, extract_context)
+            else:
+                metadata.update(resolved_op.memory_fields)
             source = getattr(resolved_op, "source", None)
             source_extraction_id = getattr(source, "extraction_id", None) if source else None
             if source_extraction_id:
@@ -1422,7 +1437,7 @@ class MemoryUpdater:
             if source_trace_id:
                 metadata["last_update_trace_id"] = source_trace_id
             # Process fields defined in schema (apply merge_op)
-            for field in schema.fields:
+            for field in () if is_work_item else schema.fields:
                 if field.name in resolved_op.memory_fields:
                     patch_value = resolved_op.memory_fields[field.name]
                     # Get current value for this URI
@@ -1513,6 +1528,12 @@ class MemoryUpdater:
                 ),
                 extract_context=extract_context,
             )
+            if (
+                is_work_item
+                and estimate_text_tokens(MemoryFileUtils.read(new_full_content, uri=uri).content)
+                > WORK_ITEM_BODY_TOKEN_CAP
+            ):
+                raise ValueError("work_item rendered body exceeds its token cap")
             await viking_fs.write_file(
                 uri,
                 new_full_content,
@@ -1728,6 +1749,10 @@ class MemoryUpdater:
         lease_ref: Any = None,
     ) -> None:
         """Apply delete operation (uri is already a string)."""
+        from openviking.session.memory.work_item import is_work_item_uri
+
+        if is_work_item_uri(uri):
+            raise ValueError("work_item extraction cannot delete or merge canonical identities")
         viking_fs = self._get_viking_fs()
 
         # Delete from VikingFS
@@ -1839,6 +1864,16 @@ class MemoryUpdater:
                     user=ctx.user,
                     account_id=ctx.account_id,
                 )
+                from openviking.session.memory.work_item_index import is_work_item_leaf
+
+                if memory_type == "work_item" or is_work_item_leaf(uri):
+                    from openviking.session.memory.utils.memory_file_utils import (
+                        memory_version_from_fields,
+                    )
+
+                    memory_context.meta["work_item_version"] = memory_version_from_fields(
+                        mf.extra_fields, default=0
+                    )
                 memory_context.set_vectorize(Vectorize(text=embedding_text))
 
                 # Convert to embedding msg and enqueue

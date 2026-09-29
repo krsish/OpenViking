@@ -31,6 +31,30 @@ function client(overrides = {}) {
   };
 }
 
+test("work-item sessions are created before sync and resumed only with the same mode", async () => {
+  let createdId;
+  const make = (overrides = {}) => new SyncManager(client({
+    createSession: async (id) => { createdId = id; return { ok: true }; },
+    ...overrides,
+  }), config({ workingMemoryMode: "work_item" }));
+  const fresh = make();
+  assert.equal(await fresh.ensureSession("test-session"), true);
+  assert.equal(createdId, fresh.sessionId);
+  const conflict = { createSession: async () => ({ ok: false, status: 409 }) };
+  const resumed = make({ ...conflict,
+    getSession: async () => ({ memory_policy: { working_memory: { mode: "work_item" } } }),
+  });
+  assert.equal(await resumed.ensureSession("test-session"), true);
+  const legacy = make({ ...conflict,
+    getSession: async () => ({ memory_policy: { working_memory: { mode: "legacy" } } }),
+  });
+  assert.equal(await legacy.ensureSession("test-session"), false);
+  assert.equal(legacy.sessionId, null);
+  const failed = make({ createSession: async () => ({ ok: false, status: 500 }) });
+  assert.equal(await failed.ensureSession("test-session"), false);
+  assert.equal(failed.sessionId, null);
+});
+
 async function withPendingDir(fn) {
   const previous = process.env.OPENVIKING_PENDING_DIR;
   const dir = await mkdtemp(join(tmpdir(), "ov-pi-pending-"));

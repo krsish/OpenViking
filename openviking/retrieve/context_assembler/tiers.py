@@ -4,7 +4,8 @@
 
 Every tier always carries the URI; the tiers differ only in how much body text
 they spend. ``abstract`` comes from the vector payload and costs no read, while
-``overview`` and ``full`` need the node content.
+``overview`` and ``full`` need the node content. Mutable work items always
+resolve every content-bearing tier from their canonical file.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from openviking.retrieve.context_assembler.params import (
     FULL_BODY_ABSTRACT_CATEGORIES,
     READ_CONCURRENCY,
     TIER_RANK,
+    WORK_ITEM_CATEGORY,
     Tier,
 )
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
@@ -176,6 +178,11 @@ def tier_text(
     """Body text for ``tier``, or ``None`` when that tier is unavailable."""
     if tier == "uri":
         return ""
+    if candidate.category == WORK_ITEM_CATEGORY:
+        # Even an explicit abstract pin or budget downgrade must use current
+        # canonical state. Missing/deleted files degrade to URI, never stale
+        # vector content. The existing planner applies the final token budget.
+        return contents.get(content_uri_for(candidate), "").strip() or None
     if tier == "abstract":
         return candidate.abstract.strip() or None
 
@@ -227,4 +234,7 @@ def tier_window(candidate: Candidate, pin: Optional[Tier] = None) -> Tuple[Tier,
 
 def needs_content(candidate: Candidate, pin: Optional[Tier] = None) -> bool:
     """Whether any tier this candidate can reach requires reading its body."""
-    return TIER_RANK[tier_window(candidate, pin)[1]] >= TIER_RANK["overview"]
+    return (
+        candidate.category == WORK_ITEM_CATEGORY
+        or TIER_RANK[tier_window(candidate, pin)[1]] >= TIER_RANK["overview"]
+    )

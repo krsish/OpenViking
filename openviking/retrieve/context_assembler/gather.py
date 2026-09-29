@@ -21,6 +21,7 @@ from openviking.retrieve.context_assembler.params import (
     OTHER_PEER_OVERFETCH,
     READ_CONCURRENCY,
     REPORTED_CATEGORY_KEYS,
+    WORK_ITEM_CATEGORY,
 )
 from openviking.retrieve.skill_results import package_abstract, skill_root_uri
 from openviking.server.identity import RequestContext
@@ -96,6 +97,8 @@ def memory_target_roots(ctx: RequestContext) -> List[str]:
 def category_targets(category: str, ctx: RequestContext) -> List[str]:
     """Retrieval scopes owning ``category``."""
     user_root = canonical_user_root(ctx)
+    if category == WORK_ITEM_CATEGORY:
+        return [f"{user_root}/memories/{WORK_ITEM_CATEGORY}"]
     if category == "resources":
         targets = default_target_directories(ctx, context_type=ContextType.RESOURCE)
         if targets:
@@ -237,6 +240,14 @@ async def gather_candidates(
             if base_uri.endswith("/profile.md"):
                 continue
             category = category_for(item, bucket)
+            if category == WORK_ITEM_CATEGORY and (
+                is_directory
+                or not _is_under(base_uri, f"{user_root}/memories/{WORK_ITEM_CATEGORY}")
+                or not base_uri.endswith(".md")
+            ):
+                # Work items are user-owned canonical files, never peer copies
+                # or directory summaries, including when reached by flat search.
+                continue
             abstract = _abstract(item)
             if category == "skills":
                 # Every file and directory level of a package carries its own
@@ -288,6 +299,7 @@ async def gather_candidates(
         target_uri: str,
         find_limit: int,
         find_filter: Optional[Dict[str, Any]] = None,
+        level: Optional[List[int]] = None,
     ) -> Any:
         return _safe_find(
             service,
@@ -300,7 +312,7 @@ async def gather_candidates(
             score_threshold=score_threshold,
             filter=find_filter if find_filter is not None else filter,
             image_url=image_url,
-            level=None,
+            level=level,
         )
 
     async def gather_bucket(bucket: str, quota: int) -> List[Candidate]:
@@ -352,12 +364,13 @@ async def gather_candidates(
                     target_uri=target,
                     find_limit=_overfetch(quota),
                     find_filter=bucket_filter,
+                    level=[2] if bucket == WORK_ITEM_CATEGORY else None,
                 )
                 for query in planned
                 for target in targets
             ]
         peer_offset = len(searches)
-        if peer_scope == "all" and bucket in MEMORY_CATEGORIES:
+        if peer_scope == "all" and bucket in MEMORY_CATEGORIES and bucket != WORK_ITEM_CATEGORY:
             searches.extend(
                 _find(
                     query=query,

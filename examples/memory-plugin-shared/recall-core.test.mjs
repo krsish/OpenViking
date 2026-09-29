@@ -10,6 +10,7 @@ import {
   buildRecallBlockDetailed,
   contextRequestTimeoutMs,
   estimateTokens,
+  fetchAssembledContext,
   isContextFaceLegacy,
   postRecall,
   readPeerScopeDowngrade,
@@ -29,9 +30,10 @@ test("context requests preserve the configured recall width and server budget", 
     recallCompressMaxInputChars: 18000,
   });
 
-  assert.equal(Object.values(body.quotas).reduce((sum, quota) => sum + quota, 0), 6);
+  assert.equal(Object.values(body.quotas).reduce((sum, quota) => sum + quota, 0), 7);
   assert.equal(body.quotas.resources, 1);
   assert.equal(body.quotas.skills, 1);
+  assert.equal(body.quotas.work_item, 1);
   assert.equal(body.max_tokens, 800);
   assert.equal(body.purpose, "coding");
 });
@@ -63,6 +65,7 @@ test("coding-agent fallback recall explicitly uses the 0.35 threshold", () => {
   const body = buildRecallEndpointBody({});
 
   assert.equal(body.min_score, 0.35);
+  assert.ok(body.quotas.work_item > 0);
 });
 
 test("buildRecallBlock injects context assembled by the server", async () => {
@@ -640,3 +643,61 @@ for (const textLength of [20, 500]) {
     assert.equal(recalled.hintCount, citedUris.length - visibleContent.length);
   });
 }
+
+
+test("old recall servers reject work_item without disabling existing memory buckets", async () => {
+  const memoPath = await tempPath("peer-scope.json");
+  const quotas = { events: 3, work_item: 2 };
+  const { sent, fetchJSON } = recordingFetch([
+    { ok: false, status: 422, error: { message: "unknown quota keys: work_item; allowed: events" } },
+    { ok: true, status: 200, result: { rendered: "existing memory" } },
+  ]);
+  const res = await postRecall(fetchJSON, { query: "q", quotas, peer_scope: "actor" }, { peerScopeMemoPath: memoPath });
+  assert.equal(res.ok, true);
+  assert.deepEqual(sent[1].quotas, { events: 3 });
+  assert.equal(sent[1].peer_scope, "actor");
+  assert.deepEqual(quotas, { events: 3, work_item: 2 });
+  assert.equal(await readPeerScopeDowngrade(memoPath), null);
+});
+
+test("recall compatibility handles separate quota and peer rejections with bounded retries", async () => {
+  for (const errors of [
+    ["unknown quota keys: work_item; allowed: events", "unexpected keyword argument 'peer_scope'"],
+    ["unexpected keyword argument 'peer_scope'", "unknown quota keys: work_item; allowed: events"],
+  ]) {
+    const memoPath = await tempPath("peer-scope.json");
+    const { sent, fetchJSON } = recordingFetch([
+      ...errors.map(error => ({ ok: false, status: 422, error })),
+      { ok: false, status: 422, error: "query must not be empty" },
+    ]);
+    const res = await postRecall(fetchJSON, { query: "", quotas: { events: 3, work_item: 2 }, peer_scope: "actor" }, { peerScopeMemoPath: memoPath });
+    assert.equal(res.ok, false);
+    assert.equal(sent.length, 3);
+    assert.deepEqual(sent[2].quotas, { events: 3 });
+    assert.equal(sent[2].peer_scope, undefined);
+  }
+});
+
+test("context face retries the new quota without marking an otherwise supported endpoint legacy", async () => {
+  const legacyCachePath = await tempPath("context-face.json");
+  const { sent, fetchJSON } = recordingFetch([
+    { ok: false, status: 422, error: "unknown quota keys: work_item; allowed: events" },
+    { ok: true, status: 200, result: { rendered: "existing context", entries: [] } },
+  ]);
+  const result = await fetchAssembledContext(fetchJSON, { recallLimit: 10, recallLimitConfigured: true }, "q", { legacyCachePath });
+  assert.equal(result.rendered, "existing context");
+  assert.equal(sent.length, 2);
+  assert.ok(sent[0].quotas.work_item > 0);
+  assert.equal(sent[1].quotas.work_item, undefined);
+  assert.equal(sent[1].mode, "context");
+  assert.equal(await isContextFaceLegacy(legacyCachePath), false);
+});
+
+test("unrelated work_item errors do not remove quotas or retry", async () => {
+  const { sent, fetchJSON } = recordingFetch([
+    { ok: false, status: 422, error: "work_item quota must be nonnegative" },
+  ]);
+  const res = await postRecall(fetchJSON, { query: "q", quotas: { work_item: -1 } });
+  assert.equal(res.ok, false);
+  assert.equal(sent.length, 1);
+});

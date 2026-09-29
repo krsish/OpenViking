@@ -28,7 +28,7 @@ def _memory_policy_shape_error(key: str) -> str:
 
 def _memory_policy_keys_error(key: str) -> str:
     if key == "working_memory":
-        return "memory_policy.working_memory supports only: enabled"
+        return "memory_policy.working_memory supports only: enabled, mode"
     return "memory_policy target supports only: enabled"
 
 
@@ -59,12 +59,21 @@ def _target_enabled(data: Any, *, default_enabled: bool, key: str = "target") ->
         return default_enabled
     if not isinstance(data, dict):
         raise InvalidArgumentError(_memory_policy_shape_error(key))
-    extra_keys = set(data) - _TARGET_KEYS
+    extra_keys = set(data) - (_TARGET_KEYS | {"mode"} if key == "working_memory" else _TARGET_KEYS)
     if extra_keys:
         raise InvalidArgumentError(_memory_policy_keys_error(key))
     if "enabled" not in data:
         return default_enabled
     return _parse_enabled(data["enabled"], key=key)
+
+
+def _working_memory_mode(data: Any) -> str:
+    if not isinstance(data, dict):
+        return "legacy"
+    mode = data.get("mode", "legacy")
+    if mode not in ("legacy", "work_item"):
+        raise InvalidArgumentError("memory_policy.working_memory.mode must be legacy or work_item")
+    return mode
 
 
 def _parse_memory_types(data: Any) -> Optional[set[str]]:
@@ -92,6 +101,7 @@ class MemoryPolicy:
     peer_enabled: bool = True
     memory_types: Optional[set[str]] = None
     working_memory_enabled: bool = True
+    working_memory_mode: str = "legacy"
 
     @classmethod
     def default(cls) -> "MemoryPolicy":
@@ -117,6 +127,7 @@ class MemoryPolicy:
             working_memory_enabled=_target_enabled(
                 data.get("working_memory"), default_enabled=True, key="working_memory"
             ),
+            working_memory_mode=_working_memory_mode(data.get("working_memory")),
         )
 
     def validate_memory_types(self, known_memory_types: set[str]) -> None:
@@ -135,6 +146,8 @@ class MemoryPolicy:
         }
         if not self.working_memory_enabled:
             data["working_memory"] = {"enabled": False}
+        if self.working_memory_mode != "legacy":
+            data.setdefault("working_memory", {})["mode"] = self.working_memory_mode
         if self.memory_types is not None:
             data["memory_types"] = sorted(self.memory_types)
         return data

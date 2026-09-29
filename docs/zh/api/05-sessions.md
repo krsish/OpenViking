@@ -43,7 +43,7 @@ Session API 按认证用户作用域访问会话，并返回 canonical user sess
 | 参数 | 类型 | 必填 | 默认值 | 说明 |
 |------|------|------|--------|------|
 | session_id | str | 否 | None | 会话 ID。如果为 None，则创建一个自动生成 ID 的新会话 |
-| memory_policy | object | 否 | None | 会话默认的记忆抽取策略。可选的 `self` 和 `peer` 开关控制写入目标；可选的 `working_memory.enabled=false` 跳过 archive summary；可选的顶层 `memory_types` 将抽取限制为指定的 enabled memory schema。包含 `experiences` 时会自动激活 `cases` 和 `trajectories`；不包含 `experiences` 时，显式传入的 `cases` 和 `trajectories` 会被忽略。所有 `enabled` 值都应使用 JSON 布尔值。旧版 boolean-like 值暂时仍兼容（字符串 `"false"` 会正确解析为 false），但会产生弃用警告。未传或为 `null` 时允许所有 enabled memory schema。非法结构或未知 memory type 会以 `InvalidArgumentError` 拒绝。 |
+| memory_policy | object | 否 | None | 会话默认的记忆抽取策略。可选的 `self` 和 `peer` 开关控制写入目标；可选的 `working_memory.enabled=false` 跳过 archive summary；可选的顶层 `memory_types` 将抽取限制为指定的 enabled memory schema。包含 `experiences` 时会自动激活 `cases` 和 `trajectories`；不包含 `experiences` 时，显式传入的 `cases` 和 `trajectories` 会被忽略。所有 `enabled` 值都应使用 JSON 布尔值。旧版 boolean-like 值暂时仍兼容（字符串 `"false"` 会正确解析为 false），但会产生弃用警告。未传或为 `null` 时默认允许 enabled legacy memory schema；`work_item` 由显式开启的模式或指定类型加入。非法结构或未知 memory type 会以 `InvalidArgumentError` 拒绝。 |
 | auto_commit_policy | object | 否 | None | 可选的自动 commit 策略（见下表）。传入的字段会被校验并 clamp 到取值范围，然后合并到默认值之上；最终生效的策略会在响应的 `result.auto_commit_policy` 中返回，并持久化到 session meta。省略时，新 Session 先继承 `server.user_config_defaults.auto_commit_policy`，再沿用现有 `memory.session_auto_commit.enabled` 行为。之后可通过 `update_session_config()` 部分更新或禁用该策略。 |
 
 `auto_commit_policy` 字段（均为可选；存在 policy 时，未传字段回退到默认值）：
@@ -1705,3 +1705,9 @@ results = await client.search(query=query, session_id=session_id)
 - [检索](06-retrieval.md) - 结合会话进行搜索
 - [资源管理](02-resources.md) - 资源管理
 - [后台任务](17-tasks.md) - 跟踪 commit 任务
+
+## Work-item 工作记忆（显式开启）
+
+`memory_policy.working_memory.mode` 默认为 `"legacy"`。要使用有界 work-item 投影，请创建**新会话**并传入 `{"memory_policy":{"working_memory":{"enabled":true,"mode":"work_item"}}}`。即使 `memory_types` 显式为空列表，该模式仍加入必需的 `work_item` 类型。已有 legacy 会话不会自动迁移。
+
+此模式下，context 和 archive 读取仅在有已发布 checkpoint 时返回 `status: "ready"`，并从用户级权威状态刷新活跃项。checkpoint 尚未就绪时返回 `not_ready`；context 无法满足请求预算时返回 `budget_insufficient`，不返回可推进的 checkpoint 边界。调用方必须保留尚未获得可用覆盖边界的 transcript。读取不调用 LLM。预算、coverage 边界、版本校验和恢复方式见 [Work-item 工作记忆](../concepts/17-work-item.md)。

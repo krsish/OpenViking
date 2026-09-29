@@ -84,12 +84,23 @@ class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
             ensure_ascii=False,
             indent=2,
         )
+        activation_hint = (
+            " Include work_item_activations when the user resumes matching already-read work "
+            "even if no fields change. "
+            if "work_item_activations" in context.operations_model.model_fields
+            else ""
+        )
         return (
             "You have reached the maximum number of tool call iterations. "
             "Do not call any more tools. Return your final result now as ONLY a valid JSON object "
             "matching the required schema. Do not include explanations or markdown. "
-            "If there are no memory changes, return this exact empty-shape JSON with all fields present:\n"
-            f"{skeleton}"
+            + activation_hint
+            + (
+                "If there are no memory changes or requested activations, return this exact empty-shape JSON with all fields present:\n"
+                if activation_hint
+                else "If there are no memory changes, return this exact empty-shape JSON with all fields present:\n"
+            )
+            + skeleton
         )
 
     def render_format_retry(self, error: str | None = None) -> str:

@@ -210,11 +210,36 @@ filtered or truncated the original Pi transcript.
 | Field                    | Default    | Description                                                              |
 |--------------------------|------------|--------------------------------------------------------------------------|
 | `takeoverEnabled`        | `true`     | Let OpenViking own long-term context through the `context` hook. Env: `OPENVIKING_TAKEOVER` |
+| `workingMemoryMode`      | `"legacy"` | Opt in with `"work_item"` for published work-item checkpoints; selected when a new OV session is created |
 | `takeoverTokenThreshold` | `30000`    | Synced-token pressure that triggers commit and boundary advance           |
 | `takeoverKeepRecentTurns`| `3`        | Recent user turns retained in full fidelity                              |
 | `takeoverOverviewBudget` | `3000`     | Token budget for the injected archive overview                           |
 | `takeoverOverviewPollMs` | `2000`     | Delay between overview reads while answering pi's compaction             |
 | `takeoverOverviewPollMax`| `15`       | Max overview reads for pi's compaction; capped by the 25s handler budget |
+
+With `workingMemoryMode: "work_item"`, the extension uses the existing turn-end
+threshold and pending-archive checks to prepare checkpoints in the background.
+It reads the archive API and requires a matching archive ID and a version-1
+`checkpoint` with `compact_ready: true`; an `.overview.md` file alone is never
+enough. The polling settings above apply only to legacy mode.
+
+At Pi's compaction hook, a pending checkpoint can fall back to the previous
+ready checkpoint plus the complete Pi transcript between its coverage boundary
+and Pi's requested cut. Tool calls and results in that transcript are preserved
+as JSONL; Pi keeps the messages after the cut. The extension checks the active
+branch and estimates the entire resulting context, including retained messages,
+system prompt, tools, recall/profile budgets and output reserve, with additional
+headroom. If no valid checkpoint fits, Pi performs its normal compaction. No
+extra model call, indexing wait, timer or readiness polling is added to this path.
+A checkpoint that arrives after this hook cannot replace a newer Pi compaction.
+Before reusing a cached checkpoint, the hook rereads its current hot view once,
+so another session's task-state updates can be reflected without changing the
+checkpoint's coverage boundary. If this read fails or its boundary changes, the
+hook uses Pi compaction rather than the stale cached view.
+
+Start a new Pi session when enabling work-item mode. Resuming an existing OV
+session requires its stored policy to already use that mode; this setting does
+not migrate legacy sessions. The mode defaults to legacy for compatibility.
 
 ### Injection tuning
 

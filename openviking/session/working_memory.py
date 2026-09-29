@@ -872,7 +872,9 @@ def wm_enforce_files_no_regression(op: Any, old_content: str) -> Dict[str, Any]:
             # Try to pull the LLM's own phrasing for that path from new_content
             for line in new_content.splitlines():
                 if path in line:
-                    new_items.append(line.strip().lstrip("-*").strip())
+                    item = line.strip().lstrip("-*").strip()
+                    if item not in new_items:
+                        new_items.append(item)
                     break
             else:
                 new_items.append(f"{path} (newly referenced)")
@@ -1026,9 +1028,13 @@ def merge_wm_sections(old_wm: str, ops: Dict[str, Any]) -> str:
                         header,
                         [type(s).__name__ for s in bad_items],
                     )
-                appended = "\n".join(
-                    f"- {s.strip()}" for s in items if isinstance(s, str) and s.strip()
-                )
+                existing = {line.strip().lstrip("-*").strip() for line in old_content.splitlines()}
+                additions = []
+                for item in items:
+                    if isinstance(item, str) and item.strip() and item.strip() not in existing:
+                        additions.append(f"- {item.strip()}")
+                        existing.add(item.strip())
+                appended = "\n".join(additions)
                 if old_content and appended:
                     new_content = f"{old_content}\n{appended}"
                 else:

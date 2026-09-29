@@ -109,6 +109,27 @@ def test_files_and_context_section_can_keep_growing_with_unique_paths():
     assert items[-1] == "src/file_30.py - referenced during round 30."
 
 
+def test_replayed_append_and_multi_path_salvage_do_not_duplicate_bullets():
+    original = _wm(files_context="- src/original.py - still required.")
+    ops = _keep_all()
+    ops["Files & Context"] = {
+        "op": "UPDATE",
+        "content": "- src/new.py and tests/new.py describe the same change.",
+    }
+    once = wm.merge_wm_sections(original, ops)
+    repeated = wm.merge_wm_sections(once, ops)
+    assert _section_items(once, "Files & Context") == [
+        "src/original.py - still required.",
+        "src/new.py and tests/new.py describe the same change.",
+    ]
+    assert repeated == once
+    ops["Files & Context"] = {
+        "op": "APPEND",
+        "items": ["src/new.py and tests/new.py describe the same change."] * 2,
+    }
+    assert wm.merge_wm_sections(once, ops) == once
+
+
 # =====================================================================
 # Key Facts consolidation guard — Layer 1: bullet-count ratio
 # =====================================================================

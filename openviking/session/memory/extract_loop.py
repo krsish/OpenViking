@@ -791,6 +791,21 @@ class ExtractLoop:
             for item_index, item in enumerate(items):
                 item_dict = dict(item)
                 item_dict["memory_type"] = memory_type
+                source_message_ids = None
+                if memory_type == "work_item":
+                    from openviking.session.memory.work_item import (
+                        covered_source_message_ids,
+                        new_work_item_id,
+                    )
+
+                    ranges = item_dict.get("ranges")
+                    source_message_ids = covered_source_message_ids(self._extract_context, ranges)
+                    item_dict["work_item_id"] = new_work_item_id(
+                        self._extract_context,
+                        ranges,
+                        item_index,
+                        getattr(self.context_provider, "work_item_namespace", ""),
+                    )
                 identity_resolution_skip = None
                 classify_identity_fields = getattr(
                     self._isolation_handler,
@@ -832,6 +847,7 @@ class ExtractLoop:
                     uris=[],
                     page_id=page_id,
                     resolution_skip=identity_resolution_skip,
+                    source_message_ids=source_message_ids,
                 )
 
                 if is_event:
@@ -967,7 +983,18 @@ class ExtractLoop:
             page_id_assignments,
             page_id_map,
         )
+        activations = []
+        if any(schema.memory_type == "work_item" for schema in schemas):
+            from openviking.session.memory.work_item import resolve_work_item_activations
+
+            activations = resolve_work_item_activations(
+                getattr(operations, "work_item_activations", []) or [],
+                extract_context=self._extract_context,
+                read_files=self.context_provider.read_file_contents,
+                ctx=self.ctx,
+            )
         resolved = ResolvedOperations(
+            work_item_activations=activations,
             upsert_operations=upsert_operations,
             delete_file_contents=delete_file_contents,
             errors=errors,

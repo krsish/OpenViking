@@ -66,7 +66,9 @@ def test_memory_policy_rejects_invalid_working_memory_shape():
     with pytest.raises(InvalidArgumentError, match="working_memory must be an object"):
         MemoryPolicy.from_dict({"working_memory": False})
 
-    with pytest.raises(InvalidArgumentError, match="working_memory supports only: enabled"):
+    with pytest.raises(
+        InvalidArgumentError, match="working_memory.mode must be legacy or work_item"
+    ):
         MemoryPolicy.from_dict({"working_memory": {"enabled": True, "mode": "summary"}})
 
 

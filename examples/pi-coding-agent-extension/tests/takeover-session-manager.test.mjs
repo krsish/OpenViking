@@ -37,7 +37,7 @@ function findSessionManager() {
 
 const SESSION_MANAGER_PATH = findSessionManager();
 
-async function openSession(t, config = {}) {
+async function openSession(t, config = {}, io = {}) {
   if (!SESSION_MANAGER_PATH) {
     t.skip("pi SessionManager not resolvable");
     return null;
@@ -70,6 +70,7 @@ async function openSession(t, config = {}) {
       persistEntry: (type, data) => sm.appendCustomEntry(type, data),
       getWatermark: () => sm.getEntries().length,
       log: (message) => logs.push(message),
+      ...io,
     },
   });
   let clock = 1_000;
@@ -89,6 +90,42 @@ async function openSession(t, config = {}) {
   }
   return { sm, core, logs, turn };
 }
+
+test("work-item pending fallback survives real Pi compaction with uncovered tool results", async (t) => {
+  let ready = true;
+  const session = await openSession(t, { workingMemoryMode: "work_item" }, {
+    readArchiveCheckpoint: async (uri) => ready || uri.endsWith("archive_001") ? {
+      overview: "A is waiting for review.",
+      checkpoint: { mode: "work_item", version: 1, compact_ready: true,
+        starting_message_id: "ov1", ending_message_id: "ov2", work_items: [] },
+    } : null,
+  });
+  if (!session) return;
+  const { sm, core, turn } = session;
+  await turn("A");
+  await turn("B");
+  ready = false;
+  sm.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "read-b", name: "read", arguments: { path: "B" } }],
+    timestamp: 3000, api: "test", provider: "test", model: "test", usage: {}, stopReason: "toolUse" });
+  sm.appendMessage({ role: "toolResult", toolCallId: "read-b", toolName: "read", isError: false,
+    content: [{ type: "text", text: "B full tool result" }], timestamp: 3001 });
+  const kept = await turn("Continue B");
+  assert.ok(core.state.pendingArchive);
+  const result = await core.handleBeforeCompact({ firstKeptEntryId: kept.userId, tokensBefore: 15000,
+    contextWindow: 16000, reserveTokens: 1000, overheadTokens: 200 }, () => sm.getBranch());
+  assert.ok(result);
+  assert.match(result.compaction.summary, /B full tool result/);
+  assert.match(result.compaction.summary, /"toolCallId":"read-b"/);
+  sm.appendCompaction(result.compaction.summary, result.compaction.firstKeptEntryId,
+    result.compaction.tokensBefore, result.compaction.details);
+  const context = sm.buildSessionContext().messages;
+  assert.match(JSON.stringify(context), /B full tool result/);
+  assert.ok(context.some((message) => message.role === "user" && JSON.stringify(message.content).includes("Continue B")));
+  ready = true;
+  assert.equal(await core.resumePending(() => sm.getBranch()), false);
+  assert.equal(core.state.coveredThroughEntryId, "");
+  assert.deepEqual(core.transformContext(context, sm.getBranch()), context);
+});
 
 test("takeover state entries between turns do not reset the boundary", async (t) => {
   const session = await openSession(t);

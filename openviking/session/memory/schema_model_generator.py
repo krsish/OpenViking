@@ -64,6 +64,13 @@ def to_pascal_case(s: str) -> str:
 #     )
 
 
+class WorkItemActivation(BaseModel):
+    """Resume an existing item without changing its canonical state."""
+
+    page_id: int = Field(..., description="Page ID of an already-read nonterminal work_item.")
+    ranges: str = Field(..., description="Current user message indices requesting this same work.")
+
+
 class SchemaModelGenerator:
     """
     Dynamic Pydantic model generator from memory type schemas.
@@ -160,14 +167,18 @@ class SchemaModelGenerator:
         )
 
         identity_field_names = set(memory_type.identity_fields(include_peer_id=False))
+        server_fields = {"work_item_id"} if memory_type.memory_type == "work_item" else set()
         required_on_create = [
             field.name
             for field in memory_type.fields
-            if field.merge_op == MergeOp.IMMUTABLE or field.name in identity_field_names
+            if field.name not in server_fields
+            and (field.merge_op == MergeOp.IMMUTABLE or field.name in identity_field_names)
         ]
 
         # Add business fields from schema
         for field in memory_type.fields:
+            if field.name in server_fields:
+                continue
             base_type = self._map_field_type(field.field_type)
             if field.merge_op == MergeOp.IMMUTABLE:
                 # Existing updates may omit immutable fields. New objects are
@@ -297,6 +308,21 @@ class SchemaModelGenerator:
                 ),
             )
 
+        if "work_item" in memory_type_fields:
+            field_definitions["work_item_activations"] = (
+                List[WorkItemActivation],
+                Field(
+                    default_factory=list,
+                    description=(
+                        "At most 3 already-read work_items the current user explicitly resumes. "
+                        "Confirm matching goal and scope from canonical state. A semantic search hit "
+                        "alone is not activation. Use this even when no state fields change; it "
+                        "does not update the item or claim message coverage. Never activate a "
+                        "done/cancelled item; reopening requires a separately authorized update."
+                    ),
+                ),
+            )
+
         # Only expose delete_ids when at least one schema supports deletion.
         # add_only schemas (e.g. trajectories) never delete existing records,
         # so excluding this field prevents the LLM from hallucinating fake deletes.
@@ -351,7 +377,9 @@ class SchemaModelGenerator:
                     else:
                         # Single value (not None)
                         return False
-            return len(getattr(self, "delete_ids", [])) == 0
+            return not (
+                getattr(self, "delete_ids", []) or getattr(self, "work_item_activations", [])
+            )
 
         def to_legacy_operations(self) -> Dict[str, Any]:
             """Convert new per-type structure to legacy write_uris/edit_uris format."""

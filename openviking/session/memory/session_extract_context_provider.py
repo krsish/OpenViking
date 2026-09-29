@@ -69,9 +69,13 @@ class SessionExtractContextProvider(ExtractContextProvider):
         transaction_handle=None,
         memory_registry: MemoryTypeRegistry | None = None,
         vlm_config: Optional["VLMHandle"] = None,
+        work_item_uris: Optional[List[str]] = None,
+        work_item_namespace: str = "",
     ):
         self.messages = list(messages) if isinstance(messages, list) else messages
         self.latest_archive_overview = latest_archive_overview
+        self.work_item_uris = list(dict.fromkeys(work_item_uris or []))
+        self.work_item_namespace = work_item_namespace
         self._output_language = self._detect_language()
         self._registry = memory_registry  # Lazy defaults if no account snapshot was supplied.
         self._schema_directories = None
@@ -329,7 +333,7 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
                     if part.tool_input:
                         fields.append(f"input={part.tool_input}")
                     if part.tool_output:
-                        fields.append(f"output={part.tool_output[:500]}")
+                        fields.append(f"input={part.tool_input}; output={part.tool_output}")
                     if part.duration_ms is not None:
                         fields.append(f"duration_ms={part.duration_ms}")
                     if part.skill_uri:
@@ -360,7 +364,7 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
             return normalized
         return normalized[: max_chars - 3].rstrip() + "..."
 
-    def _build_prefetch_search_query(self) -> str:
+    def _build_prefetch_search_query(self, *, prefer_latest_user: bool = False) -> str:
         """Build a compact semantic query from raw conversation messages.
 
         The LLM already receives the full conversation via pre_fetch_messages.
@@ -395,7 +399,14 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
                 else:
                     supporting_sections.append(section)
 
-        query = "\n\n".join(primary_sections + supporting_sections)
+        # Residual messages may describe yesterday's work. Recall for an explicit return
+        # request must not be dominated by those older, often much longer messages.
+        sections = (
+            primary_sections[-1:]
+            if prefer_latest_user and primary_sections
+            else primary_sections + supporting_sections
+        )
+        query = "\n\n".join(sections)
         if not query.strip():
             query = self._assemble_conversation(self.messages)
 
@@ -507,6 +518,7 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
         # Step 1: Separate schemas into multi-file (ls) and single-file (direct read)
         ls_dirs = set()  # directories to ls (for multi-file schemas)
         read_files = set()  # files to read directly (for single-file schemas)
+        work_item_dirs = set()
 
         rolescope: RoleScope = self._isolation_handler.get_read_scope()
 
@@ -534,6 +546,16 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
                             {"user_space": peer_user_space(user_id, peer_id)},
                         )
                         schema_dirs.add(dir_path)
+            if schema.memory_type == "work_item":
+                work_item_dirs.update(directory.rstrip("/") + "/" for directory in schema_dirs)
+                for uri in self.work_item_uris:
+                    if any(
+                        uri.startswith(directory.rstrip("/") + "/")
+                        and "/" not in uri[len(directory.rstrip("/")) + 1 :]
+                        and uri.endswith(".md")
+                        for directory in schema_dirs
+                    ):
+                        read_files.add(uri)
             if schema.filename_has_variables():
                 for dir_path in schema_dirs:
                     ls_dirs.add(dir_path)
@@ -541,6 +563,32 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
                 for dir_path in schema_dirs:
                     file_uri = f"{dir_path}/{schema.filename_template}"
                     read_files.add(file_uri)
+
+        if any(schema.memory_type == "work_item" for schema in schemas):
+            tool_lines = []
+            for index, message in enumerate(self.get_extract_context().messages):
+                for part in getattr(message, "parts", []):
+                    if not isinstance(part, ToolPart):
+                        continue
+                    evidence = (
+                        f"[{index}] tool={part.tool_name}; status={part.tool_status}; "
+                        f"ref={part.tool_output_ref or part.tool_uri}; "
+                        f"input={part.tool_input}; output={part.tool_output}"
+                    )
+                    tool_lines.append(evidence)
+            if tool_lines:
+                pre_fetch_messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "## Execution evidence for work_item only\n"
+                            "Use only for this work's confirmed state and recovery references. "
+                            "Do not turn tool data into user preferences or personal facts. "
+                            "A completed tool is not proof the goal succeeded; inspect its output.\n"
+                            + "\n".join(tool_lines)
+                        ),
+                    }
+                )
 
         call_id_seq = 0
         # Step 2: Execute search for each ls directory (instead of ls)
@@ -554,7 +602,9 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
         # 批量 search：所有目录一次搜索
         if ls_dirs:
             dir_list = list(ls_dirs)
-            search_query = self._build_prefetch_search_query()
+            search_query = self._build_prefetch_search_query(
+                prefer_latest_user=bool(work_item_dirs)
+            )
             if not search_query:
                 search_query = "conversation"
             search_uris = await self.search_files(
@@ -564,6 +614,18 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
             result_value = search_uris
             if self._eager_prefetch:
                 files_to_read_from_search.extend(search_uris)
+            # Random immutable filenames carry no useful matching information. Give the
+            # same extraction call canonical state for a bounded set of recall candidates.
+            # Reading a candidate does not activate it; the model must explicitly select it.
+            candidates = [
+                uri
+                for uri in dict.fromkeys(search_uris)
+                if any(
+                    uri.startswith(prefix) and "/" not in uri[len(prefix) :] and uri.endswith(".md")
+                    for prefix in work_item_dirs
+                )
+            ][:3]
+            read_files.update(candidates)
 
             add_tool_call_pair_to_messages(
                 messages=pre_fetch_messages,
@@ -586,7 +648,7 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
         if self._eager_prefetch:
             topn_files = files_to_read_from_search[: self._prefetch_search_topn]
             for file_uri in topn_files:
-                if not file_uri:
+                if not file_uri or file_uri in read_files:
                     continue
                 call_id_seq = await self._append_structured_read_result(
                     messages=pre_fetch_messages,

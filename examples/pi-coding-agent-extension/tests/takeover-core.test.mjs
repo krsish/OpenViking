@@ -188,6 +188,23 @@ test("estimateTokens and truncateToTokens handle CJK conservatively", () => {
   assert.ok(truncated.length < 2500);
 });
 
+test("token estimates match the server's Unicode weighting", () => {
+  // Expected values from openviking.utils.token_estimation.estimate_text_tokens.
+  const serverCases = [
+    ["ASCII", "Hello, world!", 4],
+    ["Chinese", "汉字", 3],
+    ["Japanese", "かなカナ", 6],
+    ["Korean", "한글ᄀᄁ", 6],
+    ["fullwidth", "ＡＢ１２", 6],
+    ["emoji", "😀🚀", 4],
+    ["ordinary BMP above U+3000", "ꙮ꙯䷀䷁", 1],
+    ["astral CJK", "𠀀𠀁", 3],
+    ["other astral", "𝔸𝔹", 4],
+    ["mixed", "abcd界😀", 5],
+  ];
+  for (const [label, text, expected] of serverCases) assert.equal(estimateTokens(text), expected, label);
+});
+
 test("estimatePayloadTokens counts content and structured parts", () => {
   assert.equal(estimatePayloadTokens({ content: "a".repeat(40) }), 10);
   const withParts = estimatePayloadTokens({

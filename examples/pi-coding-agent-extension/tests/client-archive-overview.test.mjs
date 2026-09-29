@@ -15,6 +15,51 @@ function makeClient() {
   });
 }
 
+test("createSession sends the configured working-memory policy", async () => {
+  await withFetch(async () => ({ body: { status: "ok", result: { session_id: "s" } } }), async (calls) => {
+    const client = makeClient();
+    client.cfg.workingMemoryMode = "work_item";
+    assert.equal((await client.createSession("s")).ok, true);
+    assert.deepEqual(JSON.parse(calls[0].init.body), {
+      session_id: "s", memory_policy: { working_memory: { mode: "work_item" } },
+    });
+  });
+});
+
+test("readArchiveCheckpoint requires a matching published archive and never reads raw overview", async () => {
+  const valid = { archive_id: "archive_007", overview: "---\ntitle: view\n---\n\nReady hot view",
+    checkpoint: { mode: "work_item", version: 1, compact_ready: true, archive_id: "archive_007",
+      starting_message_id: "s1", ending_message_id: "s2", work_items: [] } };
+  for (const [result, ready] of [
+    [valid, true],
+    [{ ...valid, status: "not_ready" }, false],
+    [{ ...valid, archive_id: "archive_006" }, false],
+    [{ ...valid, checkpoint: { ...valid.checkpoint, archive_id: "archive_006" } }, false],
+    [{ ...valid, checkpoint: { ...valid.checkpoint, compact_ready: false } }, false],
+    [{ ...valid, checkpoint: { ...valid.checkpoint, mode: "legacy" } }, false],
+    [{ ...valid, overview: "" }, false],
+    [{ overview: "Exists without marker" }, false],
+  ]) {
+    await withFetch(async () => ({ body: { status: "ok", result } }), async (calls) => {
+      const value = await makeClient().readArchiveCheckpoint("viking://user/u/sessions/s/history/archive_007");
+      assert.equal(Boolean(value), ready);
+      if (ready) assert.equal(value.overview, "Ready hot view");
+      assert.equal(calls.length, 1);
+      assert.match(calls[0].url, /\/sessions\/s\/archives\/archive_007$/);
+    });
+  }
+});
+
+test("archive checkpoint read errors do not fall through to overview readiness", async () => {
+  await withFetch(async () => ({ status: 404, body: { status: "error" } }), async (calls) => {
+    assert.equal(await makeClient().readArchiveCheckpoint("viking://user/u/sessions/s/history/archive_007"), null);
+    assert.equal(calls.length, 1);
+  });
+  await withFetch(async () => ({ status: 500, body: { status: "error", error: { message: "storage" } } }), async () => {
+    await assert.rejects(() => makeClient().readArchiveCheckpoint("viking://user/u/sessions/s/history/archive_007"), /storage/);
+  });
+});
+
 async function withFetch(handler, fn) {
   const original = globalThis.fetch;
   const calls = [];

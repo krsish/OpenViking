@@ -345,6 +345,8 @@ class ResolvedOperation(BaseModel):
     uris: List[str]
     page_id: Optional[int] = None  # Temporary page_id for link resolution (not persisted)
     source: Optional[MemoryOperationSource] = None
+    # Runtime source attribution, resolved before streaming combines conversations.
+    source_message_ids: Optional[List[str]] = None
     # Runtime-only resolution decision. It is deliberately excluded from model
     # serialization so it cannot enter later LLM merge prompts or memory files.
     resolution_skip: Optional[MemoryOperationSkip] = Field(default=None, exclude=True)
@@ -363,6 +365,8 @@ class ResolvedOperations(BaseModel):
     errors: List[str]
     resolved_links: List[StoredLink] = Field(default_factory=list)
     delete_replacements: Dict[str, str] = Field(default_factory=dict)
+    # Session bindings selected from already-read canonical state, never writes or coverage.
+    work_item_activations: List[Dict[str, Any]] = Field(default_factory=list)
 
     def has_errors(self) -> bool:
         return len(self.errors) > 0

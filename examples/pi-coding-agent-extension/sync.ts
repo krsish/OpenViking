@@ -75,6 +75,19 @@ export class SyncManager {
     if (this.ovSessionId) return true;
 
     const id = deriveHarnessSessionId("pi-", piSessionId);
+    if (this.config.workingMemoryMode === "work_item") {
+      const created = await this.client.createSession(id);
+      if (!created.ok) {
+        // A resumed session must already have the selected policy. Changing a
+        // plugin setting cannot silently reinterpret a legacy server session.
+        if (created.status !== 409 && created.error?.code !== "ALREADY_EXISTS") return false;
+        const existing = await this.client.getSession(id);
+        if (existing?.memory_policy?.working_memory?.mode !== "work_item") {
+          this.logger.log("session_policy_mismatch", { sessionId: id, requested: "work_item" });
+          return false;
+        }
+      }
+    }
     this.ovSessionId = id;
     return true;
   }

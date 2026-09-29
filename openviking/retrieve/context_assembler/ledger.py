@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, Iterable, Optional, Set
 
+from openviking.retrieve.context_assembler.params import WORK_ITEM_CATEGORY
 from openviking.server.identity import RequestContext
 from openviking_cli.utils.logger import get_logger
 
@@ -119,6 +120,9 @@ class RecallLedger:
         """URIs served within the last ``dedup_turns`` turns."""
         cooled: Set[str] = set()
         for uri, record in self._entries().items():
+            if f"/memories/{WORK_ITEM_CATEGORY}/" in str(uri):
+                # Its current state may change without its URI changing.
+                continue
             served_turn = _record_turn(record)
             if served_turn is None or served_turn > self._turn:
                 # Archive rotation reset the clock; treat the record as expired.
@@ -137,10 +141,14 @@ class RecallLedger:
         viking_fs = getattr(self._service, "viking_fs", None)
         if viking_fs is None:
             return
-        stored = dict(self._entries())
+        stored = {
+            uri: record
+            for uri, record in self._entries().items()
+            if f"/memories/{WORK_ITEM_CATEGORY}/" not in str(uri)
+        }
         for entry in entries:
             uri = str(getattr(entry, "uri", "") or "")
-            if not uri:
+            if not uri or getattr(entry, "category", "") == WORK_ITEM_CATEGORY:
                 continue
             stored[uri] = {"turn": self._turn, "detail": getattr(entry, "detail", "")}
 

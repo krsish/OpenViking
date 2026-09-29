@@ -122,9 +122,13 @@ def test_factory_ignores_deprecated_memory_version():
 
 
 def test_extract_long_term_memories_preserves_legacy_positional_parameter_order():
-    parameter_names = list(
-        inspect.signature(SessionCompressorV3.extract_long_term_memories).parameters
-    )
+    parameters = inspect.signature(SessionCompressorV3.extract_long_term_memories).parameters
+    parameter_names = [
+        name
+        for name, parameter in parameters.items()
+        if parameter.kind != inspect.Parameter.KEYWORD_ONLY
+    ]
+    assert parameters["work_item_uris"].kind == inspect.Parameter.KEYWORD_ONLY
 
     assert parameter_names[-4:] == [
         "allow_self_memory",

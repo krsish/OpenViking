@@ -919,6 +919,15 @@ async def merge_one_memory_type_operations(
     registry = registry or get_default_registry()
     schema = registry.get(memory_type)
     delete_files = list(delete_files or [])
+    if memory_type == "work_item":
+        # Work-item identity and extraction snapshots survive all merge entry
+        # points, including compile. The shared updater checks the version under
+        # the URI lease; an LLM must not silently rebase a stale session's patch.
+        return ResolvedOperations(
+            upsert_operations=list(operations),
+            delete_file_contents=delete_files,
+            errors=[],
+        )
     patch_count = len(operations)
     target_uris = _unique_operation_uris(operations)
     target_count = len(target_uris)
@@ -1027,8 +1036,7 @@ async def merge_one_memory_type_operations(
     )
     if vlm_resolver is None:
         raise RuntimeError(
-            "merge_one_memory_type_operations requires a VLM resolver "
-            "for account-owned work"
+            "merge_one_memory_type_operations requires a VLM resolver for account-owned work"
         )
     vlm_config = await vlm_resolver.get_vlm(ctx.account_id)
     provider = PatchMergeContextProvider(

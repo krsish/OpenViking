@@ -25,6 +25,7 @@ const CODING_QUOTA_WEIGHTS = {
   entities: 2,
   preferences: 1,
   experiences: 1,
+  work_item: 2,
   resources: 3,
   skills: 2,
 };
@@ -84,7 +85,7 @@ function scaleQuotas(limit, weights) {
 
 function legacyMemoryQuotas(limit) {
   return {
-    ...scaleQuotas(limit, { events: 10, entities: 10, preferences: 3 }),
+    ...scaleQuotas(limit, { events: 10, entities: 10, preferences: 3, work_item: 2 }),
     experiences: 0,
   };
 }
@@ -473,6 +474,18 @@ function looksLikeUnknownField(res) {
   return text.includes("extra") || text.includes("mode") || text.includes("unexpected");
 }
 
+// Old servers reject the new quota key before executing recall. Remove only
+// that explicitly unsupported bucket; unrelated validation errors stay errors.
+function withoutUnsupportedWorkItemQuota(body, res) {
+  if (res.ok || ![400, 422].includes(res.status) || !body.quotas ||
+      !Object.hasOwn(body.quotas, "work_item")) return null;
+  const text = JSON.stringify(res?.error ?? res?.result ?? res?.detail ?? "").toLowerCase();
+  if (!/unknown quota keys?:[^;]*\bwork_item\b/.test(text)) return null;
+  const quotas = { ...body.quotas };
+  delete quotas.work_item;
+  return { ...body, quotas };
+}
+
 function wrapContext(body) {
   // Retrieved text cannot introduce a second capture delimiter inside ours.
   const text = String(body)
@@ -513,10 +526,17 @@ export async function fetchAssembledContext(fetchJSON, cfg, query, options = {})
 
   const body = buildContextSearchBody(cfg, options);
   body.query = query;
-  const res = await fetchJSON("/api/v1/search/search", {
+  let res = await fetchJSON("/api/v1/search/search", {
     method: "POST",
     body: JSON.stringify(body),
   }, { actorPeerId, timeoutMs: contextRequestTimeoutMs(cfg, body) });
+  const downgraded = withoutUnsupportedWorkItemQuota(body, res);
+  if (downgraded) {
+    log("recall_work_item_quota_downgrade", { status: res.status || 0 });
+    res = await fetchJSON("/api/v1/search/search", {
+      method: "POST", body: JSON.stringify(downgraded),
+    }, { actorPeerId, timeoutMs: contextRequestTimeoutMs(cfg, downgraded) });
+  }
 
   if (!res.ok) {
     const status = res.status || 0;
@@ -626,7 +646,7 @@ export async function postRecall(fetchJSON, body, opts = {}) {
   const actorPeerId = opts.actorPeerId || "";
   const log = opts.log || (() => {});
   const memoPath = opts.peerScopeMemoPath;
-  const request = { ...body };
+  let request = { ...body };
 
   // A remembered downgrade is still a downgrade: recall runs wider than the
   // caller asked for, so the memo doubles as the doctor's evidence.
@@ -634,29 +654,31 @@ export async function postRecall(fetchJSON, body, opts = {}) {
     delete request.peer_scope;
   }
 
-  const res = await fetchJSON("/api/v1/search/recall", {
-    method: "POST",
-    body: JSON.stringify(request),
-  }, { actorPeerId });
-  if (!request.peer_scope || (res.status !== 400 && res.status !== 422)) {
-    return res;
+  // Each compatibility field can be removed only once: at most three calls,
+  // including the original, even when old servers report errors one at a time.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetchJSON("/api/v1/search/recall", {
+      method: "POST", body: JSON.stringify(request),
+    }, { actorPeerId });
+    if (res.ok || ![400, 422].includes(res.status)) return res;
+    const downgraded = withoutUnsupportedWorkItemQuota(request, res);
+    if (downgraded) {
+      log("recall_work_item_quota_downgrade", { status: res.status || 0 });
+      request = downgraded;
+      continue;
+    }
+    if (!request.peer_scope) return res;
+    // Dropping peer_scope widens recall, so an unrelated validation error
+    // must never trigger that downgrade.
+    if (!looksLikeUnknownField(res)) {
+      log("recall_peer_scope_error", { status: res.status || 0 });
+      return res;
+    }
+    await markPeerScopeDowngrade(String(request.peer_scope), res.status || 0, memoPath);
+    log("recall_peer_scope_downgrade", { status: res.status || 0 });
+    request = { ...request };
+    delete request.peer_scope;
   }
-  // Only an unknown-field rejection means "this server predates peer_scope".
-  // Retrying every other 400/422 without it silently widens the search from
-  // the caller's own peer to the whole user root.
-  if (!looksLikeUnknownField(res)) {
-    log("recall_peer_scope_error", { status: res.status || 0 });
-    return res;
-  }
-
-  const downgraded = { ...request };
-  delete downgraded.peer_scope;
-  await markPeerScopeDowngrade(String(request.peer_scope), res.status || 0, memoPath);
-  log("recall_peer_scope_downgrade", { status: res.status || 0 });
-  return fetchJSON("/api/v1/search/recall", {
-    method: "POST",
-    body: JSON.stringify(downgraded),
-  }, { actorPeerId });
 }
 
 /**

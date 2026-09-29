@@ -22,6 +22,7 @@ MEMORY_CATEGORIES = [
     "preferences",
     "entities",
     "events",
+    "work_item",
     "cases",
     "patterns",
     "tools",

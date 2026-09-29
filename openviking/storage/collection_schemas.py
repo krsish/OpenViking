@@ -121,6 +121,9 @@ class CollectionSchemas:
                 #   - level=1: {目录}/.overview.md
                 #   - level=2: {文件路径}
                 {"FieldName": "level", "FieldType": "int64"},
+                # Exact L2 readiness checks need a persisted field: Context.meta
+                # is runtime-only and gets filtered out by storage adapters.
+                {"FieldName": "work_item_version", "FieldType": "int64", "DefaultValue": 0},
                 {"FieldName": "name", "FieldType": "string"},
                 {"FieldName": "description", "FieldType": "string"},
                 {"FieldName": "tags", "FieldType": "string"},
@@ -353,6 +356,12 @@ async def init_context_collection(storage) -> bool:
     expected_fields = {field.get("FieldName") for field in schema["Fields"]}
     existing_fields = {field.get("FieldName") for field in existing_meta.get("Fields", [])}
     missing_fields = sorted(expected_fields - existing_fields)
+    if "work_item_version" in missing_fields and vectordb_cfg.backend not in {"local", "cuvs"}:
+        logger.warning(
+            "Existing collection lacks work_item_version; add an int64 field with default 0 "
+            "before enabling work_item cold checkpoints. Per-item index readiness stays false "
+            "until this remote collection is migrated and the items are reindexed."
+        )
     expected_scalar_indexes = set(schema["ScalarIndex"])
     existing_scalar_indexes = set(existing_meta.get("ScalarIndex", []))
     missing_scalar_indexes = sorted(expected_scalar_indexes - existing_scalar_indexes)
@@ -937,7 +946,18 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     upsert_options = normalize_upsert_options(
                         {**raw_upsert_options, "partial_update": False}
                     )
-                    if inserted_data.get("context_type") == ContextType.SKILL.value:
+                    from openviking.session.memory.work_item_index import (
+                        is_work_item_leaf,
+                        upsert_work_item_embedding,
+                    )
+
+                    if inserted_data.get(
+                        "context_type"
+                    ) == ContextType.MEMORY.value and is_work_item_leaf(str(uri or "")):
+                        result = await upsert_work_item_embedding(
+                            self._vikingdb, inserted_data, ctx=ctx, options=upsert_options
+                        )
+                    elif inserted_data.get("context_type") == ContextType.SKILL.value:
                         # Cancelling the waiter cannot stop a threaded DB write.
                         # Keep this task active until that write has settled.
                         result = await run_to_completion(

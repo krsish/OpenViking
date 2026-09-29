@@ -23,6 +23,7 @@ export function createTakeoverManager(opts: {
       // the session's newest `/context` overview — the latter can be an older
       // archive this takeover did not create.
       readArchiveOverview: (archiveUri: string) => client.readArchiveOverview(archiveUri),
+      readArchiveCheckpoint: (archiveUri: string) => client.readArchiveCheckpoint(archiveUri),
       // Whether a still-unsummarized archive can get its summary at all.
       archiveState: (archiveUri: string) => client.getArchiveState(archiveUri),
       // The exact server keep_recent_count for the retained tail (message count,

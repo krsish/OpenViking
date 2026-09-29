@@ -22,7 +22,20 @@ export interface PendingArchive {
   coveredUserTurns: number;
   frozenTokens: number;
   nativeCompaction?: boolean;
+  compactionEntryId?: string;
 }
+
+export interface WorkItemCheckpoint {
+  mode: "work_item";
+  version: 1;
+  compact_ready: true;
+  archive_id?: string;
+  starting_message_id: string;
+  ending_message_id: string;
+  work_items: { uri: string; version: number }[];
+}
+
+export function isReadyWorkItemCheckpoint(value: unknown): value is WorkItemCheckpoint;
 
 export interface TakeoverPersistedState {
   /** The pi entry id the covered prefix ends at (inclusive); "" when none. */
@@ -41,9 +54,13 @@ export interface TakeoverPersistedState {
   captureGap?: boolean;
   archiveUri?: string;
   historyUri?: string;
+  workingMemoryMode?: "legacy" | "work_item";
+  readyCheckpoint?: WorkItemCheckpoint | null;
+  readyCompactionEntryId?: string;
 }
 
 export interface TakeoverConfig {
+  workingMemoryMode?: "legacy" | "work_item";
   takeoverEnabled?: boolean;
   takeoverTokenThreshold?: number;
   takeoverKeepRecentTurns?: number;
@@ -68,6 +85,7 @@ export interface TakeoverIo {
   commit?: (opts?: { queueOnFailure?: boolean; keepRecentCount?: number; timeoutMs?: number }) => Promise<unknown> | unknown;
   /** Read one archive's `.overview.md` by its uri; null until it is ready. */
   readArchiveOverview?: (archiveUri: string) => Promise<string | null> | string | null;
+  readArchiveCheckpoint?: (archiveUri: string) => Promise<{ overview: string; checkpoint: WorkItemCheckpoint } | null>;
   /** An archive's terminal state from its `.done` / `.failed.json` markers; null when unknown. */
   archiveState?: (archiveUri: string) => Promise<"completed" | "failed" | "pending" | null> | string | null;
   /** Exact server keep_recent_count for a retained tail (message count). */
@@ -136,7 +154,8 @@ export class TakeoverCore {
   resumePending(branch?: any[] | (() => any[]), opts?: HandlerDeadline): Promise<boolean>;
   commitAndAdvance(branch?: any[] | (() => any[]), opts?: HandlerDeadline): Promise<boolean>;
   handleBeforeCompact(
-    preparation?: { firstKeptEntryId?: string; tokensBefore?: number; signal?: AbortSignal },
+    preparation?: { firstKeptEntryId?: string; tokensBefore?: number; signal?: AbortSignal;
+      contextWindow?: number; reserveTokens?: number; overheadTokens?: number },
     branch?: any[] | (() => any[]),
     opts?: HandlerDeadline,
   ): Promise<
@@ -145,7 +164,8 @@ export class TakeoverCore {
           summary: string;
           firstKeptEntryId: string;
           tokensBefore: number;
-          details: { source: string };
+          estimatedTokensAfter?: number;
+          details: { source: string; [key: string]: unknown };
         };
       }
     | undefined

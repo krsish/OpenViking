@@ -1398,3 +1398,68 @@ async def test_full_upsert_carries_existing_record_id_as_internal_override(monke
     msg = queue.items[0]
     assert msg.context_data["_upsert_record_id"] == "id-from-vector-db"
     assert "_record_id" not in msg.context_data
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text_source", ["summary_first", "content_only"])
+@pytest.mark.parametrize("supplied_content", [False, True])
+async def test_work_item_reindex_binds_version_to_body_snapshot(
+    monkeypatch, text_source, supplied_content
+):
+    from openviking.session.memory.dataclass import MemoryFile
+    from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
+
+    uri = "viking://user/default/memories/work_item/wi_a.md"
+    snapshot = MemoryFileUtils.write(
+        MemoryFile(
+            uri=uri,
+            memory_type="work_item",
+            content="Current task state: waiting for rollout approval.",
+            extra_fields={"version": 7},
+        )
+    )
+    queue = DummyQueue()
+    # If caller supplies a snapshot, a later file version must not relabel it.
+    fs = DummyFS("Later canonical content must not be read" if supplied_content else snapshot)
+    monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: DummyQueueManager(queue))
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: fs)
+    monkeypatch.setattr(
+        embedding_utils,
+        "get_openviking_config",
+        lambda: types.SimpleNamespace(
+            embedding=types.SimpleNamespace(text_source=text_source, max_input_tokens=1000)
+        ),
+    )
+    result = await embedding_utils.vectorize_file(
+        file_path=uri,
+        parent_uri="viking://user/default/memories/work_item",
+        summary_dict={"name": "wi_a.md", "summary": "Stale task state: deploy now"},
+        context_type="memory",
+        ctx=DummyReq(),
+        file_content=snapshot.encode() if supplied_content else None,
+        use_summary=True,
+    )
+    assert result is True
+    assert len(queue.items) == 1
+    message = queue.items[0]
+    assert message.context_data["meta"]["work_item_version"] == 7
+    assert message.message == "Current task state: waiting for rollout approval."
+    assert message.context_data["abstract"] == message.message
+    assert fs.read_file_calls == (0 if supplied_content else 1)
+
+
+@pytest.mark.asyncio
+async def test_work_item_reindex_does_not_enqueue_unversioned_text(monkeypatch):
+    queue = DummyQueue()
+    fs = DummyFS("Unversioned task content")
+    monkeypatch.setattr(embedding_utils, "get_queue_manager", lambda: DummyQueueManager(queue))
+    monkeypatch.setattr(embedding_utils, "get_viking_fs", lambda: fs)
+    with pytest.raises(ValueError, match="positive source version"):
+        await embedding_utils.vectorize_file(
+            file_path="viking://user/default/memories/work_item/wi_a.md",
+            parent_uri="viking://user/default/memories/work_item",
+            summary_dict={"name": "wi_a.md", "summary": "Summary cannot establish source version"},
+            context_type="memory",
+            ctx=DummyReq(),
+        )
+    assert queue.items == []

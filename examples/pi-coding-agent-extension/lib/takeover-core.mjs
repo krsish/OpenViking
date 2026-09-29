@@ -31,12 +31,39 @@ function numberOr(value, fallback) {
 function takeoverConfig(config = {}) {
   return {
     takeoverEnabled: config.takeoverEnabled !== false,
+    workingMemoryMode: config.workingMemoryMode === "work_item" ? "work_item" : "legacy",
     takeoverTokenThreshold: Math.max(0, numberOr(config.takeoverTokenThreshold, DEFAULT_CONFIG.takeoverTokenThreshold)),
     takeoverKeepRecentTurns: Math.max(0, numberOr(config.takeoverKeepRecentTurns, DEFAULT_CONFIG.takeoverKeepRecentTurns)),
     takeoverOverviewBudget: Math.max(1, numberOr(config.takeoverOverviewBudget, DEFAULT_CONFIG.takeoverOverviewBudget)),
     takeoverOverviewPollMs: Math.max(0, numberOr(config.takeoverOverviewPollMs, DEFAULT_CONFIG.takeoverOverviewPollMs)),
     takeoverOverviewPollMax: Math.max(1, numberOr(config.takeoverOverviewPollMax, DEFAULT_CONFIG.takeoverOverviewPollMax)),
   };
+}
+
+/** Publication, not the presence of an overview, makes a checkpoint usable. */
+export function isReadyWorkItemCheckpoint(value) {
+  return value?.mode === "work_item" && value.version === 1 && value.compact_ready === true &&
+    typeof value.starting_message_id === "string" && Boolean(value.starting_message_id) &&
+    typeof value.ending_message_id === "string" && Boolean(value.ending_message_id) &&
+    Array.isArray(value.work_items) && value.work_items.every((item) =>
+      typeof item?.uri === "string" && item.uri.startsWith("viking://") &&
+      Number.isInteger(item.version) && item.version > 0);
+}
+
+// Keep complete payloads: capture previews and flattenContent discard tool
+// metadata/results, and cannot stand in for an uncovered Pi transcript.
+function transcriptEntry(entry) {
+  if (entry?.type === "message") return { id: entry.id, type: entry.type, message: entry.message };
+  if (["custom_message", "branch_summary", "compaction"].includes(entry?.type)) return entry;
+  return null;
+}
+
+function transcriptText(entries) {
+  return entries.map(transcriptEntry).filter(Boolean).map((entry) => JSON.stringify(entry)).join("\n");
+}
+
+function latestCompactionId(entries) {
+  return entries.find((entry) => entry?.type === "compaction")?.id || "";
 }
 
 function asEntry(value) {
@@ -180,14 +207,24 @@ export function findBoundaryIndex(messages, coveredUserTurns) {
 
 export function estimateTokens(text) {
   const value = String(text || "");
-  if (!value) return 0;
-  let cjk = 0;
-  let other = 0;
-  for (const ch of value) {
-    if (ch.codePointAt(0) >= 0x3000) cjk++;
-    else other++;
+  // Match openviking/utils/token_estimation.py. for-of iterates code points,
+  // and quarter-token units avoid floating-point drift across the two sides.
+  let units = 0;
+  for (const char of value) {
+    const cp = char.codePointAt(0);
+    if ((cp >= 0x4E00 && cp <= 0x9FFF) ||
+        (cp >= 0x1100 && cp <= 0x11FF) ||
+        (cp >= 0x3000 && cp <= 0x30FF) ||
+        (cp >= 0x3130 && cp <= 0x318F) ||
+        (cp >= 0x31F0 && cp <= 0x31FF) ||
+        (cp >= 0x3400 && cp <= 0x4DBF) ||
+        (cp >= 0xAC00 && cp <= 0xD7AF) ||
+        (cp >= 0xF900 && cp <= 0xFAFF) ||
+        (cp >= 0xFF00 && cp <= 0xFFEF) ||
+        (cp >= 0x20000 && cp <= 0x2EBEF)) units += 6;
+    else units += cp > 0xFFFF ? 8 : 1;
   }
-  return Math.ceil(cjk * 1.5 + other / 4);
+  return Math.ceil(units / 4);
 }
 
 export function truncateToTokens(text, budget) {
@@ -323,6 +360,7 @@ export class TakeoverCore {
       // Read the Working Memory of a SPECIFIC archive by its uri, so the summary
       // provably belongs to this commit and not to an older /context archive.
       readArchiveOverview: io.readArchiveOverview || (async () => null),
+      readArchiveCheckpoint: io.readArchiveCheckpoint || (async () => null),
       // An archive's terminal state from its server markers: "completed",
       // "failed", "pending", or null when it cannot be asked.
       archiveState: io.archiveState || (async () => null),
@@ -348,6 +386,9 @@ export class TakeoverCore {
     // Display only: user turns the boundary covers in the active context.
     this.coveredUserTurns = 0;
     this.overview = "";
+    this.readyCheckpoint = null;
+    this.readyCompactionEntryId = "";
+    this.lastReadCheckpoint = null;
     this.pendingTokens = 0;
     this.lastSeenUserTurns = 0;
     this.syncedEntryCount = 0;
@@ -389,6 +430,7 @@ export class TakeoverCore {
       captureGap: this.captureGap,
       archiveUri: this.archiveUri,
       historyUri: this.historyUri,
+      readyCheckpoint: this.readyCheckpoint,
     };
   }
 
@@ -419,6 +461,15 @@ export class TakeoverCore {
       this.captureGap = data.captureGap === true;
       this.archiveUri = typeof data.archiveUri === "string" ? data.archiveUri : "";
       this.historyUri = typeof data.historyUri === "string" ? data.historyUri : "";
+      this.readyCheckpoint = isReadyWorkItemCheckpoint(data.readyCheckpoint) ? data.readyCheckpoint : null;
+      this.readyCompactionEntryId = typeof data.readyCompactionEntryId === "string" ? data.readyCompactionEntryId : "";
+      if (this.config.workingMemoryMode === "work_item" &&
+          (data.workingMemoryMode !== "work_item" || !this.readyCheckpoint ||
+           estimateTokens(this.overview) > this.config.takeoverOverviewBudget)) {
+        this.overview = "";
+        this.resetBoundary("unverified work-item checkpoint");
+        if (data.workingMemoryMode !== "work_item") this.pendingArchive = null;
+      }
       this.lastPersisted = JSON.stringify(this.persistedState());
       this.log(
         `takeover: restored boundary ${this.coveredThroughEntryId || (this.legacyBoundary ? `at ${this.coveredUserTurns} user turns (count-based)` : "none")}` +
@@ -443,6 +494,8 @@ export class TakeoverCore {
 
     if (!this.enabled || !this.overview) return list;
     const entries = projectContextEntries(currentBranch(branch));
+    if (this.config.workingMemoryMode === "work_item" &&
+        latestCompactionId(entries) !== this.readyCompactionEntryId) return list;
     if (this.legacyBoundary) this.adoptLegacyBoundary(list, entries);
     if (!this.coveredThroughEntryId) return list;
 
@@ -470,12 +523,16 @@ export class TakeoverCore {
     // reconciles tools against the executable set on every request, so keeping
     // the existing declarations introduces no duplicate. System messages inside
     // the retained tail are left where they are, not hoisted in front.
-    const coveredSystem = [];
+    const preserved = [];
+    const capturedRoles = new Set(["user", "assistant", "tool", "tool_result", "toolResult", "tool_call", "toolCall"]);
     for (let i = 0; i < cut; i++) {
-      if (list[i]?.role === "system") coveredSystem.push(list[i]);
+      // Work-item capture excludes Pi custom/branch/compaction context. An
+      // overview cannot cover those messages, or any unknown extension role.
+      if (list[i]?.role === "system" ||
+          (this.config.workingMemoryMode === "work_item" && !capturedRoles.has(list[i]?.role))) preserved.push(list[i]);
     }
     return [
-      ...coveredSystem,
+      ...preserved,
       buildOverviewMessage(
         this.overview, firstKeptTs, this.config.takeoverOverviewBudget, this.recoveryHint(),
       ),
@@ -574,7 +631,7 @@ export class TakeoverCore {
     if (this.remaining(until) < 2 * READ_RESERVE_MS) return false;
     this.committing = true;
     try {
-      return await this.resolvePendingArchive(branch);
+      return await this.resolvePendingArchive(branch, until);
     } catch (error) {
       this.log(`takeover: pending archive check failed (${errorMessage(error)}); boundary held`);
       return false;
@@ -599,7 +656,7 @@ export class TakeoverCore {
     const until = this.deadlineFrom(deadline);
     this.committing = true;
     try {
-      if (this.pendingArchive) return await this.resolvePendingArchive(branch);
+      if (this.pendingArchive) return await this.resolvePendingArchive(branch, until);
       return await this.beginArchive(branch, until);
     } catch (error) {
       this.log(`takeover: archive preparation failed (${errorMessage(error)}); boundary held`);
@@ -676,6 +733,7 @@ export class TakeoverCore {
       coveredThroughEntryId: archive.coveredThroughEntryId,
       coveredUserTurns: archive.coveredUserTurns,
       frozenTokens: archive.frozenTokens,
+      compactionEntryId: archive.compactionEntryId,
     };
     this.persist();
     this.log(`takeover: ${archive.archiveUri} committed, Working Memory not ready; checking on later turns`);
@@ -717,7 +775,7 @@ export class TakeoverCore {
    * failed summary, or a server with Working Memory disabled, would otherwise
    * hold takeover on this archive for the rest of the session.
    */
-  async resolvePendingArchive(branch) {
+  async resolvePendingArchive(branch, until = Infinity) {
     const pending = this.pendingArchive;
     if (!pending) return false;
     // A branch switch or a pi compaction during the wait can take the frozen
@@ -732,10 +790,16 @@ export class TakeoverCore {
 
     let overview = await this.readOverviewOnce(pending.archiveUri);
     if (!overview) {
+      if (this.config.workingMemoryMode === "work_item" && this.remaining(until) < READ_RESERVE_MS * 2) return false;
       const state = await this.io.archiveState(pending.archiveUri);
       if (!TERMINAL_ARCHIVE_STATES.has(state)) return false;
       // The summary may have landed between the two reads.
-      overview = await this.readOverviewOnce(pending.archiveUri);
+      if (this.config.workingMemoryMode !== "work_item" || state === "completed") {
+        // One bounded publication-race recheck, never a polling loop. If the
+        // handler ran out of read budget, keep pending for the next event.
+        if (this.config.workingMemoryMode === "work_item" && this.remaining(until) < READ_RESERVE_MS) return false;
+        overview = await this.readOverviewOnce(pending.archiveUri);
+      }
       if (!overview) {
         this.pendingArchive = null;
         // Wait for fresh pressure before the next archive, so a server that
@@ -763,7 +827,9 @@ export class TakeoverCore {
 
   /** Move the boundary to a summarized archive, re-checking the frozen prefix first. */
   advanceTo(branch, frozen, overview) {
-    if (!this.inActiveContext(branch, frozen.coveredThroughEntryId)) {
+    if (!this.inActiveContext(branch, frozen.coveredThroughEntryId) ||
+        (this.config.workingMemoryMode === "work_item" &&
+         latestCompactionId(projectContextEntries(currentBranch(branch))) !== (frozen.compactionEntryId || ""))) {
       this.pendingArchive = null;
       this.persist();
       this.log("takeover: frozen boundary no longer in history; advance abandoned");
@@ -774,6 +840,10 @@ export class TakeoverCore {
     this.coveredUserTurns = frozen.coveredUserTurns;
     this.legacyBoundary = null;
     this.overview = overview;
+    this.readyCheckpoint = this.config.workingMemoryMode === "work_item"
+      ? this.lastReadCheckpoint?.archiveUri === frozen.archiveUri ? this.lastReadCheckpoint.checkpoint : null
+      : null;
+    this.readyCompactionEntryId = frozen.compactionEntryId || "";
     this.archiveUri = frozen.archiveUri;
     this.historyUri = frozen.historyUri || "";
     this.pendingArchive = null;
@@ -841,6 +911,7 @@ export class TakeoverCore {
       coveredUserTurns: users.length - keep,
       keepRecentCount: Math.max(0, Math.floor(Number(this.io.captureCount(raw.slice(rawThrough + 1))) || 0)),
       frozenTokens: this.pendingTokens,
+      compactionEntryId: latestCompactionId(entries),
     };
   }
 
@@ -864,6 +935,9 @@ export class TakeoverCore {
    * must then keep applying to the uncompacted context.
    */
   async handleBeforeCompact(preparation = {}, branch = [], { deadline } = {}) {
+    if (this.config.workingMemoryMode === "work_item") {
+      return this.handleWorkItemCompact(preparation, branch, { deadline });
+    }
     if (!this.enabled || this.committing) return undefined;
     if (!preparation.firstKeptEntryId) return undefined;
     // A gap means the archive is missing messages, so an OpenViking summary
@@ -950,6 +1024,113 @@ export class TakeoverCore {
     }
   }
 
+  /** One readiness check, then a ready prefix plus verbatim uncovered tail. */
+  async handleWorkItemCompact(preparation, branch, { deadline } = {}) {
+    if (!this.enabled || this.committing || this.captureGap || preparation.signal?.aborted) return undefined;
+    const initial = projectContextEntries(currentBranch(branch));
+    if (initial.findIndex((entry) => entry.id === preparation.firstKeptEntryId) <= 0) return undefined;
+    const until = this.deadlineFrom(deadline);
+    const previousRead = this.lastReadCheckpoint;
+    this.committing = true;
+    try {
+      if (this.pendingArchive) {
+        if (this.remaining(until) >= READ_RESERVE_MS * 3) await this.resolvePendingArchive(branch, until);
+      } else if (this.remaining(until) >= COMMIT_RESERVE_MS) {
+        // Same trigger and phase-1 commit as turn_end; no model/index wait and
+        // no polling. A pending result leaves the previous ready prefix usable.
+        await this.beginArchive(branch, until);
+      }
+      if (preparation.signal?.aborted || this.remaining(until) <= 0 || this.captureGap) return undefined;
+      // The archive's coverage stays fixed, but another session may have
+      // updated its active work items. Refresh the cached hot view once before
+      // giving it to Pi; a newly read/advanced checkpoint is already current.
+      if (this.readyCheckpoint && this.coveredThroughEntryId &&
+          (this.lastReadCheckpoint === previousRead || this.lastReadCheckpoint?.archiveUri !== this.archiveUri)) {
+        if (this.remaining(until) < READ_RESERVE_MS) return undefined;
+        const previousCheckpoint = this.readyCheckpoint;
+        const refreshed = await this.readOverviewOnce(this.archiveUri);
+        const checkpoint = this.lastReadCheckpoint?.checkpoint;
+        if (!refreshed || checkpoint?.starting_message_id !== previousCheckpoint.starting_message_id ||
+            checkpoint?.ending_message_id !== previousCheckpoint.ending_message_id) return undefined;
+        this.overview = refreshed;
+        this.readyCheckpoint = checkpoint;
+        this.persist();
+      }
+      if (preparation.signal?.aborted || this.remaining(until) <= 0) return undefined;
+      const result = this.workItemCompaction(preparation, branch);
+      if (!result) return undefined;
+      // Once Pi consumes this result, neither the old boundary nor a late
+      // checkpoint may be installed over its newly compacted context.
+      if (this.pendingArchive) this.pendingArchive.nativeCompaction = true;
+      this.resetBoundary("pi compaction absorbed work-item checkpoint");
+      this.persist();
+      return result;
+    } catch (error) {
+      this.log(`takeover: work-item compaction unavailable (${errorMessage(error)}); using pi compaction`);
+      return undefined;
+    } finally {
+      if (this.pendingArchive) {
+        this.pendingArchive.nativeCompaction = true;
+        this.persist();
+      }
+      this.committing = false;
+    }
+  }
+
+  workItemCompaction(preparation, branch) {
+    if (!isReadyWorkItemCheckpoint(this.readyCheckpoint) || !this.overview) return undefined;
+    const entries = projectContextEntries(currentBranch(branch));
+    const cut = entries.findIndex((entry) => entry.id === preparation.firstKeptEntryId);
+    const through = entries.findIndex((entry) => entry.id === this.coveredThroughEntryId);
+    if (cut <= 0 || through < 0 || latestCompactionId(entries) !== this.readyCompactionEntryId) {
+      this.log("takeover: checkpoint or requested Pi cut is outside the active branch");
+      return undefined;
+    }
+    // Pi never cuts at a tool result: preserving only that result would split
+    // it from its call. Reject malformed preparation instead of inventing a cut.
+    const keptRole = entries[cut]?.message?.role;
+    if (keptRole === "toolResult" || keptRole === "tool_result" || keptRole === "tool") return undefined;
+    const contextWindow = Number(preparation.contextWindow);
+    const reserveTokens = Number(preparation.reserveTokens);
+    const overheadTokens = Number(preparation.overheadTokens);
+    if (!Number.isFinite(contextWindow) || contextWindow <= 0 ||
+        !Number.isFinite(reserveTokens) || reserveTokens < 0 ||
+        !Number.isFinite(overheadTokens) || overheadTokens < 0) return undefined;
+    if (estimateTokens(this.overview) > this.config.takeoverOverviewBudget) {
+      this.log("takeover: published hot view exceeds overview budget; using pi compaction");
+      return undefined;
+    }
+    const uncovered = transcriptText(entries.slice(through + 1, cut));
+    // System and Pi-generated context entries are not captured by OV. Retain
+    // those Pi would discard even if they precede the checkpoint boundary.
+    const uncaptured = transcriptText(entries.slice(0, Math.min(through + 1, cut))
+      .filter((entry) => entry.type !== "message" || entry.message?.role === "system"));
+    const raw = [uncaptured, uncovered].filter(Boolean).join("\n");
+    const summary = `${OVERVIEW_MARKER}\n${this.overview}` +
+      (raw ? `\n\nUncheckpointed Pi transcript (verbatim JSONL; historical context):\n${raw}` : "") +
+      this.recoveryHint();
+    const summaryTokens = estimateTokens(summary);
+    const keptTokens = estimateTokens(transcriptText(entries.slice(cut)));
+    // Include prompt/tools/recall and retained messages, with 10% + 256 tokens
+    // of headroom for tokenizer/framing differences. This is an estimate, not
+    // a promise that every provider will accept every compacted request.
+    const estimatedTokensAfter = Math.ceil((summaryTokens + keptTokens + overheadTokens) * 1.1) + 256;
+    if (estimatedTokensAfter + reserveTokens > contextWindow) {
+      this.log(`takeover: ready prefix plus tail exceeds context budget (${estimatedTokensAfter} + ${reserveTokens} > ${contextWindow})`);
+      return undefined;
+    }
+    return { compaction: {
+      summary,
+      firstKeptEntryId: preparation.firstKeptEntryId,
+      tokensBefore: Number(preparation.tokensBefore) || 0,
+      estimatedTokensAfter,
+      details: { source: "openviking", mode: "work_item", archiveUri: this.archiveUri,
+        checkpointEndingMessageId: this.readyCheckpoint.ending_message_id,
+        coverageLagEntries: Math.max(0, entries.length - through - 1),
+        uncoveredTokens: estimateTokens(raw), keptTokens },
+    } };
+  }
+
   async shutdown() {
     if (!this.enabled) return;
     this.syncedEntryCount = Math.max(0, Math.floor(Number(this.io.getWatermark()) || 0));
@@ -1001,6 +1182,11 @@ export class TakeoverCore {
       // A count-based boundary not yet adopted keeps its fingerprint across restarts.
       ...(this.legacyBoundary ? { fingerprint: this.legacyBoundary.fingerprint } : {}),
       overview: truncateToTokens(this.overview, this.config.takeoverOverviewBudget),
+      ...(this.config.workingMemoryMode === "work_item" ? {
+        workingMemoryMode: "work_item", readyCheckpoint: this.readyCheckpoint,
+        readyCompactionEntryId: this.readyCompactionEntryId,
+        overview: this.overview,
+      } : {}),
       pendingTokens: this.pendingTokens,
       lastSeenUserTurns: this.lastSeenUserTurns,
       syncedEntryCount: watermark,
@@ -1028,6 +1214,13 @@ export class TakeoverCore {
     const uri = String(archiveUri || "").trim();
     if (!uri) return "";
     try {
+      if (this.config.workingMemoryMode === "work_item") {
+        const value = await this.io.readArchiveCheckpoint(uri);
+        if (!isReadyWorkItemCheckpoint(value?.checkpoint) || typeof value?.overview !== "string" ||
+            !value.overview.trim() || estimateTokens(value.overview) > this.config.takeoverOverviewBudget) return "";
+        this.lastReadCheckpoint = { archiveUri: uri, checkpoint: value.checkpoint };
+        return value.overview.trim();
+      }
       const value = await this.io.readArchiveOverview(uri);
       return typeof value === "string" ? value.trim() : "";
     } catch (error) {
@@ -1074,6 +1267,7 @@ function restorePendingArchive(value) {
     coveredThroughEntryId: typeof value.coveredThroughEntryId === "string" ? value.coveredThroughEntryId : "",
     coveredUserTurns: Math.max(0, Math.floor(Number(value.coveredUserTurns) || 0)),
     frozenTokens: Math.max(0, Math.floor(Number(value.frozenTokens) || 0)),
+    compactionEntryId: typeof value.compactionEntryId === "string" ? value.compactionEntryId : "",
     ...(value.nativeCompaction === true ? { nativeCompaction: true } : {}),
   };
 }

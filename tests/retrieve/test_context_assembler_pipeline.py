@@ -1,8 +1,11 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
+import json
 import re
 from types import SimpleNamespace
+
+import pytest
 
 from openviking.retrieve.context_assembler import pipeline as pipeline_module
 from openviking.retrieve.context_assembler import rewrite as rewrite_module
@@ -135,6 +138,7 @@ def test_coding_purpose_uses_absolute_cross_domain_quotas():
         "entities": 2,
         "preferences": 1,
         "experiences": 1,
+        "work_item": 2,
         "resources": 3,
         "skills": 2,
     }
@@ -370,6 +374,7 @@ async def test_purpose_quotas_are_not_truncated_by_global_limit():
         "entities": 2,
         "preferences": 1,
         "experiences": 1,
+        "work_item": 2,
         "resources": 3,
         "skills": 2,
     }
@@ -929,3 +934,147 @@ async def test_flat_retrieval_collapses_skills_and_leaves_other_hits_alone():
     assert result.stats["candidates"] == 3
     assert [entry.uri for entry in result.entries] == [f"{DEPLOY}/SKILL.md", events_dir]
     assert result.stats["deduped"] == 1
+
+
+@pytest.mark.parametrize("quotas", [{"work_item": 3}, None])
+async def test_work_item_recall_only_serves_current_user_canonical_files(quotas):
+    canonical = f"{USER_ROOT}/memories/work_item/wi_a.md"
+    uris = [
+        canonical,
+        f"{USER_ROOT}/peers/current/memories/work_item/actor.md",
+        f"{USER_ROOT}/peers/other/memories/work_item/peer.md",
+        "viking://user/other_user/memories/work_item/foreign.md",
+        f"{USER_ROOT}/memories/work_item/.overview.md",
+    ]
+    calls = []
+
+    async def fake_find(**kwargs):
+        calls.append(kwargs)
+        return _FakeFindResult(
+            memories=[{"uri": uri, "score": 0.9, "abstract": "old state"} for uri in uris]
+        )
+
+    service = _service(hits=[], bodies={canonical: "Goal: ship A. Next: run its tests."})
+    service.search.find = fake_find
+    result = await assemble_context(
+        service=service,
+        ctx=_ctx(),
+        params=AssembleParams(query="resume A", quotas=quotas, peer_scope="all"),
+    )
+
+    assert [(entry.uri, entry.origin) for entry in result.entries] == [(canonical, "self")]
+    if quotas is not None:
+        assert [call["target_uri"] for call in calls] == [f"{USER_ROOT}/memories/work_item"]
+        # Exercise the real adapter's level-filter compiler: search accepts a
+        # list, and an integer fails only once the request reaches storage.
+        from openviking.storage.expr import In
+        from openviking.storage.vectordb_adapters.base import CollectionAdapter
+
+        compiled = CollectionAdapter._compile_filter(
+            SimpleNamespace(_URI_FIELD_NAMES=set()), In("level", calls[0]["level"])
+        )
+        assert compiled == {"op": "must", "field": "level", "conds": [2]}
+
+
+@pytest.mark.parametrize("detail", [None, "abstract", "overview", "full"])
+async def test_work_item_recall_reads_latest_body_even_with_abstract_pin(detail):
+    uri = f"{USER_ROOT}/memories/work_item/wi_a.md"
+    bodies = {uri: "Goal: ship A. Status: blocked. Next: wait for approval."}
+    service = _service(
+        hits=[{"uri": uri, "score": 0.9, "abstract": "Status: open. Next: deploy now."}],
+        bodies=bodies,
+    )
+    params = AssembleParams(query="resume A", quotas={"work_item": 1}, detail=detail)
+    first = await assemble_context(service=service, ctx=_ctx(), params=params)
+    assert "wait for approval" in first.entries[0].text
+    assert "deploy now" not in first.rendered
+
+    bodies[uri] = "Goal: ship A. Status: done. Next: no further action."
+    second = await assemble_context(service=service, ctx=_ctx(), params=params)
+    assert "no further action" in second.entries[0].text
+    assert "wait for approval" not in second.rendered
+    assert second.stats["used_tokens"] <= params.max_tokens
+
+
+@pytest.mark.parametrize("detail", [None, "abstract"])
+async def test_missing_work_item_body_never_falls_back_to_stale_index(detail):
+    uri = f"{USER_ROOT}/memories/work_item/deleted.md"
+    result = await assemble_context(
+        service=_service(
+            hits=[{"uri": uri, "score": 0.9, "abstract": "Next: execute obsolete action."}],
+            bodies={},
+        ),
+        ctx=_ctx(),
+        params=AssembleParams(query="resume", quotas={"work_item": 1}, detail=detail),
+    )
+    assert len(result.entries) == 1
+    assert result.entries[0].detail == "uri"
+    assert result.entries[0].text == ""
+    assert "obsolete action" not in result.rendered
+
+
+async def test_work_item_ignores_automatic_cooldown_but_honors_explicit_exclusion():
+    uri = f"{USER_ROOT}/memories/work_item/wi_a.md"
+    entity = f"{USER_ROOT}/memories/entities/project.md"
+    session = _fake_session()
+    session.uri = f"{USER_ROOT}/sessions/session-a"
+    session.meta = SimpleNamespace(total_message_count=10)
+    writes = []
+
+    async def read_ledger(*args, **kwargs):
+        return json.dumps(
+            {
+                "entries": {
+                    uri: {"turn": 9, "detail": "full"},
+                    entity: {"turn": 9, "detail": "abstract"},
+                }
+            }
+        )
+
+    async def write_ledger(**kwargs):
+        writes.append(json.loads(kwargs["content"]))
+
+    service = _service(
+        hits=[{"uri": uri, "score": 0.9, "abstract": "old"}],
+        bodies={uri: "Status: waiting. Next: inspect the new review."},
+        session=session,
+    )
+    service.viking_fs = SimpleNamespace(read_file=read_ledger, write_file=write_ledger)
+    params = AssembleParams(
+        query="continue A",
+        quotas={"work_item": 1},
+        session_id="session-a",
+        query_expansion="off",
+        dedup_turns=5,
+    )
+    result = await assemble_context(service=service, ctx=_ctx(), params=params)
+    assert [entry.uri for entry in result.entries] == [uri]
+    assert result.stats["dedup"]["cooled"] == 1
+    assert writes[-1]["entries"] == {entity: {"turn": 9, "detail": "abstract"}}
+
+    params.exclude_uris = [uri]
+    excluded = await assemble_context(service=service, ctx=_ctx(), params=params)
+    assert excluded.entries == []
+
+
+def test_work_item_default_quotas_cover_both_purposes_and_recall_preset():
+    from openviking.retrieve.context_assembler.params import DEFAULT_QUOTAS
+
+    assert normalize_quotas(None, "coding")["work_item"] > 0
+    assert normalize_quotas(None, "chat")["work_item"] > 0
+    assert DEFAULT_QUOTAS["work_item"] > 0
+
+
+async def test_oversized_work_item_degrades_to_uri_without_using_stale_abstract():
+    uri = f"{USER_ROOT}/memories/work_item/wi_a.md"
+    result = await assemble_context(
+        service=_service(
+            hits=[{"uri": uri, "score": 0.9, "abstract": "obsolete short action"}],
+            bodies={uri: "Current state with detailed constraints. " * 500},
+        ),
+        ctx=_ctx(),
+        params=AssembleParams(query="resume A", quotas={"work_item": 1}, max_tokens=100),
+    )
+    assert result.entries[0].detail == "uri"
+    assert "obsolete short action" not in result.rendered
+    assert result.stats["used_tokens"] <= 100

@@ -143,6 +143,7 @@ class _MemoryObject:
     deleted: bool = False
     replacement: _MemoryObject | None = None
     changed_fields: dict[str, Any] = field(default_factory=dict)
+    activation_ranges: str | None = None
 
 
 _UNSET = object()
@@ -175,6 +176,15 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         lines = list(_CONTRACT_PREAMBLE)
         for schema in context.schemas:
             lines.extend(self._render_schema_contract(context, schema))
+        if any(schema.memory_type == "work_item" for schema in context.schemas):
+            lines.append(
+                '- existing_work_item.activate(ranges="<current user message indices>"): '
+                "resume at most 3 already-read nonterminal work_items whose goal and scope "
+                "match the current user request. Use the supplied existing-object variable. "
+                "Activation changes no fields and writes no memory; emit it even when the user "
+                "resumes work without new state. Search similarity alone is insufficient. "
+                "Do not activate unrelated or done/cancelled items. This does not claim coverage."
+            )
         if not context.link_enabled:
             lines.append("Links are disabled; obj.link(...) is unavailable.")
         else:
@@ -296,11 +306,22 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             return None, str(exc)
 
     def render_final_instruction(self, context: ExtractionOutputContext) -> str:
-        del context
+        activation_hint = (
+            " Include .activate(ranges=...) when the user resumes a matching existing work_item "
+            "even if no fields change."
+            if any(schema.memory_type == "work_item" for schema in context.schemas)
+            else ""
+        )
         return (
             "You have reached the maximum number of tool call iterations. Do not call any more "
             "tools. Return the complete restricted Python memory SDK program now. Output only "
-            "Python code. If there are no changes, return only sdk.commit()."
+            "Python code."
+            + activation_hint
+            + (
+                " If there are no changes or activations, return only sdk.commit()."
+                if activation_hint
+                else " If there are no changes, return only sdk.commit()."
+            )
         )
 
     def render_format_retry(self, error: str | None = None) -> str:
@@ -979,6 +1000,21 @@ class _PythonProgramCompiler:
             self._error(node, f"{method}() must be a standalone statement")
         if not owner.existing and not owner.name:
             self._error(node, "assign a new memory object before calling methods on it")
+        if method == "activate":
+            kwargs = self._eval_keywords(node)
+            if (
+                owner.memory_type != "work_item"
+                or not owner.existing
+                or owner.deleted
+                or "work_item_activations" not in self.context.operations_model.model_fields
+            ):
+                self._error(node, "activate() is available only for an already-read work_item")
+            if node.args or set(kwargs) != {"ranges"} or not isinstance(kwargs["ranges"], str):
+                self._error(
+                    node, "activate() requires only ranges= with current user message indices"
+                )
+            owner.activation_ranges = kwargs["ranges"]
+            return None
         if method == "update":
             if node.args:
                 self._error(node, "update() accepts keyword arguments only")
@@ -1226,6 +1262,10 @@ class _PythonProgramCompiler:
                     }
                 )
                 continue
+            if obj.activation_ranges is not None:
+                payload["work_item_activations"].append(
+                    {"page_id": obj.page_id, "ranges": obj.activation_ranges}
+                )
             if not obj.changed_fields:
                 continue
             fields = dict(obj.changed_fields)

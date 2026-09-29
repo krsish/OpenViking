@@ -183,6 +183,7 @@ export const KNOBS = [
   { name: "repoContextCacheTtlMs", type: "int", default: 60000, min: 1000, max: 3600000, capability: "session" },
 
   { name: "takeoverEnabled", type: "bool", default: true, env: "OPENVIKING_TAKEOVER", capability: "session" },
+  { name: "workingMemoryMode", type: "enum", values: ["legacy", "work_item"], default: "legacy", capability: "session" },
   { name: "takeoverTokenThreshold", type: "int", default: 30000, min: 1, max: 1000000, capability: "session" },
   { name: "takeoverKeepRecentTurns", type: "int", default: 3, min: 0, max: 100, capability: "session" },
   { name: "takeoverOverviewBudget", type: "int", default: 3000, min: 100, max: 50000, capability: "session" },

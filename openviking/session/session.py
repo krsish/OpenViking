@@ -21,6 +21,7 @@ from openviking.message import Message, Part
 from openviking.message.part import TextPart, ToolPart
 from openviking.server.config import ToolOutputExternalizationConfig
 from openviking.server.identity import RequestContext, Role
+from openviking.session import work_items as wi
 from openviking.session import working_memory as wm
 from openviking.session.archive_store import (
     ArchiveStore,
@@ -135,22 +136,24 @@ def _apply_agent_evolution_setting(
 ) -> MemoryPolicy:
     if agent_evolution_enabled:
         return policy
-    effective_types = (
-        _enabled_memory_types() if policy.memory_types is None else set(policy.memory_types)
-    )
+    effective_types = _effective_memory_types(policy)
     effective_types -= AGENT_EVOLUTION_MEMORY_TYPES
     return MemoryPolicy(
         self_enabled=policy.self_enabled,
         peer_enabled=policy.peer_enabled,
         memory_types=effective_types,
         working_memory_enabled=policy.working_memory_enabled,
+        working_memory_mode=policy.working_memory_mode,
     )
 
 
 def _effective_memory_types(policy: MemoryPolicy) -> set[str]:
-    if policy.memory_types is None:
-        return _enabled_memory_types()
-    return set(policy.memory_types)
+    types = _enabled_memory_types() if policy.memory_types is None else set(policy.memory_types)
+    if policy.working_memory_mode == wi.WORK_ITEM_MODE:
+        types.add("work_item")
+    elif policy.memory_types is None:
+        types.discard("work_item")
+    return types
 
 
 def _agent_memory_skip_reason(
@@ -1062,6 +1065,9 @@ class Session:
             archive_uri,
             {
                 "phase1": payload,
+                "working_memory_mode": MemoryPolicy.from_dict(
+                    queue_message.get("memory_policy")
+                ).working_memory_mode,
                 "agent_evolution": {
                     "enabled": agent_evolution_enabled,
                     "skip_reason": agent_memory_skip_reason,
@@ -1649,7 +1655,10 @@ class Session:
         """
         # ponytail: reuse archive ordering; no second session identity or context store.
         newest = f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
-        if self._compression.compression_index > 0 and await self._archives.is_context_reset_archive(newest):
+        if (
+            self._compression.compression_index > 0
+            and await self._archives.is_context_reset_archive(newest)
+        ):
             return  # Context is already empty; no second boundary needed.
         self._compression.compression_index += 1
         archive_uri = (
@@ -1956,6 +1965,10 @@ class Session:
         completed_memory_steps: Dict[str, set[str]] = {}
         telemetry = OperationTelemetry(operation="session_commit_phase2", enabled=True)
         archive_index = self._archives.archive_index_from_uri(archive_uri)
+        effective_policy = MemoryPolicy.from_dict(memory_policy)
+        work_item_mode = effective_policy.working_memory_mode == wi.WORK_ITEM_MODE
+        work_checkpoint = None
+        previous_checkpoint = {}
 
         try:
             (
@@ -1965,6 +1978,18 @@ class Session:
                 covered_failed_archives,
                 completed_memory_steps,
             ) = await self._prepare_phase2_archive_messages(archive_uri, messages)
+            if work_item_mode:
+                previous_checkpoint, uncovered = await self._work_item_history(
+                    before_index=archive_index
+                )
+                residual = [
+                    Message.from_dict(value) for value in previous_checkpoint.get("residual", [])
+                ]
+                messages = self._archives.stable_deduplicate_messages(
+                    residual + uncovered + messages
+                )
+                if uncovered:
+                    coverage_start_archive = previous_checkpoint.get("archive_id", "archive_001")
             if not messages:
                 raise ValueError("session commit archive has no recoverable messages")
             first_message_id = messages[0].id
@@ -1989,7 +2014,7 @@ class Session:
                             covered_failed_archives,
                             messages,
                         )
-                        if working_memory_enabled
+                        if working_memory_enabled and not work_item_mode
                         else []
                     )
                     latest_archive_overview = (
@@ -1997,7 +2022,7 @@ class Session:
                             exclude_archive_uri=archive_uri,
                             before_archive_index=archive_index,
                         )
-                        if working_memory_enabled
+                        if working_memory_enabled and not work_item_mode
                         else ""
                     )
                     extraction_messages = await self._tool_outputs.hydrate_for_extraction(messages)
@@ -2010,7 +2035,7 @@ class Session:
                     )
 
                     async def _run_archive_summary() -> None:
-                        if not working_memory_enabled:
+                        if work_item_mode or not working_memory_enabled:
                             logger.info(
                                 "Working Memory summary skipped "
                                 "(memory_policy.working_memory.enabled=false)"
@@ -2117,6 +2142,19 @@ class Session:
                         fn: Callable[[], Awaitable[Any]],
                     ) -> Any:
                         result = await _run_retryable_phase2_step(operation_name, fn)
+                        if work_item_mode and isinstance(result, dict):
+                            meta = await self._archives.read_meta(archive_uri)
+                            await self._merge_archive_meta(
+                                archive_uri,
+                                {
+                                    key: meta.get(key, []) + result.get(key, [])
+                                    for key in (
+                                        "work_items",
+                                        "work_item_coverage",
+                                        "work_item_activations",
+                                    )
+                                },
+                            )
                         completed_memory_steps.setdefault(step, set()).update(
                             message.id for message in step_messages
                         )
@@ -2127,7 +2165,9 @@ class Session:
                             archive_uri,
                             {
                                 "completed_memory_steps": (
-                                    self._archives.serialize_completed_memory_steps(completed_memory_steps)
+                                    self._archives.serialize_completed_memory_steps(
+                                        completed_memory_steps
+                                    )
                                 )
                             },
                         )
@@ -2150,6 +2190,8 @@ class Session:
                     peer_memory_enabled = extraction_scope.peer_memory_enabled
                     allowed_peer_ids = extraction_scope.allowed_peer_ids
                     long_term_memory_types = extraction_scope.memory_types
+                    if work_item_mode or effective_policy.memory_types is None:
+                        long_term_memory_types = _effective_memory_types(effective_policy)
 
                     long_term_messages = [
                         message
@@ -2171,7 +2213,7 @@ class Session:
 
                         extraction_tasks: List[Any] = []
                         extraction_labels: List[str] = []
-                        if working_memory_enabled:
+                        if working_memory_enabled and not work_item_mode:
                             extraction_tasks.append(_run_archive_summary())
                             extraction_labels.append("archive_summary")
 
@@ -2180,6 +2222,15 @@ class Session:
                             async def _run_long_term_memory_extraction(
                                 batch_messages: Optional[List[Message]] = None,
                             ) -> Any:
+                                work_item_kwargs = {}
+                                if work_item_mode:
+                                    current_meta = await self._archives.read_meta(archive_uri)
+                                    bindings = previous_checkpoint.get(
+                                        "active_work_items", []
+                                    ) + current_meta.get("work_items", [])
+                                    work_item_kwargs["work_item_uris"] = list(
+                                        dict.fromkeys(item["uri"] for item in bindings)
+                                    )
                                 return await self._session_compressor.extract_long_term_memories(
                                     messages=(
                                         long_term_messages
@@ -2198,6 +2249,7 @@ class Session:
                                     peer_memory_enabled=peer_memory_enabled,
                                     allowed_peer_ids=allowed_peer_ids,
                                     event_search_tags=event_search_tags,
+                                    **work_item_kwargs,
                                 )
 
                             if extraction_batch_limits.enabled:
@@ -2311,11 +2363,17 @@ class Session:
                                     exc,
                                 )
 
-                try:
-                    await request_wait_tracker.wait_for_request(
-                        telemetry.telemetry_id,
-                        timeout=_PHASE2_QUEUE_WAIT_TIMEOUT_SECONDS,
+                if work_item_mode and working_memory_enabled:
+                    work_checkpoint = await self._prepare_work_item_checkpoint(
+                        archive_uri, messages, previous_checkpoint
                     )
+
+                try:
+                    if not work_item_mode:
+                        await request_wait_tracker.wait_for_request(
+                            telemetry.telemetry_id,
+                            timeout=_PHASE2_QUEUE_WAIT_TIMEOUT_SECONDS,
+                        )
                 except TimeoutError as exc:
                     telemetry.set_error(
                         "session.commit.phase2.wait_for_request",
@@ -2354,6 +2412,7 @@ class Session:
                 completed_memory_steps=self._archives.serialize_completed_memory_steps(
                     completed_memory_steps
                 ),
+                **({"checkpoint": work_checkpoint} if work_item_mode else {}),
             )
 
             result_payload = {
@@ -2426,6 +2485,146 @@ class Session:
             )
             logger.exception(f"Memory extraction failed for session {self.session_id}")
 
+    async def _work_item_history(
+        self, before_index: Optional[int] = None, *, use_checkpoint: bool = True
+    ) -> tuple[Dict[str, Any], List[Message]]:
+        """Find a published checkpoint, retaining every newer uncovered archive."""
+        uncovered = []
+        checkpoint = {}
+        for archive in await self._archives.list_refs():
+            if before_index is not None and archive["index"] >= before_index:
+                continue
+            done = await self._archives.read_done(archive["archive_uri"])
+            if done.get("context_reset") is True:
+                break
+            if use_checkpoint and wi.ready_checkpoint(done, archive["archive_id"]):
+                if await self._archives.read_overview(archive["archive_uri"]):
+                    checkpoint = done
+                    break
+            # Failed archives are still raw continuation. Only a valid .done
+            # publication is allowed to advance the context coverage boundary.
+            uncovered.append(await self._archives.read_messages(archive["archive_uri"]))
+        messages = [message for batch in reversed(uncovered) for message in batch]
+        return checkpoint, self._archives.stable_deduplicate_messages(messages)
+
+    async def _prepare_work_item_checkpoint(
+        self, archive_uri: str, messages: List[Message], previous: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        from openviking.session.memory.work_item_index import work_item_index_ready
+
+        meta = await self._archives.read_meta(archive_uri)
+        # New evidence first, followed by the previous active set. Semantic
+        # discovery happens in the existing extractor/recall pipeline.
+        message_order = {message.id: index for index, message in enumerate(messages)}
+        updates = sorted(
+            meta.get("work_item_coverage", []) + meta.get("work_item_activations", []),
+            key=lambda operation: max(
+                (
+                    message_order.get(identity, -1)
+                    for identity in operation.get("source_message_ids", [])
+                ),
+                default=-1,
+            ),
+            reverse=True,
+        )
+        uris = list(dict.fromkeys(item["uri"] for item in updates))
+        previous_uris = [item["uri"] for item in previous.get("active_work_items", [])]
+        uris.extend(
+            item["uri"]
+            for item in meta.get("work_items", [])
+            if item["uri"] not in uris and item["uri"] not in previous_uris
+        )
+        uris.extend(uri for uri in previous_uris if uri not in uris)
+        items = [await wi.read_work_item(self._viking_fs, self.ctx, uri) for uri in uris]
+        residual, coverage = wi.coverage_report(
+            messages, meta.get("work_item_coverage", []), archive_uri
+        )
+        # Persist the ledger even if budget/index checks below reject publication.
+        await self._merge_archive_meta(archive_uri, {"coverage": coverage})
+        overview, active = wi.build_projection(items, residual)
+        active_uris = {item["uri"] for item in active}
+        cold = [item for item in items if item["uri"] not in active_uris]
+        # Only items removed from the projection require discovery readiness.
+        # This wait runs in the background, never inside a compact/read request.
+        deadline = asyncio.get_running_loop().time() + 60
+        index_ready = {}
+        while cold:
+            pending = []
+            for item in cold:
+                if await work_item_index_ready(
+                    self._vikingdb_manager, item["uri"], item["version"], ctx=self.ctx
+                ):
+                    index_ready[item["uri"]] = True
+                else:
+                    pending.append(item)
+            if not pending:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                raise ValueError("work_item checkpoint cannot evict items whose index is not ready")
+            cold = pending
+            await asyncio.sleep(0.5)
+        await self._viking_fs.write_file(f"{archive_uri}/.overview.md", overview, ctx=self.ctx)
+        await self._viking_fs.write_file(
+            f"{archive_uri}/.abstract.md", "Work-item continuation checkpoint", ctx=self.ctx
+        )
+        await self._merge_archive_meta(
+            archive_uri, {"overview_tokens": estimate_text_tokens(overview)}
+        )
+        return {
+            "mode": wi.WORK_ITEM_MODE,
+            "version": 1,
+            "archive_id": archive_uri.rsplit("/", 1)[-1],
+            "compact_ready": True,
+            "work_items": [
+                {
+                    "uri": item["uri"],
+                    "version": item["version"],
+                    "index_ready": index_ready.get(item["uri"], False),
+                }
+                for item in items
+            ],
+            "active_work_items": active,
+            "residual": residual,
+            "coverage": coverage,
+        }
+
+    async def _read_work_item_projection(
+        self, checkpoint: Dict[str, Any]
+    ) -> tuple[str, Dict[str, Any]]:
+        """Refresh mutable state without changing the published coverage boundary."""
+        from openviking.session.memory.work_item_index import work_item_index_ready
+
+        items = []
+        for binding in checkpoint.get("active_work_items", []):
+            try:
+                items.append(await wi.read_work_item(self._viking_fs, self.ctx, binding["uri"]))
+            except Exception as exc:
+                if not _is_storage_not_found(exc):
+                    raise
+                # An explicitly removed memory must not reappear from a cached
+                # archive snapshot. The original archive remains auditable.
+        overview, active = wi.build_projection(items, checkpoint.get("residual", []))
+        active_uris = {item["uri"] for item in active}
+        for item in items:
+            if (
+                item["uri"] not in active_uris
+                and item["fields"].get("status") not in wi.WORK_ITEM_TERMINAL_STATUSES
+            ):
+                if not await work_item_index_ready(
+                    self._vikingdb_manager, item["uri"], item["version"], ctx=self.ctx
+                ):
+                    raise ValueError("updated work_item does not fit and its index is not ready")
+        versions = {item["uri"]: item["version"] for item in items}
+        rendered = {
+            **checkpoint,
+            "active_work_items": active,
+            "work_items": [
+                {**binding, "version": versions.get(binding["uri"], binding["version"])}
+                for binding in checkpoint.get("work_items", [])
+            ],
+        }
+        return overview, rendered
+
     async def _write_done_file(
         self,
         archive_uri: str,
@@ -2437,6 +2636,7 @@ class Session:
         coverage_end_archive: Optional[str] = None,
         covered_failed_archives: Optional[List[str]] = None,
         completed_memory_steps: Optional[Dict[str, List[str]]] = None,
+        checkpoint: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Write .done marker file to the archive directory."""
         if not self._viking_fs:
@@ -2451,9 +2651,17 @@ class Session:
                 "coverage_end_archive": coverage_end_archive or archive_id,
                 "covered_failed_archives": list(covered_failed_archives or []),
                 "completed_memory_steps": dict(completed_memory_steps or {}),
+                **(checkpoint or {}),
             },
             ensure_ascii=False,
         )
+        if checkpoint is not None:
+            await self._viking_fs.write_file(f"{archive_uri}/.done.tmp", content, ctx=self.ctx)
+            await self._viking_fs._async_agfs.mv(
+                self._viking_fs._uri_to_path(f"{archive_uri}/.done.tmp", ctx=self.ctx),
+                self._viking_fs._uri_to_path(f"{archive_uri}/.done", ctx=self.ctx),
+            )
+            return
         await self._viking_fs.write_file(
             uri=f"{archive_uri}/.done",
             content=content,
@@ -2495,6 +2703,40 @@ class Session:
             raise ValueError("token_budget must be greater than or equal to 0")
 
         context = await self._collect_session_context_components()
+        if context.get("mode") == wi.WORK_ITEM_MODE:
+            latest = context["latest_archive"]
+            overview = latest["overview"] if latest else ""
+            raw_messages = [message.to_dict() for message in context["messages"]]
+            message_tokens = (
+                estimate_text_tokens(json.dumps(raw_messages, ensure_ascii=False))
+                if raw_messages
+                else 0
+            )
+            required_tokens = estimate_text_tokens(overview) + message_tokens
+            if required_tokens > token_budget:
+                # No boundary is returned on failure. Callers must retain their
+                # transcript or use their host's own compactor.
+                return {
+                    "status": "budget_insufficient",
+                    "requiredTokens": required_tokens,
+                    "latest_archive_overview": "",
+                    "pre_archive_abstracts": [],
+                    "messages": [],
+                    "estimatedTokens": 0,
+                }
+            return {
+                "status": "ready" if latest else "not_ready",
+                "checkpoint": latest.get("checkpoint") if latest else None,
+                "latest_archive_overview": overview,
+                "pre_archive_abstracts": [],
+                "messages": raw_messages,
+                "estimatedTokens": required_tokens,
+                "stats": {
+                    "totalArchives": context["total_archives"],
+                    "activeTokens": message_tokens,
+                    "archiveTokens": estimate_text_tokens(overview),
+                },
+            }
         merged_messages = context["messages"]
         budgeted = fit_active_messages_to_budget(
             merged_messages,
@@ -2576,6 +2818,36 @@ class Session:
     async def get_session_archive(self, archive_id: str) -> Dict[str, Any]:
         """Get one completed archive by archive ID."""
 
+        for archive in await self._archives.list_refs():
+            if archive["archive_id"] != archive_id:
+                continue
+            done = await self._archives.read_done(archive["archive_uri"])
+            meta = await self._archives.read_meta(archive["archive_uri"])
+            if (
+                done.get("mode") == wi.WORK_ITEM_MODE
+                or meta.get("working_memory_mode") == wi.WORK_ITEM_MODE
+            ):
+                if not wi.ready_checkpoint(done, archive_id):
+                    return {"archive_id": archive_id, "status": "not_ready"}
+                try:
+                    overview, rendered = await self._read_work_item_projection(done)
+                except ValueError:
+                    return {"archive_id": archive_id, "status": "not_ready"}
+                return {
+                    "archive_id": archive_id,
+                    "status": "ready",
+                    "checkpoint": rendered,
+                    "overview": overview,
+                    "abstract": await self._archives.read_abstract(
+                        archive["archive_uri"], overview
+                    ),
+                    "messages": [
+                        message.to_dict()
+                        for message in await self._archives.read_messages(archive["archive_uri"])
+                    ],
+                }
+            break
+
         for archive in await self._archives.completed_refs():
             if archive["archive_id"] != archive_id:
                 continue
@@ -2620,6 +2892,46 @@ class Session:
         scan. Public ``pre_archive_abstracts`` stay empty; abstracts are not read.
         """
         archive_refs = await self._archives.list_refs()
+        mode = MemoryPolicy.from_dict(self._meta.memory_policy).working_memory_mode
+        if archive_refs:
+            # Commits can inherit a user policy or carry an override. Their
+            # persisted mode governs reads; Markdown headings never select it.
+            latest_meta = await self._archives.read_meta(archive_refs[0]["archive_uri"])
+            mode = latest_meta.get("working_memory_mode", mode)
+        if mode == wi.WORK_ITEM_MODE:
+            checkpoint, messages = await self._work_item_history()
+            latest_archive = None
+            if checkpoint:
+                uri = f"{self._session_uri}/history/{checkpoint['archive_id']}"
+                try:
+                    overview, checkpoint = await self._read_work_item_projection(checkpoint)
+                except ValueError:
+                    # Do not advance a boundary using a now-oversized projection.
+                    # Replay raw history so the caller can apply its own compact.
+                    _, messages = await self._work_item_history(use_checkpoint=False)
+                    checkpoint = {}
+                    overview = ""
+                latest_archive = (
+                    {
+                        "archive_id": checkpoint.get("archive_id"),
+                        "archive_uri": uri,
+                        "overview": overview,
+                        "overview_tokens": estimate_text_tokens(overview),
+                        "checkpoint": checkpoint,
+                    }
+                    if checkpoint
+                    else None
+                )
+            return {
+                "mode": wi.WORK_ITEM_MODE,
+                "latest_archive": latest_archive,
+                "pre_archive_abstracts": [],
+                "failed_archives": 0,
+                "total_archives": len(await self._archives.list_refs()),
+                "messages": self._archives.stable_deduplicate_messages(
+                    messages + list(self._messages)
+                ),
+            }
         newer_pending: List[Dict[str, Any]] = []
         terminal: Optional[Dict[str, Any]] = None
         terminal_state = ""
@@ -2673,7 +2985,9 @@ class Session:
                     archive["archive_uri"],
                 )
 
-        merged_messages = self._archives.stable_deduplicate_messages(archive_messages + list(self._messages))
+        merged_messages = self._archives.stable_deduplicate_messages(
+            archive_messages + list(self._messages)
+        )
         merged_messages = await self._checkpoints.insert_terminal_checkpoints(
             merged_messages,
             terminal if terminal_state == "completed" else None,

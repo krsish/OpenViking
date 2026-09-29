@@ -637,6 +637,32 @@ async def vectorize_file(
             owner_space=owner_space_for_uri(file_path),
         )
 
+        # Reindex must bind the version to the same source bytes as its text.
+        # A directory summary can predate the canonical state, so work items
+        # always embed their own body even under summary-first configuration.
+        from openviking.session.memory.work_item_index import is_work_item_leaf
+
+        work_item_content = None
+        if context_type == "memory" and is_work_item_leaf(file_path):
+            from openviking.session.memory.utils.memory_file_utils import (
+                MemoryFileUtils,
+                memory_version_from_fields,
+            )
+
+            raw = _coerce_text_file_content(
+                file_content
+                if file_content is not None
+                else await viking_fs.read_file(file_path, ctx=ctx)
+            )
+            memory = MemoryFileUtils.read(raw, uri=file_path)
+            version = memory_version_from_fields(memory.extra_fields, default=0)
+            if version <= 0:
+                raise ValueError("work_item reindex requires a positive source version")
+            context.meta["work_item_version"] = version
+            work_item_content = memory.plain_content()
+            context.abstract = _truncate_abstract_bytes(work_item_content)
+            file_content = raw.encode("utf-8")
+
         content_type = await _resolve_resource_content_type(
             file_path, file_name, viking_fs, ctx, file_content=file_content
         )
@@ -648,7 +674,13 @@ async def vectorize_file(
         effective_text_source = TEXT_SOURCE_SUMMARY_FIRST if use_summary else configured_text_source
         embed_summary = bool(summary and effective_text_source in SUMMARY_TEXT_SOURCES)
 
-        if content_type in (ResourceContentType.AUDIO, ResourceContentType.VIDEO):
+        if work_item_content is not None:
+            context.set_vectorize(
+                Vectorize(
+                    text=truncate_embedding_input(work_item_content, embedding_cfg.max_input_tokens)
+                )
+            )
+        elif content_type in (ResourceContentType.AUDIO, ResourceContentType.VIDEO):
             effective_text = summary or file_name
             context.abstract = effective_text
             context.set_vectorize(Vectorize(text=effective_text))

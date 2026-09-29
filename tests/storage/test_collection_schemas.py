@@ -3295,3 +3295,124 @@ async def test_single_account_backend_query_runs_adapter_in_threadpool(monkeypat
     assert isinstance(query_filter, Eq)
     assert query_filter.field == "account_id"
     assert query_filter.value == "acc1"
+
+
+@pytest.mark.asyncio
+async def test_embedding_consumer_skips_stale_work_item_version(monkeypatch):
+    uri = "viking://user/default/memories/work_item/wi_a.md"
+    fs = SimpleNamespace(
+        _uri_to_path=lambda uri, ctx: "/default/wi_a.md",
+        read_file=AsyncMock(
+            return_value='Current state\n\n<!-- MEMORY_FIELDS\n{"version": 2}\n-->'
+        ),
+        _async_agfs=SimpleNamespace(
+            pathlock_acquire_exact=AsyncMock(return_value={"lease": "test"}),
+            pathlock_release=AsyncMock(),
+        ),
+    )
+    db = SimpleNamespace(is_closing=False, upsert=AsyncMock(return_value="record"))
+    monkeypatch.setattr("openviking.storage.viking_fs.get_viking_fs", lambda: fs)
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config", lambda: _DummyConfig(_DummyEmbedder())
+    )
+    message = EmbeddingMsg.for_embed(
+        message="old state",
+        context_data={
+            "uri": uri,
+            "account_id": "default",
+            "context_type": "memory",
+            "level": 2,
+            "abstract": "old state",
+            "meta": {"work_item_version": 1},
+        },
+        action=IndexAction.UPSERT,
+    )
+
+    result = await TextEmbeddingHandler(db).on_dequeue(_build_operation_payload(message))
+
+    assert result.outcome is ProcessOutcome.SUCCESS
+    db.upsert.assert_not_awaited()
+    fs._async_agfs.pathlock_release.assert_awaited_once_with({"lease": "test"})
+
+
+@pytest.mark.asyncio
+async def test_local_existing_collection_migrates_and_preserves_work_item_version(monkeypatch):
+    config = _DummyConfig(_DummyEmbedder(), backend="local")
+    monkeypatch.setattr("openviking_cli.utils.config.get_openviking_config", lambda: config)
+    legacy_schema = CollectionSchemas.context_collection("context", 2)
+    legacy_schema["Fields"] = [
+        field for field in legacy_schema["Fields"] if field["FieldName"] != "work_item_version"
+    ]
+    added_fields = []
+    records = {}
+
+    class _Collection:
+        def get_meta_data(self):
+            return dict(legacy_schema)
+
+        def get_index_meta_data(self, name):
+            return {"ScalarIndex": legacy_schema["ScalarIndex"]}
+
+        def update(self, *, fields=None, description=None):
+            if fields:
+                added_fields.extend(fields)
+                legacy_schema["Fields"].extend(fields)
+            if description is not None:
+                legacy_schema["Description"] = description
+
+    class _Adapter:
+        mode = "local"
+        USE_CONTENT_FIELD = False
+
+        def get_collection(self):
+            return _Collection()
+
+        def collection_exists(self):
+            return True
+
+        def create_collection(self, **kwargs):
+            return False
+
+        def count(self, **kwargs):
+            return len(records)
+
+        def upsert(self, data):
+            records[data["id"]] = dict(data)
+            return [data["id"]]
+
+        def get(self, ids):
+            return [dict(records[key]) for key in ids if key in records]
+
+        def close(self):
+            pass
+
+    backend = _SingleAccountBackend(
+        config=VectorDBBackendConfig(backend="local", name="context", dimension=2),
+        bound_account_id="default",
+        shared_adapter=_Adapter(),
+    )
+    uri = "viking://user/default/memories/work_item/wi_a.md"
+    record_id = vector_record_id("default", uri, 2)
+    row = {
+        "id": record_id,
+        "uri": uri,
+        "account_id": "default",
+        "context_type": "memory",
+        "level": 2,
+        "abstract": "current state",
+        "vector": [0.1, 0.2],
+        "work_item_version": 7,
+    }
+    try:
+        await backend.upsert(row)
+        assert "work_item_version" not in (await backend.get_strict([record_id]))[0]
+        assert await init_context_collection(backend) is False
+        await backend.upsert(row)
+        indexed = (await backend.get_strict([record_id]))[0]
+        assert indexed["work_item_version"] == 7
+        assert indexed["uri"] == uri
+        assert added_fields == [
+            {"FieldName": "work_item_version", "FieldType": "int64", "DefaultValue": 0}
+        ]
+    finally:
+        await backend.close()

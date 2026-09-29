@@ -1,0 +1,113 @@
+memory_type: work_item
+stage: user
+enabled: true
+operation_mode: upsert
+peer_enabled: false
+directory: "viking://user/{{ user_space }}/memories/work_item"
+filename_template: "{{ work_item_id }}.md"
+description: |
+  Maintain a bounded current continuation state for a concrete piece of the user's work,
+  shared across sessions. This is not an event log or a list of everything ever discussed.
+  Use an existing page_id only after reading its canonical state and confirming the same
+  goal and scope. Same title or topic alone is not identity; do not merge unrelated work.
+  The server allocates immutable work_item IDs. Renaming or switching sessions keeps the ID.
+  Apply only NEW conversation evidence. Prior WM and existing memory are background, not
+  fresh facts that override a newer canonical state. Preserve still-valid constraints,
+  unanswered user questions and commitments. Keep plan, attempted action, and verified
+  result distinct. Tool evidence is evidence of execution, not a user preference.
+  Account for this conversation's continuation information: update/create the relevant
+  work_item, or return no work_item operation only when there is truly no continuation delta.
+  A request to resume existing work needs an activation even if no state changed: select
+  that already-read item with activate(ranges=...) in Python, or work_item_activations
+  in JSON. Match the current request to its goal and scope, not its title alone. Candidate
+  reads and search hits are background, never automatic activation. Do not invent an
+  update just to activate; update fields only for genuinely new state evidence.
+  Use complete concise string values for changed fields; an empty string explicitly clears
+  a resolved optional field. Omitted/null fields retain their previous values. Resolve or
+  replace stale steps and decisions, do not append a history of every round.
+  All fields combined MUST stay within 1200 estimated tokens. Current state is a short
+  snapshot, next_action is the immediate next step, waiting_for includes the waiting party
+  and release condition. Keep only currently useful references and decisions.
+  status is open, in_progress, waiting, blocked, done, or cancelled. Do not mark a plan done
+  without supporting results. Never delete work_items merely because they finished or
+  became inactive. A completed/cancelled item changes status only on an explicit new user
+  request: set reopen_reason to an exact quote from that request and include its ranges.
+  Mere retrieval, similarity, an old instruction or offline consolidation cannot reopen it.
+content_template: |
+  # {{ title }}
+  Status: {{ status }}
+  Scope: {{ scope }}
+  ## Goal
+  {{ goal }}
+  ## Current state
+  {{ current_state }}
+  ## Next action
+  {{ next_action }}
+  ## Constraints
+  {{ constraints }}
+  ## Waiting for
+  {{ waiting_for }}
+  ## Decisions
+  {{ decisions }}
+  ## References
+  {{ refs }}
+embedding_template: |
+  {{ title }}
+  {{ scope }}
+  {{ goal }}
+  {{ current_state }}
+  {{ next_action }}
+  {{ waiting_for }}
+fields:
+  - name: work_item_id
+    type: string
+    description: Server-assigned immutable work-item identity; never invent or change it.
+    merge_op: immutable
+  - name: title
+    type: string
+    description: Short distinctive name.
+    merge_op: replace
+  - name: scope
+    type: string
+    description: Project, repository or business object that disambiguates this work.
+    merge_op: replace
+  - name: goal
+    type: string
+    description: Current intended outcome and acceptance condition.
+    merge_op: replace
+  - name: status
+    type: string
+    description: "One of open, in_progress, waiting, blocked, done, cancelled."
+    merge_op: replace
+  - name: current_state
+    type: string
+    description: Latest confirmed progress and important evidence, not an action log.
+    merge_op: replace
+  - name: next_action
+    type: string
+    description: Immediate next action; empty when none remains.
+    merge_op: replace
+  - name: constraints
+    type: string
+    description: Still-valid requirements and constraints needed to continue.
+    merge_op: replace
+  - name: waiting_for
+    type: string
+    description: Unanswered questions, waiting party and release condition; clear after resolution.
+    merge_op: replace
+  - name: decisions
+    type: string
+    description: Current decisions with concise reasons; remove superseded details.
+    merge_op: replace
+  - name: refs
+    type: string
+    description: A few necessary file paths or resource/memory URIs with their purpose.
+    merge_op: replace
+  - name: ranges
+    type: string
+    description: Current conversation source indices, e.g. 0-3,7. Include only messages whose continuation information this state accounts for. Required with new conversation; empty only for offline consolidation.
+    merge_op: replace
+  - name: reopen_reason
+    type: string
+    description: Empty normally. To change a terminal status, quote the exact NEW user request authorizing reopening and include that message in ranges.
+    merge_op: replace

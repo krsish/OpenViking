@@ -13,7 +13,14 @@ DetailRequest = Union[Literal["auto", "abstract", "overview", "full"], Dict[str,
 Tier = Literal["uri", "abstract", "overview", "full"]
 Purpose = Literal["chat", "coding"]
 
-MEMORY_CATEGORIES: Tuple[str, ...] = ("events", "entities", "preferences", "experiences")
+WORK_ITEM_CATEGORY = "work_item"
+MEMORY_CATEGORIES: Tuple[str, ...] = (
+    "events",
+    "entities",
+    "preferences",
+    "experiences",
+    WORK_ITEM_CATEGORY,
+)
 # Built-in memory types outside MEMORY_CATEGORIES — cases, patterns, tools,
 # trajectories and skill-usage memories — cannot own a quota bucket: their
 # retrieval scope is the memory root, which every other bucket already covers.
@@ -40,13 +47,14 @@ ORIGIN_ORDER: Tuple[str, ...] = ("actor_peer", "self", "other_peer")
 
 # Tier a category is served at when the caller does not pin ``detail``.
 #
-# ``events`` is the only memory type whose body is long enough for the
-# ``# Summary`` section to be a real compression, so it is the only one worth a
-# file read. The others sit at ``abstract`` because the memory writer stores the
+# Mutable work items always read their canonical body; their indexed abstract
+# can describe an earlier version. Other memory types keep their existing tiers.
+# ``events`` uses its ``# Summary`` section for compression. The remaining
+# memory categories sit at ``abstract`` because the memory writer stores the
 # whole stripped body in that scalar (it doubles as the embedding text), which
 # makes ``abstract`` the complete file at zero read cost. Once the writer stores
 # a separate summary scalar, ``events`` moves back to ``abstract`` here and the
-# default path stops reading files altogether.
+# events no longer need a file read by default.
 # ``resources``/``skills`` stay at their generated 256-char abstract: their
 # bodies are large and may carry credentials, so deepening is opt-in.
 DEFAULT_TIER_BY_CATEGORY: Dict[str, Tier] = {
@@ -54,6 +62,7 @@ DEFAULT_TIER_BY_CATEGORY: Dict[str, Tier] = {
     "entities": "abstract",
     "preferences": "abstract",
     "experiences": "abstract",
+    WORK_ITEM_CATEGORY: "full",
     "resources": "abstract",
     "skills": "abstract",
     OTHER_MEMORY_CATEGORY: "abstract",
@@ -84,6 +93,7 @@ PURPOSE_PRESETS: Dict[str, Dict[str, int]] = {
         "entities": 2,
         "preferences": 1,
         "experiences": 1,
+        WORK_ITEM_CATEGORY: 2,
         "resources": 3,
         "skills": 2,
     },
@@ -92,6 +102,7 @@ PURPOSE_PRESETS: Dict[str, Dict[str, int]] = {
         "entities": 3,
         "preferences": 1,
         "experiences": 1,
+        WORK_ITEM_CATEGORY: 2,
         "resources": 1,
         "skills": 1,
     },
@@ -102,6 +113,7 @@ DEFAULT_QUOTAS: Dict[str, int] = {
     "entities": 10,
     "preferences": 3,
     "experiences": 0,
+    WORK_ITEM_CATEGORY: 2,
 }
 
 DEFAULT_OTHER_PEER_PENALTIES: Dict[str, float] = {
@@ -109,6 +121,7 @@ DEFAULT_OTHER_PEER_PENALTIES: Dict[str, float] = {
     "entities": 0.1,
     "preferences": 0.02,
     "experiences": 0.02,
+    WORK_ITEM_CATEGORY: 0.0,
     "resources": 0.02,
     "skills": 0.02,
     OTHER_MEMORY_CATEGORY: 0.1,

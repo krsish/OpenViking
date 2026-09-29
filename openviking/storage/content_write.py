@@ -1108,6 +1108,12 @@ class ContentWriteCoordinator:
             raise InvalidArgumentError(f"unsupported tag mode: {mode}")
 
     def _ensure_content_write_policy(self, uri: str) -> None:
+        from openviking.session.memory.work_item import is_work_item_uri
+
+        if is_work_item_uri(uri):
+            raise InvalidArgumentError(
+                "work_item content must be updated through memory extraction/compile"
+            )
         name = uri.rstrip("/").split("/")[-1]
         if name in _DERIVED_FILENAMES:
             raise InvalidArgumentError(f"cannot write derived semantic file directly: {uri}")

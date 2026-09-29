@@ -472,3 +472,41 @@ async def test_context_mode_does_not_materialize_session_when_session_features_a
         f"viking://user/default/sessions/{session_id}",
         ctx=ctx,
     )
+
+
+async def test_work_item_quota_and_detail_use_canonical_user_state(
+    client: httpx.AsyncClient,
+    service,
+    monkeypatch,
+):
+    calls = []
+    uri = "viking://user/default/memories/work_item/wi_a.md"
+
+    async def fake_find(**kwargs):
+        calls.append(kwargs)
+        return _FakeFindResult([_memory(uri, abstract="Old indexed state: deploy immediately")])
+
+    async def fake_read(target_uri, **kwargs):
+        assert target_uri == uri
+        return "Goal: ship A. Status: blocked. Next: wait for review."
+
+    monkeypatch.setattr(service.search, "find", fake_find)
+    monkeypatch.setattr(service.fs, "read", fake_read)
+    response = await client.post(
+        "/api/v1/search/search",
+        headers={"X-OpenViking-Actor-Peer": "current"},
+        json={
+            "query": "resume A",
+            "mode": "context",
+            "quotas": {"work_item": 1},
+            "detail": {"work_item": "abstract"},
+            "peer_scope": "all",
+        },
+    )
+
+    assert response.status_code == 200
+    assert [call["target_uri"] for call in calls] == ["viking://user/default/memories/work_item"]
+    result = response.json()["result"]
+    assert result["entries"][0]["category"] == "work_item"
+    assert "wait for review" in result["rendered"]
+    assert "deploy immediately" not in result["rendered"]

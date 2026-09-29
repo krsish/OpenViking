@@ -147,9 +147,7 @@ def _memory_type_by_uri(operations: ResolvedOperations) -> dict[str, str]:
     for file_content in getattr(operations, "delete_file_contents", []) or []:
         uri = str(getattr(file_content, "uri", "") or "")
         if uri:
-            types_by_uri[uri] = str(
-                getattr(file_content, "memory_type", "") or "unknown"
-            )
+            types_by_uri[uri] = str(getattr(file_content, "memory_type", "") or "unknown")
     return types_by_uri
 
 
@@ -282,9 +280,7 @@ class SessionCompressorV3:
         vlm_config: VLMHandle | None = None,
     ) -> ExtractLoop:
         if vlm_config is None:
-            raise RuntimeError(
-                "SessionCompressorV3 requires an explicitly resolved VLM config"
-            )
+            raise RuntimeError("SessionCompressorV3 requires an explicitly resolved VLM config")
         vlm = vlm_config
         viking_fs = get_viking_fs()
         if context_provider is None:
@@ -431,6 +427,8 @@ class SessionCompressorV3:
         allowed_peer_ids: Optional[set[str]] = None,
         event_search_tags: Optional[List[str]] = None,
         peer_memory_enabled: bool = True,
+        *,
+        work_item_uris: Optional[List[str]] = None,
     ):
         if not agent_evolution_enabled:
             effective_types = (
@@ -471,6 +469,7 @@ class SessionCompressorV3:
                 peer_memory_enabled=peer_memory_enabled,
                 allowed_peer_ids=allowed_peer_ids,
                 event_search_tags=event_search_tags,
+                work_item_uris=work_item_uris,
             )
             agent_memory_types = _allowed_agent_memory_types(allowed_memory_types)
             cases_allowed = (
@@ -522,6 +521,10 @@ class SessionCompressorV3:
                 contexts=result.contexts,
                 train_result=train_result,
                 archive_uri=archive_uri or "",
+                work_items=getattr(result, "work_items", []),
+                work_item_coverage=getattr(result, "work_item_coverage", []),
+                work_item_activations=getattr(result, "work_item_activations", []),
+                include_work_items=work_item_uris is not None,
             )
         except Exception:
             if strict_extract_errors:
@@ -673,6 +676,7 @@ class SessionCompressorV3:
         peer_memory_enabled: bool = True,
         allowed_peer_ids: Optional[set[str]] = None,
         event_search_tags: Optional[List[str]] = None,
+        work_item_uris: Optional[List[str]] = None,
     ) -> "_V3ExtractionResult":
         del user
         if not messages:
@@ -701,9 +705,7 @@ class SessionCompressorV3:
             )
 
         if self.vlm_resolver is None:
-            raise RuntimeError(
-                "SessionCompressorV3 requires a VLM resolver for account-owned work"
-            )
+            raise RuntimeError("SessionCompressorV3 requires a VLM resolver for account-owned work")
         vlm_config = await self.vlm_resolver.get_vlm(ctx.account_id)
         context_provider = SessionExtractContextProvider(
             messages=messages,
@@ -714,6 +716,8 @@ class SessionCompressorV3:
             transaction_handle=None,
             memory_registry=registry,
             vlm_config=vlm_config,
+            work_item_uris=work_item_uris,
+            work_item_namespace=session_id or "",
         )
         await context_provider.prepare_extraction_messages()
         extract_context = context_provider.get_extract_context()
@@ -738,9 +742,26 @@ class SessionCompressorV3:
             vlm_config=vlm_config,
         )
         operations, _tools_used = await orchestrator.run()
-        if operations is None:
-            tracer.info("[v3_patch_merge] No memory operations generated")
-            return _V3ExtractionResult()
+        activations = getattr(operations, "work_item_activations", []) or []
+        if operations is None or not (
+            operations.upsert_operations
+            or operations.delete_file_contents
+            or operations.resolved_links
+            or operations.errors
+        ):
+            tracer.info("[v3_patch_merge] No memory writes generated")
+            work_items, _ = await _work_item_extraction_metadata(
+                context_provider=context_provider,
+                operations=None,
+                result=None,
+                viking_fs=viking_fs,
+                ctx=ctx,
+                activations=activations,
+            )
+            return _V3ExtractionResult(
+                work_items=work_items,
+                work_item_activations=_work_item_activation_receipts(activations, work_items),
+            )
 
         # Attach caller-provided custom scalar tags to event memories so they
         # ride the same first write into the vector index (人填标量).
@@ -800,8 +821,19 @@ class SessionCompressorV3:
             viking_fs=viking_fs,
             ctx=ctx,
         )
+        work_items, work_item_coverage = await _work_item_extraction_metadata(
+            context_provider=context_provider,
+            operations=patch_operations,
+            result=result,
+            viking_fs=viking_fs,
+            ctx=ctx,
+            activations=activations,
+        )
         return _V3ExtractionResult(
             contexts=contexts,
+            work_items=work_items,
+            work_item_coverage=work_item_coverage,
+            work_item_activations=_work_item_activation_receipts(activations, work_items),
             cases=canonical_cases,
             memory_diff=memory_diff,
             case_uri_by_name=_case_uri_by_name(canonical_cases, patch_operations, result),
@@ -1313,6 +1345,9 @@ class SessionCompressorV3:
 
 @dataclass(slots=True)
 class _V3ExtractionResult:
+    work_items: list[dict[str, Any]] = field(default_factory=list)
+    work_item_coverage: list[dict[str, Any]] = field(default_factory=list)
+    work_item_activations: list[dict[str, Any]] = field(default_factory=list)
     contexts: list[Context] = field(default_factory=list)
     cases: list[Case] = field(default_factory=list)
     memory_diff: dict[str, Any] | None = None
@@ -2152,11 +2187,129 @@ def _serialize_skipped_operations(items: Any) -> list[dict[str, Any]]:
     return serialized
 
 
+async def _work_item_extraction_metadata(
+    *,
+    context_provider: Any,
+    operations: Any,
+    result: Any,
+    viking_fs: Any,
+    ctx: RequestContext,
+    activations: Optional[list[dict[str, Any]]] = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Return bindings and source attribution, never infer coverage from a read."""
+    from openviking.session.memory.utils.memory_file_utils import memory_version_from_fields
+    from openviking.session.memory.work_item import WORK_ITEM_TERMINAL_STATUSES, is_work_item_uri
+
+    written = set(getattr(result, "written_uris", []) or []) | set(
+        getattr(result, "edited_uris", []) or []
+    )
+    work_ops = [
+        op
+        for op in getattr(operations, "upsert_operations", []) or []
+        if op.memory_type == "work_item"
+    ]
+    # Only explicitly active bindings survive a no-change extraction; search hits
+    # alone must not activate all unfinished work belonging to this user.
+    known = set(getattr(context_provider, "work_item_uris", []) or [])
+    read = getattr(context_provider, "read_file_contents", {})
+    uris = {uri for uri in known if uri in read and is_work_item_uri(uri)}
+    uris.update(uri for op in work_ops for uri in op.uris if uri in written)
+    uris.update(item["uri"] for item in activations or [] if item.get("uri") in read)
+    bindings, coverage = [], []
+    applied_sources = []
+    for uri in sorted(uris):
+        try:
+            canonical = MemoryFileUtils.read(await viking_fs.read_file(uri, ctx=ctx), uri=uri)
+        except Exception:
+            # An unreadable canonical item cannot support a compact checkpoint.
+            continue
+        # Another session may have completed this item since candidate selection.
+        # Preserve coverage for an applied terminal update, but never activate it.
+        if canonical.extra_fields.get("status") not in WORK_ITEM_TERMINAL_STATUSES:
+            bindings.append(
+                {"uri": uri, "version": memory_version_from_fields(canonical.extra_fields)}
+            )
+        for op in work_ops:
+            if uri not in op.uris or uri not in written:
+                continue
+            extraction_id = getattr(getattr(op, "source", None), "extraction_id", None)
+            if (
+                not extraction_id
+                or canonical.extra_fields.get("source_extraction_id") != extraction_id
+            ):
+                continue
+            applied_sources.append((uri, op))
+            ids = list(op.source_message_ids or [])
+            if ids:
+                coverage.append({"uri": uri, "source_message_ids": ids})
+    # One raw message may describe several work items. Count the union of only
+    # successfully persisted source chunks, while retaining every destination.
+    get_context = getattr(context_provider, "get_extract_context", None)
+    if callable(get_context):
+        coverage.extend(_work_item_union_coverage(get_context(), applied_sources))
+    by_uri: dict[str, list[str]] = {}
+    for entry in coverage:
+        by_uri.setdefault(entry["uri"], []).extend(entry["source_message_ids"])
+    coverage = [
+        {"uri": uri, "source_message_ids": list(dict.fromkeys(ids))} for uri, ids in by_uri.items()
+    ]
+    return bindings, coverage
+
+
+def _work_item_union_coverage(
+    extract_context: Any, applied_sources: list[tuple[str, Any]]
+) -> list[dict[str, Any]]:
+    from openviking.session.memory.work_item import selected_source_messages
+
+    chunks: dict[str, set[int]] = {}
+    source_for_chunk: dict[int, str] = {}
+    chunk_meta = getattr(extract_context, "chunk_meta", {}) or {}
+    for message in getattr(extract_context, "messages", []) or []:
+        meta = chunk_meta.get(id(message))
+        source_id = meta.source_message_id if meta is not None else message.id
+        chunks.setdefault(source_id, set()).add(id(message))
+        source_for_chunk[id(message)] = source_id
+    selected: dict[str, set[int]] = {}
+    destinations: dict[str, set[str]] = {}
+    for uri, operation in applied_sources:
+        try:
+            messages = selected_source_messages(
+                extract_context, operation.memory_fields.get("ranges")
+            )
+        except ValueError:
+            continue
+        for message in messages:
+            source_id = source_for_chunk[id(message)]
+            selected.setdefault(source_id, set()).add(id(message))
+            destinations.setdefault(source_id, set()).add(uri)
+    return [
+        {"uri": uri, "source_message_ids": [source_id]}
+        for source_id, indexes in selected.items()
+        if indexes == chunks[source_id]
+        for uri in sorted(destinations[source_id])
+    ]
+
+
+def _work_item_activation_receipts(
+    activations: list[dict[str, Any]], bindings: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    versions = {item["uri"]: item["version"] for item in bindings}
+    return [
+        {**item, "version": versions[item["uri"]]}
+        for item in activations
+        if item.get("uri") in versions
+    ]
+
+
 def _v3_extraction_response(
     *,
     contexts: list[Context],
     train_result: Any,
     archive_uri: str,
+    work_items: Optional[list[dict[str, Any]]] = None,
+    work_item_coverage: Optional[list[dict[str, Any]]] = None,
+    work_item_activations: Optional[list[dict[str, Any]]] = None,
+    include_work_items: bool = False,
 ) -> list[Context] | dict[str, Any]:
     """Build the extraction response.
 
@@ -2174,9 +2327,20 @@ def _v3_extraction_response(
             if uri_str and uri_str not in seen:
                 seen.add(uri_str)
                 skill_dicts.append({"uri": uri_str, "archive_uri": archive_uri})
-    if not skill_dicts:
+    if not (
+        skill_dicts
+        or include_work_items
+        or work_items
+        or work_item_coverage
+        or work_item_activations
+    ):
         return contexts
-    return {"contexts": contexts, "session_skills": skill_dicts}
+    response = {"contexts": contexts, "session_skills": skill_dicts}
+    if include_work_items or work_items or work_item_coverage or work_item_activations:
+        response["work_items"] = list(work_items or [])
+        response["work_item_coverage"] = list(work_item_coverage or [])
+        response["work_item_activations"] = list(work_item_activations or [])
+    return response
 
 
 def _make_memory_diff(

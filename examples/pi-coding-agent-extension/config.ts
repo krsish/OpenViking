@@ -41,6 +41,7 @@ export interface OVConfig {
   commitTokenThreshold: number;
   commitKeepRecentCount: number;
   takeoverEnabled: boolean;
+  workingMemoryMode: "legacy" | "work_item";
   takeoverTokenThreshold: number;
   takeoverKeepRecentTurns: number;
   takeoverOverviewBudget: number;

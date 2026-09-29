@@ -25,7 +25,7 @@ import { guardVikingUriToolCall, noticeVikingUriToolResult } from "./lib/uri-gua
 import { createMcpBridge, DEFAULT_HANDSHAKE_BUDGET_MS } from "./lib/mcp-bridge.mjs";
 import { registerMcpTools } from "./tools.js";
 import { createTakeoverManager } from "./takeover.js";
-import { HANDLER_BUDGET_MS } from "./lib/takeover-core.mjs";
+import { HANDLER_BUDGET_MS, estimateTokens } from "./lib/takeover-core.mjs";
 
 /** This extension's directory, published for the experimental fork's probe. */
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
@@ -379,11 +379,19 @@ export default async function (pi: ExtensionAPI) {
     if (config.takeoverEnabled) {
       const deadline = Date.now() + HANDLER_BUDGET_MS;
       const prep = (event as any)?.preparation ?? {};
+      const budget = config.workingMemoryMode === "work_item" ? {
+        contextWindow: ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow,
+        reserveTokens: prep.settings?.reserveTokens,
+        overheadTokens: estimateTokens(ctx.getSystemPrompt()) +
+          estimateTokens(JSON.stringify(pi.getAllTools().filter((tool) => pi.getActiveTools().includes(tool.name)))) +
+          config.recallTokenBudget + config.profileTokenBudget,
+      } : {};
       // Native compaction syncs the latest branch, archives all captured
       // history and reuses pi's own firstKeptEntryId, so hand it the branch.
       return await takeover.handleBeforeCompact({
         firstKeptEntryId: prep.firstKeptEntryId,
         tokensBefore: prep.tokensBefore ?? 0,
+        ...budget,
         signal: (event as any)?.signal,
       }, () => ctx.sessionManager.getBranch(), { deadline });
     }

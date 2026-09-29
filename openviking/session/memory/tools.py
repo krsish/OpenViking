@@ -10,6 +10,8 @@ import json
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+from pydantic_core import to_jsonable_python
+
 from openviking.session.memory.utils import add_line_numbers, line_count, slice_content_lines
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.telemetry import tracer
@@ -190,8 +192,7 @@ class MemoryReadTool(MemoryTool):
                 "uri": {
                     "type": "string",
                     "description": (
-                        "Memory URI to read. e.g., current user: "
-                        "'viking://~/memories/profile.md'"
+                        "Memory URI to read. e.g., current user: 'viking://~/memories/profile.md'"
                     ),
                 },
                 "offset": {
@@ -253,7 +254,10 @@ class MemoryReadTool(MemoryTool):
                     "<system-reminder>Warning: the file exists but is shorter than the provided "
                     f"offset ({offset + 1}). The file has {line_count(plain_content)} lines.</system-reminder>"
                 )
-            return llm_result
+            # MemoryFile parsing restores datetime metadata for runtime guards. Keep
+            # that typed snapshot in the cache, but expose only JSON values to both
+            # native tool responses and the prefetch JSON/Python prompt adapters.
+            return to_jsonable_python(llm_result)
         except NotFoundError as e:
             return {"error": str(e)}
         except Exception as e:
@@ -351,8 +355,7 @@ class MemoryLsTool(MemoryTool):
                 "uri": {
                     "type": "string",
                     "description": (
-                        "Directory URI to list. e.g., current user: "
-                        "'viking://~/memories'"
+                        "Directory URI to list. e.g., current user: 'viking://~/memories'"
                     ),
                 },
                 "recursive": {

@@ -72,12 +72,18 @@ async function withPluginSection(body, fn, env = {}, cliConfig = null) {
 test("loadConfig defaults takeover on", async () => {
   await withPluginSection({}, (cfg) => {
     assert.equal(cfg.takeoverEnabled, true);
+    assert.equal(cfg.workingMemoryMode, "legacy");
     assert.equal(cfg.takeoverTokenThreshold, 30000);
     assert.equal(cfg.takeoverKeepRecentTurns, 3);
     assert.equal(cfg.takeoverOverviewBudget, 3000);
     assert.equal(cfg.takeoverOverviewPollMs, 2000);
     assert.equal(cfg.takeoverOverviewPollMax, 15);
   });
+});
+
+test("loadConfig opts into work-item memory explicitly and rejects unknown modes", async () => {
+  await withPluginSection({ workingMemoryMode: "work_item" }, (cfg) => assert.equal(cfg.workingMemoryMode, "work_item"));
+  await withPluginSection({ workingMemoryMode: "automatic" }, (cfg) => assert.equal(cfg.workingMemoryMode, "legacy"));
 });
 
 test("loadConfig reads the takeover knobs", async () => {
