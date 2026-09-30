@@ -620,6 +620,8 @@ class Session:
         """Materialize session root and messages file if missing."""
         if await self.exists():
             return
+        policy = await self._resolve_memory_policy()
+        await self._validate_work_item_capability(policy)
         await self._viking_fs.mkdir(self._session_uri, exist_ok=True, ctx=self.ctx)
         await self._viking_fs.write_file(
             f"{self._session_uri}/messages.jsonl",
@@ -627,6 +629,12 @@ class Session:
             ctx=self.ctx,
         )
         await self._save_meta()
+
+    async def _validate_work_item_capability(self, policy: MemoryPolicy) -> None:
+        if policy.working_memory_enabled and policy.working_memory_mode == wi.WORK_ITEM_MODE:
+            from openviking.session.memory.work_item_index import ensure_work_item_index_capability
+
+            await ensure_work_item_index_capability(self._vikingdb_manager, ctx=self.ctx)
 
     async def _save_meta(self, lease_ref: Optional[Any] = None) -> None:
         """Persist .meta.json to storage using an optional held PathLock lease."""
@@ -1408,6 +1416,8 @@ class Session:
                     effective_memory_types=set(effective_memory_types),
                 )
 
+            await self._validate_work_item_capability(effective_policy)
+
             self._compression.compression_index = max(
                 self._compression.compression_index,
                 int(self._meta.commit_count),
@@ -1855,8 +1865,22 @@ class Session:
             [str, str, List[Message], Callable[[], Awaitable[Any]]],
             Awaitable[Any],
         ],
+        replay_message_ids: Optional[List[List[str]]] = None,
     ) -> Any:
-        batches = plan_extraction_batches(messages, limits)
+        # Frozen plans keep their original boundaries even if batching settings
+        # changed after a crash. Only previously unplanned messages are rebatched.
+        by_id = {message.id: message for message in messages}
+        batches = []
+        for identities in replay_message_ids or []:
+            if not any(identity in by_id for identity in identities):
+                continue
+            if not all(identity in by_id for identity in identities):
+                raise ValueError("work_item replay source messages are incomplete")
+            planned = tuple(by_id.pop(identity) for identity in identities)
+            batches.append(
+                ExtractionMessageBatch(planned, estimate_extraction_message_tokens(planned))
+            )
+        batches.extend(plan_extraction_batches(list(by_id.values()), limits))
         if not batches:
             return []
 
@@ -1971,6 +1995,7 @@ class Session:
         previous_checkpoint = {}
 
         try:
+            await self._validate_work_item_capability(effective_policy)
             (
                 messages,
                 coverage_start_archive,
@@ -1990,6 +2015,9 @@ class Session:
                 )
                 if uncovered:
                     coverage_start_archive = previous_checkpoint.get("archive_id", "archive_001")
+                    await self._inherit_work_item_progress(
+                        archive_uri, previous_checkpoint, completed_memory_steps
+                    )
             if not messages:
                 raise ValueError("session commit archive has no recoverable messages")
             first_message_id = messages[0].id
@@ -2152,6 +2180,7 @@ class Session:
                                         "work_items",
                                         "work_item_coverage",
                                         "work_item_activations",
+                                        "continuation_coverage",
                                     )
                                 },
                             )
@@ -2225,6 +2254,33 @@ class Session:
                                 work_item_kwargs = {}
                                 if work_item_mode:
                                     current_meta = await self._archives.read_meta(archive_uri)
+                                    source_messages = (
+                                        long_term_messages
+                                        if batch_messages is None
+                                        else batch_messages
+                                    )
+                                    source_ids = [message.id for message in source_messages]
+                                    replay = next(
+                                        (
+                                            plan
+                                            for plan in current_meta.get("work_item_replays", [])
+                                            if plan["message_ids"] == source_ids
+                                        ),
+                                        None,
+                                    )
+
+                                    async def save_replay(plan: Dict[str, Any]) -> None:
+                                        latest = await self._archives.read_meta(archive_uri)
+                                        plans = latest.get("work_item_replays", [])
+                                        if plan not in plans:
+                                            await self._merge_archive_meta(
+                                                archive_uri, {"work_item_replays": [*plans, plan]}
+                                            )
+
+                                    work_item_kwargs.update(
+                                        work_item_replay=replay,
+                                        save_work_item_replay=save_replay,
+                                    )
                                     bindings = previous_checkpoint.get(
                                         "active_work_items", []
                                     ) + current_meta.get("work_items", [])
@@ -2252,7 +2308,14 @@ class Session:
                                     **work_item_kwargs,
                                 )
 
-                            if extraction_batch_limits.enabled:
+                            replay_plans = (
+                                (await self._archives.read_meta(archive_uri)).get(
+                                    "work_item_replays", []
+                                )
+                                if work_item_mode
+                                else []
+                            )
+                            if extraction_batch_limits.enabled or replay_plans:
                                 extraction_tasks.append(
                                     self._extract_long_term_memories_with_batching(
                                         messages=long_term_messages,
@@ -2260,6 +2323,9 @@ class Session:
                                         archive_uri=archive_uri,
                                         extract_batch=_run_long_term_memory_extraction,
                                         record_batch=_run_recorded_memory_step,
+                                        replay_message_ids=[
+                                            plan["message_ids"] for plan in replay_plans
+                                        ],
                                     )
                                 )
                             else:
@@ -2485,6 +2551,51 @@ class Session:
             )
             logger.exception(f"Memory extraction failed for session {self.session_id}")
 
+    async def _inherit_work_item_progress(
+        self,
+        archive_uri: str,
+        checkpoint: Dict[str, Any],
+        completed: Dict[str, set[str]],
+    ) -> None:
+        """Reuse writes/plans from uncovered archives instead of allocating new IDs."""
+        current_index = self._archives.archive_index_from_uri(archive_uri)
+        checkpoint_id = checkpoint.get("archive_id")
+        keys = (
+            "work_items",
+            "work_item_coverage",
+            "work_item_activations",
+            "continuation_coverage",
+            "work_item_replays",
+        )
+        inherited = {key: [] for key in keys}
+        predecessors = []
+        for ref in await self._archives.list_refs():
+            if ref["index"] >= current_index:
+                continue
+            if ref["archive_id"] == checkpoint_id:
+                break
+            if (await self._archives.read_done(ref["archive_uri"])).get("context_reset"):
+                break
+            predecessors.append(ref["archive_uri"])
+        for source_uri in [*reversed(predecessors), archive_uri]:
+            meta = await self._archives.read_meta(source_uri)
+            self._archives.merge_completed_memory_steps(
+                completed, meta.get("completed_memory_steps")
+            )
+            for key in keys:
+                inherited[key].extend(
+                    value for value in meta.get(key, []) if value not in inherited[key]
+                )
+        await self._merge_archive_meta(
+            archive_uri,
+            {
+                **inherited,
+                "completed_memory_steps": self._archives.serialize_completed_memory_steps(
+                    completed
+                ),
+            },
+        )
+
     async def _work_item_history(
         self, before_index: Optional[int] = None, *, use_checkpoint: bool = True
     ) -> tuple[Dict[str, Any], List[Message]]:
@@ -2537,13 +2648,28 @@ class Session:
         uris.extend(uri for uri in previous_uris if uri not in uris)
         items = [await wi.read_work_item(self._viking_fs, self.ctx, uri) for uri in uris]
         residual, coverage = wi.coverage_report(
-            messages, meta.get("work_item_coverage", []), archive_uri
+            messages,
+            meta.get("work_item_coverage", []),
+            archive_uri,
+            meta.get("continuation_coverage", []),
         )
         # Persist the ledger even if budget/index checks below reject publication.
-        await self._merge_archive_meta(archive_uri, {"coverage": coverage})
+        await self._merge_archive_meta(
+            archive_uri,
+            {
+                "coverage": coverage,
+                "residual_tokens": estimate_text_tokens(wi.residual_text(residual)),
+                "residual_token_budget": wi.RESIDUAL_TOKEN_BUDGET,
+            },
+        )
         overview, active = wi.build_projection(items, residual)
         active_uris = {item["uri"] for item in active}
-        cold = [item for item in items if item["uri"] not in active_uris]
+        cold = [
+            item
+            for item in items
+            if item["uri"] not in active_uris
+            and item["fields"].get("status") not in wi.WORK_ITEM_TERMINAL_STATUSES
+        ]
         # Only items removed from the projection require discovery readiness.
         # This wait runs in the background, never inside a compact/read request.
         deadline = asyncio.get_running_loop().time() + 60

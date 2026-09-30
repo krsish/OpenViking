@@ -71,6 +71,18 @@ class WorkItemActivation(BaseModel):
     ranges: str = Field(..., description="Current user message indices requesting this same work.")
 
 
+class ContinuationCoverage(BaseModel):
+    """Account for continuation that does not belong to a work item."""
+
+    ranges: str = Field(..., description="Complete current conversation source indices.")
+    summary: str = Field(
+        default="", description="Concise continuation state, including constraints."
+    )
+    reason: str = Field(
+        default="", description="Why these messages have no remaining continuation."
+    )
+
+
 class SchemaModelGenerator:
     """
     Dynamic Pydantic model generator from memory type schemas.
@@ -309,6 +321,22 @@ class SchemaModelGenerator:
             )
 
         if "work_item" in memory_type_fields:
+            field_definitions["continuation_coverage"] = (
+                List[ContinuationCoverage],
+                Field(
+                    default_factory=list,
+                    description=(
+                        "Account for messages not fully covered by a work_item. Supply ranges and "
+                        "exactly one of summary or reason. Summary preserves all remaining user "
+                        "constraints, questions, commitments and necessary references; keep all "
+                        "summaries together below 600 estimated tokens. Reason explicitly explains "
+                        "why nothing remains to continue (e.g. a greeting or an answered question). "
+                        "Storage in another memory alone is not permission to discard unresolved "
+                        "information. Never claim coverage for unseen/truncated tool evidence. "
+                        "Missing classification retains original messages."
+                    ),
+                ),
+            )
             field_definitions["work_item_activations"] = (
                 List[WorkItemActivation],
                 Field(
@@ -378,7 +406,9 @@ class SchemaModelGenerator:
                         # Single value (not None)
                         return False
             return not (
-                getattr(self, "delete_ids", []) or getattr(self, "work_item_activations", [])
+                getattr(self, "delete_ids", [])
+                or getattr(self, "work_item_activations", [])
+                or getattr(self, "continuation_coverage", [])
             )
 
         def to_legacy_operations(self) -> Dict[str, Any]:

@@ -79,9 +79,22 @@ def item(identity, status="in_progress", text="current state"):
 
 def session_with_fs():
     fs = MemoryFS()
-    session = Session(viking_fs=fs, session_id="work-items", session_uri=SESSION_URI)
+    session = Session(
+        viking_fs=fs,
+        session_id="work-items",
+        session_uri=SESSION_URI,
+        vikingdb_manager=versioned_index(),
+    )
     session._meta.memory_policy = {"working_memory": {"mode": "work_item"}}
     return session, fs
+
+
+def versioned_index():
+    return SimpleNamespace(
+        get_collection_meta=AsyncMock(
+            return_value={"Fields": [{"FieldName": "work_item_version", "FieldType": "int64"}]}
+        )
+    )
 
 
 def archive(fs, number, messages, done=None, failed=False):
@@ -256,6 +269,31 @@ async def test_hot_binding_does_not_wait_for_embedding(monkeypatch):
     assert published["active_work_items"] == [state]
     index_check.assert_not_awaited()
     assert f"{uri}/.done" not in fs.files
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["done", "cancelled"])
+async def test_terminal_binding_never_blocks_publication_or_refresh(monkeypatch, status):
+    session, fs = session_with_fs()
+    uri = archive(fs, 1, [message("1")])
+    state = item("A", status=status)
+    fs.files[f"{uri}/.meta.json"] = json.dumps(
+        {
+            "work_items": [{"uri": state["uri"], "version": 1}],
+            "work_item_coverage": [{"uri": state["uri"], "source_message_ids": ["1"]}],
+        }
+    )
+    monkeypatch.setattr(wi, "read_work_item", AsyncMock(return_value=state))
+    index_check = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        "openviking.session.memory.work_item_index.work_item_index_ready", index_check
+    )
+    published = await session._prepare_work_item_checkpoint(uri, [message("1")], {})
+    assert published["compact_ready"] and published["active_work_items"] == []
+    assert published["coverage"][0]["work_item_uris"] == [state["uri"]]
+    _, refreshed = await session._read_work_item_projection({"active_work_items": [state]})
+    assert refreshed["active_work_items"] == []
+    index_check.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -469,7 +507,12 @@ async def test_next_batch_and_restarted_archive_prefetch_successful_work_item(
         meta = json.loads(fs.files[f"{uri}/.meta.json"])
         assert meta["completed_memory_steps"]["long_term"] == ["1"]
         assert meta["work_items"] == [{"uri": state["uri"], "version": 1}]
-        session = Session(viking_fs=fs, session_id="work-items", session_uri=SESSION_URI)
+        session = Session(
+            viking_fs=fs,
+            session_id="work-items",
+            session_uri=SESSION_URI,
+            vikingdb_manager=versioned_index(),
+        )
         session._meta.memory_policy = policy
         wire_phase2(session)
         await session._run_memory_extraction(
@@ -564,3 +607,97 @@ async def test_projection_growth_with_unindexed_eviction_replays_all_raw_history
     assert result["messages"] == [value.to_dict() for value in (covered, residual, pending, live)]
     assert index_check.await_count >= 2
     assert fs.files == stored_before
+
+
+@pytest.mark.asyncio
+async def test_residual_summary_publishes_and_carries_forward_with_auditable_sources():
+    session, fs = session_with_fs()
+    source = message("long-message", "background details " * 2000)
+    uri = archive(fs, 1, [source])
+    fs.files[f"{uri}/.meta.json"] = json.dumps(
+        {
+            "continuation_coverage": [
+                {
+                    "source_message_ids": [source.id],
+                    "summary": "User still requires a written answer; do not deploy.",
+                    "reason": "",
+                }
+            ]
+        }
+    )
+    published = await session._prepare_work_item_checkpoint(uri, [source], {})
+    assert published["compact_ready"]
+    assert published["coverage"][0]["summary"].endswith("do not deploy.")
+    assert published["residual"][0]["role"] == "assistant"
+    await session._write_done_file(uri, source.id, source.id, checkpoint=published)
+    previous, uncovered = await session._work_item_history()
+    assert uncovered == []
+    carried = [Message.from_dict(value) for value in previous["residual"]]
+    next_uri = archive(fs, 2, [message("next", "Continue")])
+    next_checkpoint = await session._prepare_work_item_checkpoint(next_uri, carried, previous)
+    assert "do not deploy" in wi.residual_text(next_checkpoint["residual"])
+    assert fs.files[f"{uri}/messages.jsonl"] == source.to_jsonl()
+
+
+@pytest.mark.asyncio
+async def test_overflow_keeps_coverage_diagnostics_without_publishing():
+    session, fs = session_with_fs()
+    source = message("unassigned-long", "unclassified constraint " * 2000)
+    uri = archive(fs, 1, [source])
+    with pytest.raises(ValueError, match="residual_tokens=.*message_ids=.*unassigned-long"):
+        await session._prepare_work_item_checkpoint(uri, [source], {})
+    meta = json.loads(fs.files[f"{uri}/.meta.json"])
+    assert meta["residual_tokens"] > meta["residual_token_budget"]
+    assert meta["coverage"][0]["residual_uri"] == f"{uri}/.done"
+    assert f"{uri}/.done" not in fs.files
+    assert fs.files[f"{uri}/messages.jsonl"] == source.to_jsonl()
+
+
+@pytest.mark.asyncio
+async def test_replay_preserves_batch_boundary_after_limit_changes():
+    from openviking.session.extraction_batch import ExtractionBatchLimits
+
+    session, _ = session_with_fs()
+    session._viking_fs = None
+    messages = [message(str(index)) for index in range(4)]
+    calls = []
+
+    async def extract(batch):
+        calls.append([value.id for value in batch])
+        return []
+
+    async def record(name, step, batch, operation):
+        return await operation()
+
+    await session._extract_long_term_memories_with_batching(
+        messages=messages,
+        limits=ExtractionBatchLimits(max_messages=1),
+        archive_uri="archive",
+        extract_batch=extract,
+        record_batch=record,
+        replay_message_ids=[["0", "1"]],
+    )
+    assert calls == [["0", "1"], ["2"], ["3"]]
+
+
+@pytest.mark.asyncio
+async def test_next_archive_inherits_partial_write_plan_and_success_receipts():
+    session, fs = session_with_fs()
+    original = archive(fs, 1, [message("1"), message("2")], failed=True)
+    new = archive(fs, 2, [message("3")])
+    plan = {"extraction_id": "wi-replay-example", "message_ids": ["2"], "operations": []}
+    receipt = {"uri": item("A")["uri"], "source_message_ids": ["1"]}
+    fs.files[f"{original}/.meta.json"] = json.dumps(
+        {
+            "completed_memory_steps": {"long_term": ["1"]},
+            "work_item_coverage": [receipt],
+            "work_item_replays": [plan],
+        }
+    )
+    completed = {}
+    await session._inherit_work_item_progress(new, {}, completed)
+    await session._inherit_work_item_progress(new, {}, completed)
+    meta = json.loads(fs.files[f"{new}/.meta.json"])
+    assert completed == {"long_term": {"1"}}
+    assert meta["work_item_coverage"] == [receipt]
+    assert meta["work_item_replays"] == [plan]

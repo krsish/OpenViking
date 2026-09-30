@@ -343,6 +343,9 @@ class ResolvedOperation(BaseModel):
     memory_fields: Dict
     memory_type: str  # The memory type (e.g., 'tools', 'skills', 'events')
     uris: List[str]
+    # Selected original messages, including partially covered chunks. Frozen
+    # with work-item plans so source evidence does not depend on retry indices.
+    source_evidence_message_ids: Optional[List[str]] = None
     page_id: Optional[int] = None  # Temporary page_id for link resolution (not persisted)
     source: Optional[MemoryOperationSource] = None
     # Runtime source attribution, resolved before streaming combines conversations.
@@ -367,6 +370,8 @@ class ResolvedOperations(BaseModel):
     delete_replacements: Dict[str, str] = Field(default_factory=dict)
     # Session bindings selected from already-read canonical state, never writes or coverage.
     work_item_activations: List[Dict[str, Any]] = Field(default_factory=list)
+    # Explicit continuation summaries or discard reasons, with source attribution.
+    continuation_coverage: List[Dict[str, Any]] = Field(default_factory=list)
 
     def has_errors(self) -> bool:
         return len(self.errors) > 0

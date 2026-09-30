@@ -54,6 +54,7 @@ from openviking.utils.model_retry import (
     ERROR_CLASS_PERMANENT,
 )
 from openviking.utils.time_utils import get_current_timestamp
+from openviking_cli.exceptions import FailedPreconditionError
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
@@ -292,6 +293,51 @@ def _decode_collection_description(
     return base.strip(), payload if isinstance(payload, dict) else None
 
 
+def validate_work_item_collection_schema(metadata: Any) -> None:
+    """Require actual collection schema before enabling versioned work-item WM.
+
+    This is a capability check, not an index-readiness check or a migration.
+    Synthetic data-plane metadata describes the desired schema only and cannot
+    prove that an older remote collection persists the required field.
+    """
+    details = {
+        "capability": "work_item_working_memory",
+        "field": "work_item_version",
+        "expected_type": "int64",
+    }
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("Fields"), list):
+        details["reason"] = "metadata_unavailable"
+        raise FailedPreconditionError(
+            "Cannot verify work_item working-memory capability: collection schema is unavailable. "
+            "Restore collection metadata access before enabling work_item; legacy mode remains available.",
+            details=details,
+        )
+    if metadata.get("SchemaVerified") is False:
+        details["reason"] = "schema_unverified"
+        raise FailedPreconditionError(
+            "Cannot verify work_item working-memory capability from synthetic collection metadata. "
+            "Volcengine API-key data-plane access does not read the remote schema; use a connection "
+            "with collection-schema access (such as AK/SK control-plane access) before enabling "
+            "work_item. Legacy mode remains available.",
+            details=details,
+        )
+    fields = [
+        field
+        for field in metadata["Fields"]
+        if isinstance(field, dict) and field.get("FieldName") == "work_item_version"
+    ]
+    if len(fields) != 1 or fields[0].get("FieldType") != "int64":
+        details["reason"] = "field_missing" if not fields else "field_type_mismatch"
+        if fields:
+            details["actual_type"] = fields[0].get("FieldType")
+        raise FailedPreconditionError(
+            "work_item working memory requires the vector collection field 'work_item_version' "
+            "with type 'int64'. Migrate the collection out of band (default 0 for the added field) "
+            "and reindex existing work items before enabling work_item; legacy mode remains available.",
+            details=details,
+        )
+
+
 async def init_context_collection(storage) -> bool:
     """
     Initialize the context collection with proper schema.
@@ -356,12 +402,13 @@ async def init_context_collection(storage) -> bool:
     expected_fields = {field.get("FieldName") for field in schema["Fields"]}
     existing_fields = {field.get("FieldName") for field in existing_meta.get("Fields", [])}
     missing_fields = sorted(expected_fields - existing_fields)
-    if "work_item_version" in missing_fields and vectordb_cfg.backend not in {"local", "cuvs"}:
-        logger.warning(
-            "Existing collection lacks work_item_version; add an int64 field with default 0 "
-            "before enabling work_item cold checkpoints. Per-item index readiness stays false "
-            "until this remote collection is migrated and the items are reindexed."
-        )
+    if vectordb_cfg.backend not in {"local", "cuvs"}:
+        try:
+            validate_work_item_collection_schema(existing_meta)
+        except FailedPreconditionError as exc:
+            # This optional capability must not prevent legacy server startup.
+            # Work-item sessions check it explicitly before accepting a commit.
+            logger.warning("Work-item working memory is unavailable: %s", exc)
     expected_scalar_indexes = set(schema["ScalarIndex"])
     existing_scalar_indexes = set(existing_meta.get("ScalarIndex", []))
     missing_scalar_indexes = sorted(expected_scalar_indexes - existing_scalar_indexes)

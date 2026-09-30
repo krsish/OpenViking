@@ -218,7 +218,28 @@ class TestSessionConversationToolFiltering:
 
         assert "ToolCall: tool_name=get_reservation_details" in conversation
         assert "input={'reservation_id': 'EHGLP3'}" in conversation
+        assert conversation.count("input=") == 1
         assert "output=available" in conversation
+
+    def test_agent_tool_output_retains_the_existing_preview_limit(self):
+        from openviking.session.memory.agent_trajectory_context_provider import (
+            AgentTrajectoryContextProvider,
+        )
+
+        messages = [
+            Message(
+                id="tool-result",
+                role="assistant",
+                parts=[ToolPart(tool_name="read", tool_output="x" * 500 + "HIDDEN_TAIL")],
+            )
+        ]
+        provider = AgentTrajectoryContextProvider(messages=messages)
+
+        conversation = provider._assemble_conversation(messages)
+
+        assert "output=" + "x" * 500 in conversation
+        assert "HIDDEN_TAIL" not in conversation
+        assert "input=" not in conversation
 
     def test_assemble_conversation_uses_peer_id_when_present(self):
         messages = [

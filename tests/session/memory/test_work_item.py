@@ -94,6 +94,43 @@ def setup_updater(registry):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("split", [False, True])
+async def test_terminal_time_uses_frozen_source_ids_after_range_layout_changes(
+    registry, ctx, split
+):
+    updater, fs = setup_updater(registry)
+    completion = Message(
+        id="completion",
+        role="user",
+        created_at="2020-01-01T00:01:00+00:00",
+        parts=[TextPart("Finished and verified. " * (1000 if split else 1))],
+    )
+    unrelated = Message(
+        id="unrelated",
+        role="user",
+        created_at="2020-01-01T00:03:00+00:00",
+        parts=[TextPart("A later message about something else.")],
+    )
+    context = ExtractContext([completion, unrelated])
+    operation = op(status="done", ranges=str(len(context.messages) - 1))
+    operation.source_message_ids = ["completion"]
+    operation.source_evidence_message_ids = ["completion"]
+    await updater._apply_upsert(operation, ctx, context)
+    terminal = fs.parsed()
+    assert terminal.extra_fields["terminal_evidence_at"] == "2020-01-01T00:01:00+00:00"
+    reopen = Message(
+        id="reopen",
+        role="user",
+        created_at="2020-01-01T00:02:00+00:00",
+        parts=[TextPart("Please reopen this work.")],
+    )
+    operation = op(terminal, reopen_reason="Please reopen this work.")
+    operation.source_message_ids = ["reopen"]
+    await updater._apply_upsert(operation, ctx, ExtractContext([reopen]))
+    assert fs.parsed().extra_fields["status"] == "open"
+
+
+@pytest.mark.asyncio
 async def test_latest_version_guard_and_explicit_clear(registry, ctx):
     updater, fs = setup_updater(registry)
     await updater._apply_upsert(op(waiting_for="User decision"), ctx)
@@ -241,13 +278,22 @@ async def test_resolver_assigns_id_and_existing_page_keeps_it(registry, ctx):
 
 
 @pytest.mark.asyncio
-async def test_exact_prefetch_and_full_tools_are_scoped_to_work_items(registry, ctx):
+async def test_exact_prefetch_and_bounded_tools_are_scoped_to_work_items(registry, ctx):
     output = "tool-output" * 1000
+    ref = "viking://user/alice/sessions/test/tool-results/tool-one"
     messages = [
         Message(
             id="msg",
             role="assistant",
-            parts=[ToolPart(tool_name="run", tool_status="completed", tool_output=output)],
+            parts=[
+                ToolPart(
+                    tool_name="run",
+                    tool_status="completed",
+                    tool_input={"command": "i" * 1000},
+                    tool_output=output,
+                    tool_output_ref=ref,
+                )
+            ],
         )
     ]
     provider = SessionExtractContextProvider(
@@ -264,7 +310,19 @@ async def test_exact_prefetch_and_full_tools_are_scoped_to_work_items(registry, 
     assert [
         call.kwargs["file_uri"] for call in provider._append_structured_read_result.call_args_list
     ] == [URI]
-    assert output in "\n".join(str(message.get("content", "")) for message in result)
+    evidence = next(
+        message["content"]
+        for message in result
+        if str(message.get("content", "")).startswith("## Execution evidence")
+    )
+    assert output[:500] in evidence
+    assert output not in evidence
+    assert "i" * 1000 not in evidence
+    assert evidence.count("[truncated]") == 2
+    assert "not complete execution evidence" in evidence
+    assert ref in evidence
+    assert provider.work_item_partial_tool_message_ids == {"msg"}
+    assert messages[0].parts[0].tool_output == output
     provider._isolation_handler = MemoryIsolationHandler(
         ctx, provider.get_extract_context(), allowed_memory_types=set()
     )
@@ -272,6 +330,86 @@ async def test_exact_prefetch_and_full_tools_are_scoped_to_work_items(registry, 
     result = await provider.prefetch()
     provider._append_structured_read_result.assert_not_called()
     assert output not in "\n".join(str(message.get("content", "")) for message in result)
+    assert not any(
+        str(message.get("content", "")).startswith("## Execution evidence") for message in result
+    )
+
+
+@pytest.mark.parametrize("text", ["x" * 500, "结果" * 250, "🙂" * 500])
+def test_work_item_tool_evidence_budget_preserves_recent_refs(text, ctx):
+    from openviking.utils.token_estimation import estimate_text_tokens
+
+    messages = [
+        Message(
+            id=f"msg-{index}",
+            role="assistant",
+            parts=[
+                ToolPart(
+                    tool_name=f"tool-{index}",
+                    tool_status="completed",
+                    tool_output=text,
+                    tool_output_ref=f"viking://user/alice/sessions/test/tool-results/{index}",
+                )
+            ],
+        )
+        for index in range(30)
+    ]
+    provider = SessionExtractContextProvider(messages, ctx=ctx)
+
+    evidence = provider._build_work_item_tool_evidence()
+
+    assert estimate_text_tokens(evidence) <= 2000
+    assert "Some tool evidence was omitted" in evidence
+    assert "tool=tool-29;" in evidence
+    assert "tool-results/29" in evidence
+    assert "tool=tool-0;" not in evidence
+    assert "msg-0" in provider.work_item_partial_tool_message_ids
+    assert "msg-29" not in provider.work_item_partial_tool_message_ids
+
+
+def test_work_item_tool_evidence_bounds_metadata_without_claiming_it_was_read(ctx):
+    messages = [
+        Message(
+            id="large-metadata",
+            role="assistant",
+            parts=[ToolPart(tool_name="n" * 10000, tool_output="done")],
+        )
+    ]
+    provider = SessionExtractContextProvider(messages, ctx=ctx)
+
+    evidence = provider._build_work_item_tool_evidence()
+
+    assert "Some tool evidence was omitted" in evidence
+    assert "tool=" not in evidence
+    assert provider.work_item_partial_tool_message_ids == {"large-metadata"}
+
+
+@pytest.mark.parametrize(
+    "output_length, original_chars, partial", [(30, 300, True), (300, 300, False), (30, None, True)]
+)
+def test_work_item_tool_evidence_keeps_unhydrated_result_uncovered(
+    output_length, original_chars, partial, ctx
+):
+    messages = [
+        Message(
+            id="externalized",
+            role="assistant",
+            parts=[
+                ToolPart(
+                    tool_name="read",
+                    tool_output="x" * output_length,
+                    tool_output_ref="viking://user/alice/sessions/test/tool-results/result",
+                    tool_output_truncated=True,
+                    tool_output_original_chars=original_chars,
+                )
+            ],
+        )
+    ]
+    provider = SessionExtractContextProvider(messages, ctx=ctx)
+
+    provider._build_work_item_tool_evidence()
+
+    assert ("externalized" in provider.work_item_partial_tool_message_ids) is partial
 
 
 @pytest.mark.asyncio

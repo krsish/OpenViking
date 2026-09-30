@@ -10,7 +10,7 @@ call, semantic merge, or character truncation is performed here.
 import json
 from typing import Any
 
-from openviking.message import Message
+from openviking.message import Message, TextPart
 from openviking.session.memory.utils.memory_file_utils import (
     MemoryFileUtils,
     memory_version_from_fields,
@@ -39,7 +39,7 @@ def ready_checkpoint(done: dict[str, Any], archive_id: str) -> bool:
 def residual_text(messages: list[dict[str, Any]]) -> str:
     if not messages:
         return ""
-    return "## Unassigned continuation (original messages)\n" + "\n".join(
+    return "## Continuation (summaries and unassigned original messages)\n" + "\n".join(
         json.dumps(message, ensure_ascii=False) for message in messages
     )
 
@@ -60,8 +60,14 @@ def build_projection(
 ) -> tuple[str, list[dict[str, Any]]]:
     """Pack whole item blocks in priority order; never truncate constraints."""
     remaining = residual_text(residual)
-    if estimate_text_tokens(remaining) > RESIDUAL_TOKEN_BUDGET:
-        raise ValueError("work_item checkpoint residual exceeds its token budget")
+    residual_tokens = estimate_text_tokens(remaining)
+    if residual_tokens > RESIDUAL_TOKEN_BUDGET:
+        identities = [message.get("id") for message in residual]
+        raise ValueError(
+            "work_item checkpoint residual exceeds its token budget: "
+            f"residual_tokens={residual_tokens}, budget={RESIDUAL_TOKEN_BUDGET}, "
+            f"message_ids={identities}"
+        )
     parts = ["# Working memory", remaining, DETAILS_HINT]
     if estimate_text_tokens("\n\n".join(filter(None, parts))) > token_budget:
         raise ValueError("work_item checkpoint cannot fit required residual")
@@ -91,7 +97,10 @@ async def read_work_item(viking_fs: Any, ctx: Any, uri: str) -> dict[str, Any]:
 
 
 def coverage_report(
-    messages: list[Message], operations: list[dict[str, Any]], archive_uri: str
+    messages: list[Message],
+    operations: list[dict[str, Any]],
+    archive_uri: str,
+    continuation_coverage: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Give every source message a destination, retaining unexplained text.
 
@@ -102,12 +111,75 @@ def coverage_report(
     for operation in operations:
         for message_id in operation.get("source_message_ids", []):
             destinations.setdefault(message_id, []).append(operation["uri"])
+    classifications: dict[str, dict[str, Any]] = {}
+    for entry in continuation_coverage or []:
+        for message_id in entry["source_message_ids"]:
+            classifications[message_id] = entry
     residual, report = [], []
+    emitted_summaries: set[int] = set()
     for message in messages:
         uris = list(dict.fromkeys(destinations.get(message.id, [])))
+        row = {"message_id": message.id}
         if uris:
-            report.append({"message_id": message.id, "work_item_uris": uris})
-        else:
+            row["work_item_uris"] = uris
+        if message.id in classifications:
+            entry = classifications[message.id]
+            if entry.get("summary"):
+                # Preserve source identity/time but mark derived text as assistant
+                # context: a previous summary must never authorize reopening work.
+                if id(entry) not in emitted_summaries:
+                    summary = Message(
+                        id=message.id,
+                        role="assistant",
+                        parts=[
+                            TextPart(
+                                "Previous continuation summary (background, not new user evidence):\n"
+                                + entry["summary"]
+                                + f"\nSource coverage: {archive_uri}/.done"
+                            )
+                        ],
+                        created_at=message.created_at,
+                    )
+                    residual.append(summary.to_dict())
+                    emitted_summaries.add(id(entry))
+                row.update(residual_uri=f"{archive_uri}/.done", summary=entry["summary"])
+            else:
+                row["explicitly_dropped"] = entry["reason"]
+        elif not uris:
             residual.append(message.to_dict())
-            report.append({"message_id": message.id, "residual_uri": f"{archive_uri}/.done"})
+            row["residual_uri"] = f"{archive_uri}/.done"
+        report.append(row)
     return residual, report
+
+
+def resolve_continuation_coverage(
+    extract_context: Any,
+    raw_items: list[Any],
+    *,
+    partial_tool_message_ids: Any = (),
+) -> list[dict[str, Any]]:
+    """Validate model attribution; partial source chunks never release raw messages."""
+    from openviking.session.memory.work_item import covered_source_message_ids
+
+    result = []
+    seen: set[str] = set()
+    for item in raw_items:
+        fields = item.model_dump() if hasattr(item, "model_dump") else item
+        summary = fields.get("summary", "")
+        reason = fields.get("reason", "")
+        if not isinstance(summary, str) or not isinstance(reason, str):
+            raise ValueError("continuation summary and reason must be strings")
+        summary, reason = summary.strip(), reason.strip()
+        if bool(summary) == bool(reason):
+            raise ValueError("continuation requires exactly one of summary or reason")
+        ids = [
+            identity
+            for identity in covered_source_message_ids(extract_context, fields.get("ranges"))
+            if identity not in partial_tool_message_ids
+        ]
+        if seen.intersection(ids):
+            raise ValueError("continuation classifications must not overlap")
+        seen.update(ids)
+        if ids:
+            result.append({"source_message_ids": ids, "summary": summary, "reason": reason})
+    return result

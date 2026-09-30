@@ -178,6 +178,17 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             lines.extend(self._render_schema_contract(context, schema))
         if any(schema.memory_type == "work_item" for schema in context.schemas):
             lines.append(
+                '- sdk.continuation(ranges="0-3", summary="""Remaining continuation state""") '
+                'or sdk.continuation(ranges="4", reason="""No remaining continuation because ..."""): '
+                "account for messages not fully covered by a work_item. Supply exactly one of "
+                "summary or reason. Summaries must retain unresolved requests, constraints, "
+                "commitments and necessary references; keep all summaries together below 600 "
+                "estimated tokens. Use reason only for content with nothing left to continue, "
+                "such as greetings or fully answered questions. Another memory's existence alone "
+                "does not justify discarding continuation. Never classify unseen/truncated tool "
+                "evidence as covered. Missing classifications keep original messages."
+            )
+            lines.append(
                 '- existing_work_item.activate(ranges="<current user message indices>"): '
                 "resume at most 3 already-read nonterminal work_items whose goal and scope "
                 "match the current user request. Use the supplied existing-object variable. "
@@ -308,7 +319,9 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
     def render_final_instruction(self, context: ExtractionOutputContext) -> str:
         activation_hint = (
             " Include .activate(ranges=...) when the user resumes a matching existing work_item "
-            "even if no fields change."
+            "even if no fields change. Include sdk.continuation(ranges=..., summary=...) "
+            "or sdk.continuation(ranges=..., reason=...) for remaining conversation coverage, "
+            "even when no memory fields change."
             if any(schema.memory_type == "work_item" for schema in context.schemas)
             else ""
         )
@@ -318,7 +331,8 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             "Python code."
             + activation_hint
             + (
-                " If there are no changes or activations, return only sdk.commit()."
+                " If there are no changes, activations, or continuation classifications, "
+                "return only sdk.commit()."
                 if activation_hint
                 else " If there are no changes, return only sdk.commit()."
             )
@@ -661,6 +675,7 @@ class _PythonProgramCompiler:
         self.objects: dict[str, _MemoryObject] = {}
         self.values: dict[str, Any] = {}
         self.links: list[dict[str, Any]] = []
+        self.continuation_coverage: list[dict[str, Any]] = []
         self._singleton_identities: set[tuple[str, tuple[tuple[str, Any], ...]]] = set()
         self._next_new_page_id = self._find_next_new_page_id(100)
         self._committed = False
@@ -912,6 +927,18 @@ class _PythonProgramCompiler:
 
     def _call_sdk(self, node: ast.Call, *, statement: bool) -> Any:
         method = node.func.attr
+        if method == "continuation":
+            if "continuation_coverage" not in self.context.operations_model.model_fields:
+                self._error(node, "continuation() is available only with work_item extraction")
+            kwargs = self._eval_keywords(node)
+            if node.args or set(kwargs) not in ({"ranges", "summary"}, {"ranges", "reason"}):
+                self._error(
+                    node, "continuation() requires ranges= and exactly one of summary=/reason="
+                )
+            if not all(isinstance(value, str) and value.strip() for value in kwargs.values()):
+                self._error(node, "continuation() arguments must be non-empty strings")
+            self.continuation_coverage.append(kwargs)
+            return None
         if method.startswith(("create_", "set_")):
             verb, type_alias = method.split("_", 1)
             if node.args:
@@ -1246,6 +1273,8 @@ class _PythonProgramCompiler:
 
     def _build_operations(self) -> Any:
         payload: dict[str, Any] = {name: [] for name in self.context.operations_model.model_fields}
+        if "continuation_coverage" in payload:
+            payload["continuation_coverage"] = self.continuation_coverage
         deleted_ids: set[int] = set()
         replacement_ids: dict[int, int] = {}
         for obj in self.objects.values():

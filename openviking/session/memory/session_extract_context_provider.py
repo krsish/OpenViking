@@ -35,6 +35,7 @@ from openviking.session.memory.vision_message_normalizer import (
 from openviking.storage.viking_fs import VikingFS
 from openviking.telemetry import tracer
 from openviking.utils.time_utils import parse_iso_datetime
+from openviking.utils.token_estimation import estimate_text_tokens
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config import get_openviking_config
 
@@ -48,6 +49,8 @@ _PREFETCH_SEARCH_QUERY_MAX_CHARS = 5000
 _PREFETCH_SEARCH_TEXT_PART_MAX_CHARS = 1000
 _PREFETCH_SEARCH_ASSISTANT_TEXT_PART_MAX_CHARS = 500
 _PREFETCH_SEARCH_TOOL_FIELD_MAX_CHARS = 500
+_WORK_ITEM_TOOL_FIELD_MAX_CHARS = 500
+_WORK_ITEM_TOOL_EVIDENCE_TOKEN_BUDGET = 2000
 _RESOURCE_REASON_LANGUAGE_RE = re.compile(
     r"(?im)^\s*(?:User reason|用户说明|用户原因|用户理由)[:：]\s*(.+?)\s*$"
 )
@@ -76,6 +79,7 @@ class SessionExtractContextProvider(ExtractContextProvider):
         self.latest_archive_overview = latest_archive_overview
         self.work_item_uris = list(dict.fromkeys(work_item_uris or []))
         self.work_item_namespace = work_item_namespace
+        self.work_item_partial_tool_message_ids: set[str] = set()
         self._output_language = self._detect_language()
         self._registry = memory_registry  # Lazy defaults if no account snapshot was supplied.
         self._schema_directories = None
@@ -333,7 +337,7 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
                     if part.tool_input:
                         fields.append(f"input={part.tool_input}")
                     if part.tool_output:
-                        fields.append(f"input={part.tool_input}; output={part.tool_output}")
+                        fields.append(f"output={part.tool_output[:500]}")
                     if part.duration_ms is not None:
                         fields.append(f"duration_ms={part.duration_ms}")
                     if part.skill_uri:
@@ -357,6 +361,50 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
         conversation_sections.append("\n".join(formatted_messages))
 
         return "\n\n".join(section for section in conversation_sections if section)
+
+    def _build_work_item_tool_evidence(self) -> str:
+        """Keep recent tool previews within the extraction prompt's evidence budget."""
+        header = (
+            "## Execution evidence for work_item only\n"
+            "These are bounded tool previews, not complete execution evidence. "
+            "Use only visible evidence for confirmed work state; do not infer success "
+            "from a completed tool or turn tool data into user preferences. "
+            "Existing refs identify original results, not results already read.\n"
+        )
+        omitted_notice = "Some tool evidence was omitted to fit the budget.\n"
+        lines = []
+        omitted = False
+        self.work_item_partial_tool_message_ids.clear()
+        for index, message in reversed(list(enumerate(self.get_extract_context().messages))):
+            for part in reversed(getattr(message, "parts", [])):
+                if not isinstance(part, ToolPart):
+                    continue
+                if part.tool_output_truncated and (
+                    part.tool_output_original_chars is None
+                    or part.tool_output_original_chars > len(part.tool_output or "")
+                ):
+                    self.work_item_partial_tool_message_ids.add(message.id)
+                previews = []
+                for value in (part.tool_input, part.tool_output):
+                    text = str(value or "")
+                    if len(text) > _WORK_ITEM_TOOL_FIELD_MAX_CHARS:
+                        text = text[:_WORK_ITEM_TOOL_FIELD_MAX_CHARS] + " [truncated]"
+                        self.work_item_partial_tool_message_ids.add(message.id)
+                    previews.append(text)
+                line = (
+                    f"[{index}] tool={part.tool_name}; status={part.tool_status}; "
+                    f"ref={part.tool_output_ref or part.tool_uri}; "
+                    f"input={previews[0]}; output={previews[1]}"
+                )
+                candidate = header + omitted_notice + "\n".join([line, *reversed(lines)])
+                if estimate_text_tokens(candidate) > _WORK_ITEM_TOOL_EVIDENCE_TOKEN_BUDGET:
+                    omitted = True
+                    self.work_item_partial_tool_message_ids.add(message.id)
+                    continue
+                lines.append(line)
+        if not lines and not omitted:
+            return ""
+        return header + (omitted_notice if omitted else "") + "\n".join(reversed(lines))
 
     def _truncate_prefetch_query_text(self, text: Any, max_chars: int) -> str:
         normalized = " ".join(str(text or "").split())
@@ -565,30 +613,9 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
                     read_files.add(file_uri)
 
         if any(schema.memory_type == "work_item" for schema in schemas):
-            tool_lines = []
-            for index, message in enumerate(self.get_extract_context().messages):
-                for part in getattr(message, "parts", []):
-                    if not isinstance(part, ToolPart):
-                        continue
-                    evidence = (
-                        f"[{index}] tool={part.tool_name}; status={part.tool_status}; "
-                        f"ref={part.tool_output_ref or part.tool_uri}; "
-                        f"input={part.tool_input}; output={part.tool_output}"
-                    )
-                    tool_lines.append(evidence)
-            if tool_lines:
-                pre_fetch_messages.append(
-                    {
-                        "role": "user",
-                        "content": (
-                            "## Execution evidence for work_item only\n"
-                            "Use only for this work's confirmed state and recovery references. "
-                            "Do not turn tool data into user preferences or personal facts. "
-                            "A completed tool is not proof the goal succeeded; inspect its output.\n"
-                            + "\n".join(tool_lines)
-                        ),
-                    }
-                )
+            evidence = self._build_work_item_tool_evidence()
+            if evidence:
+                pre_fetch_messages.append({"role": "user", "content": evidence})
 
         call_id_seq = 0
         # Step 2: Execute search for each ls directory (instead of ls)

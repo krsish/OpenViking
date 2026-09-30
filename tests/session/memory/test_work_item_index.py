@@ -11,10 +11,12 @@ from openviking.server.identity import RequestContext, Role
 from openviking.session.memory.dataclass import MemoryFile
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.memory.work_item_index import (
+    ensure_work_item_index_capability,
     upsert_work_item_embedding,
     work_item_index_ready,
 )
 from openviking.storage.vector_ids import vector_record_id
+from openviking_cli.exceptions import FailedPreconditionError
 from openviking_cli.session.user_id import UserIdentifier
 
 URI = "viking://user/alice/memories/work_item/wi_a.md"
@@ -156,3 +158,98 @@ async def test_index_readiness_uses_only_exact_record_and_required_version(
 async def test_missing_index_record_is_not_ready():
     db = SimpleNamespace(get_strict=AsyncMock(return_value=[]))
     assert not await work_item_index_ready(db, URI, 2, ctx=_ctx())
+
+
+@pytest.mark.parametrize(
+    "metadata,reason",
+    [
+        (None, "metadata_unavailable"),
+        ({}, "metadata_unavailable"),
+        ({"Fields": []}, "field_missing"),
+        (
+            {"Fields": [{"FieldName": "work_item_version", "FieldType": "string"}]},
+            "field_type_mismatch",
+        ),
+        (
+            {"Fields": [{"FieldName": "work_item_version", "FieldType": "float32"}]},
+            "field_type_mismatch",
+        ),
+        ({"Fields": [{"FieldName": "work_item_version"}]}, "field_type_mismatch"),
+        (
+            {
+                "SchemaVerified": False,
+                "Fields": [{"FieldName": "work_item_version", "FieldType": "int64"}],
+            },
+            "schema_unverified",
+        ),
+    ],
+)
+async def test_work_item_capability_rejects_missing_wrong_or_unverified_schema(metadata, reason):
+    db = SimpleNamespace(
+        get_collection_meta=AsyncMock(return_value=metadata), get_strict=AsyncMock()
+    )
+    ctx = _ctx()
+    with pytest.raises(FailedPreconditionError) as error:
+        await ensure_work_item_index_capability(db, ctx=ctx)
+    assert error.value.code == "FAILED_PRECONDITION"
+    assert error.value.details["reason"] == reason
+    assert error.value.details["field"] == "work_item_version"
+    assert error.value.details["expected_type"] == "int64"
+    db.get_collection_meta.assert_awaited_once_with(ctx=ctx)
+    db.get_strict.assert_not_awaited()
+
+
+async def test_work_item_capability_distinguishes_schema_migration_from_pending_record():
+    db = SimpleNamespace(
+        get_collection_meta=AsyncMock(
+            side_effect=[
+                {"Fields": []},
+                {
+                    "Fields": [
+                        {"FieldName": "work_item_version", "FieldType": "int64", "DefaultValue": 0}
+                    ]
+                },
+            ]
+        ),
+        get_strict=AsyncMock(return_value=[]),
+    )
+    with pytest.raises(FailedPreconditionError):
+        await ensure_work_item_index_capability(db, ctx=_ctx())
+    # No stale negative cache after an administrator migrates the collection.
+    await ensure_work_item_index_capability(db, ctx=_ctx())
+    assert not await work_item_index_ready(db, URI, 1, ctx=_ctx())
+    assert db.get_collection_meta.await_count == 2
+    db.get_strict.assert_awaited_once()
+
+
+async def test_work_item_capability_metadata_failure_is_explicit_and_keeps_cause():
+    cause = OSError("metadata endpoint unavailable")
+    db = SimpleNamespace(get_collection_meta=AsyncMock(side_effect=cause))
+    with pytest.raises(FailedPreconditionError, match="failed to read collection schema") as error:
+        await ensure_work_item_index_capability(db, ctx=_ctx())
+    assert error.value.details["reason"] == "metadata_unavailable"
+    assert error.value.__cause__ is cause
+    with pytest.raises(FailedPreconditionError, match="schema is unavailable"):
+        await ensure_work_item_index_capability(None, ctx=_ctx())
+
+
+async def test_data_plane_synthetic_fields_cannot_certify_remote_work_item_support():
+    from openviking.storage.vectordb.collection.volcengine_api_key_collection import (
+        VolcengineApiKeyCollection,
+    )
+
+    collection = VolcengineApiKeyCollection(
+        api_key="test-token",
+        host="https://vikingdb.example.com",
+        meta_data={
+            "CollectionName": "legacy-remote",
+            "ProjectName": "default",
+            "IndexName": "default",
+        },
+    )
+    metadata = collection.get_meta_data()
+    assert any(field.get("FieldName") == "work_item_version" for field in metadata["Fields"])
+    db = SimpleNamespace(get_collection_meta=AsyncMock(return_value=metadata))
+    with pytest.raises(FailedPreconditionError, match="API-key data-plane") as error:
+        await ensure_work_item_index_capability(db, ctx=_ctx())
+    assert error.value.details["reason"] == "schema_unverified"

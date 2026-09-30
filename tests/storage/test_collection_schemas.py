@@ -1339,7 +1339,7 @@ def test_context_collection_signature_has_no_include_parent_uri():
     assert "include_parent_uri" not in signature.parameters
 
 
-def test_volcengine_api_key_collection_reports_trusted_openviking_schema():
+def test_volcengine_api_key_collection_reports_expected_but_unverified_openviking_schema():
     collection = VolcengineApiKeyCollection(
         api_key="vk-test-token",
         host="https://vikingdb.example.com",
@@ -1348,6 +1348,7 @@ def test_volcengine_api_key_collection_reports_trusted_openviking_schema():
 
     meta = collection.get_meta_data()
 
+    assert meta["SchemaVerified"] is False
     field_names = {field["FieldName"] for field in meta["Fields"]}
     assert "content" in field_names
     assert "search_tags" in field_names
@@ -3416,3 +3417,35 @@ async def test_local_existing_collection_migrates_and_preserves_work_item_versio
         ]
     finally:
         await backend.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field_type", [None, "string"])
+async def test_remote_work_item_schema_gap_keeps_legacy_bootstrap_without_migration(
+    monkeypatch, field_type
+):
+    from openviking.storage.collection_schemas import validate_work_item_collection_schema
+    from openviking_cli.exceptions import FailedPreconditionError
+
+    config = _DummyConfig(_DummyEmbedder(), backend="volcengine")
+    monkeypatch.setattr("openviking_cli.utils.config.get_openviking_config", lambda: config)
+    metadata = CollectionSchemas.context_collection("context", 2)
+    metadata["Fields"] = [
+        field for field in metadata["Fields"] if field["FieldName"] != "work_item_version"
+    ]
+    if field_type is not None:
+        metadata["Fields"].append({"FieldName": "work_item_version", "FieldType": field_type})
+    db = SimpleNamespace(
+        create_collection=AsyncMock(return_value=False),
+        get_collection_meta=AsyncMock(return_value=metadata),
+        count=AsyncMock(return_value=0),
+        update_collection_description=AsyncMock(),
+        update_collection_schema=AsyncMock(),
+    )
+    assert await init_context_collection(db) is False
+    db.update_collection_schema.assert_not_awaited()
+    with pytest.raises(FailedPreconditionError) as error:
+        validate_work_item_collection_schema(metadata)
+    assert error.value.details["reason"] == (
+        "field_missing" if field_type is None else "field_type_mismatch"
+    )

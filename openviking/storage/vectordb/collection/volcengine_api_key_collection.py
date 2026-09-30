@@ -268,6 +268,9 @@ class VolcengineApiKeyCollection(ICollection):
             "CollectionName": self.collection_name,
             "IndexName": self.index_name,
             "Description": "data-plane only backend",
+            # Field filtering still uses the expected OpenViking schema, but it
+            # is not evidence of the actual remote collection's capabilities.
+            "SchemaVerified": False,
             "Fields": schema.get("Fields", []),
             "ScalarIndex": schema.get("ScalarIndex", []),
             "FullText": schema.get("FullText", []),

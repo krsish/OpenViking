@@ -16,7 +16,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional
 from uuid import uuid4
 
 from openviking.core.context import Context
@@ -429,6 +429,8 @@ class SessionCompressorV3:
         peer_memory_enabled: bool = True,
         *,
         work_item_uris: Optional[List[str]] = None,
+        work_item_replay: Optional[dict[str, Any]] = None,
+        save_work_item_replay: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None,
     ):
         if not agent_evolution_enabled:
             effective_types = (
@@ -470,6 +472,8 @@ class SessionCompressorV3:
                 allowed_peer_ids=allowed_peer_ids,
                 event_search_tags=event_search_tags,
                 work_item_uris=work_item_uris,
+                work_item_replay=work_item_replay,
+                save_work_item_replay=save_work_item_replay,
             )
             agent_memory_types = _allowed_agent_memory_types(allowed_memory_types)
             cases_allowed = (
@@ -524,6 +528,7 @@ class SessionCompressorV3:
                 work_items=getattr(result, "work_items", []),
                 work_item_coverage=getattr(result, "work_item_coverage", []),
                 work_item_activations=getattr(result, "work_item_activations", []),
+                continuation_coverage=getattr(result, "continuation_coverage", []),
                 include_work_items=work_item_uris is not None,
             )
         except Exception:
@@ -677,6 +682,8 @@ class SessionCompressorV3:
         allowed_peer_ids: Optional[set[str]] = None,
         event_search_tags: Optional[List[str]] = None,
         work_item_uris: Optional[List[str]] = None,
+        work_item_replay: Optional[dict[str, Any]] = None,
+        save_work_item_replay: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None,
     ) -> "_V3ExtractionResult":
         del user
         if not messages:
@@ -721,10 +728,22 @@ class SessionCompressorV3:
         )
         await context_provider.prepare_extraction_messages()
         extract_context = context_provider.get_extract_context()
+        extraction_types = allowed_memory_types
+        if work_item_replay is not None:
+            if work_item_replay.get("version") != 1 or work_item_replay.get("message_ids") != [
+                message.id for message in messages
+            ]:
+                raise ValueError("work_item replay does not match its original message batch")
+            # Keep ordinary memory extraction; reuse the frozen work-item decisions.
+            extraction_types = (
+                set(registry.list_names(include_disabled=False))
+                if allowed_memory_types is None
+                else set(allowed_memory_types)
+            ) - {"work_item"}
         isolation_handler = MemoryIsolationHandler(
             ctx,
             extract_context,
-            allowed_memory_types=allowed_memory_types,
+            allowed_memory_types=extraction_types,
             allow_self=allow_self_memory,
             allowed_peer_ids=allowed_peer_ids,
             peer_memory_enabled=peer_memory_enabled,
@@ -732,16 +751,80 @@ class SessionCompressorV3:
         isolation_handler.prepare_messages()
         context_provider._isolation_handler = isolation_handler
 
-        orchestrator = self._get_or_create_react(
-            ctx=ctx,
-            messages=messages,
-            latest_archive_overview=latest_archive_overview,
-            isolation_handler=isolation_handler,
-            transaction_handle=None,
-            context_provider=context_provider,
-            vlm_config=vlm_config,
+        if work_item_replay is None or context_provider.get_memory_schemas(ctx):
+            orchestrator = self._get_or_create_react(
+                ctx=ctx,
+                messages=messages,
+                latest_archive_overview=latest_archive_overview,
+                isolation_handler=isolation_handler,
+                transaction_handle=None,
+                context_provider=context_provider,
+                vlm_config=vlm_config,
+            )
+            operations, _tools_used = await orchestrator.run()
+        else:
+            operations = ResolvedOperations(
+                upsert_operations=[], delete_file_contents=[], errors=[]
+            )
+        extraction_id = uuid4().hex
+        partial_tool_message_ids = set(
+            getattr(context_provider, "work_item_partial_tool_message_ids", set())
         )
-        operations, _tools_used = await orchestrator.run()
+        frozen = None
+        frozen_source_coverage = None
+        if work_item_replay is not None:
+            extraction_id = work_item_replay["extraction_id"]
+            frozen = ResolvedOperations.model_validate(work_item_replay["operations"])
+            # Old plans without frozen attribution cannot safely reinterpret
+            # their ranges after extraction-only captions/chunks have changed.
+            frozen_source_coverage = work_item_replay.get("source_coverage", [])
+            operations = operations or ResolvedOperations(
+                upsert_operations=[], delete_file_contents=[], errors=[]
+            )
+            operations.upsert_operations.extend(frozen.upsert_operations)
+            operations.work_item_activations = frozen.work_item_activations
+            operations.continuation_coverage = frozen.continuation_coverage
+            partial_tool_message_ids.update(work_item_replay.get("partial_tool_message_ids", []))
+            # Restore exact bindings for unchanged and activation-only items.
+            read_uris = set(work_item_uris or [])
+            read_uris.update(item["uri"] for item in frozen.work_item_activations)
+            for uri in read_uris:
+                await context_provider.read_file(uri)
+        elif save_work_item_replay is not None:
+            if getattr(operations, "errors", []):
+                # No canonical write has happened yet, so a later attempt can
+                # re-extract instead of freezing an incomplete resolution.
+                raise ValueError("Cannot freeze work_item replay with resolution errors")
+            work_item_operations = [
+                op
+                for op in getattr(operations, "upsert_operations", [])
+                if op.memory_type == "work_item"
+            ]
+            if any(not op.uris and op.resolution_skip is None for op in work_item_operations):
+                raise ValueError("Cannot freeze work_item replay with unresolved operations")
+            extraction_id = "wi-replay-" + extraction_id
+            frozen = ResolvedOperations(
+                upsert_operations=[op for op in work_item_operations if op.uris],
+                delete_file_contents=[],
+                errors=[],
+                work_item_activations=getattr(operations, "work_item_activations", []),
+                continuation_coverage=getattr(operations, "continuation_coverage", []),
+            )
+            frozen_source_coverage = _freeze_work_item_coverage(
+                extract_context, frozen.upsert_operations, partial_tool_message_ids
+            )
+            # Save before any canonical write. A failed metadata write leaves
+            # canonical items untouched; retries reuse URI and source identity.
+            await save_work_item_replay(
+                {
+                    "version": 1,
+                    "extraction_id": extraction_id,
+                    "message_ids": [message.id for message in messages],
+                    "operations": frozen.model_dump(mode="json"),
+                    "partial_tool_message_ids": sorted(partial_tool_message_ids),
+                    "source_coverage": frozen_source_coverage,
+                }
+            )
         activations = getattr(operations, "work_item_activations", []) or []
         if operations is None or not (
             operations.upsert_operations
@@ -757,17 +840,18 @@ class SessionCompressorV3:
                 viking_fs=viking_fs,
                 ctx=ctx,
                 activations=activations,
+                partial_tool_message_ids=partial_tool_message_ids,
             )
             return _V3ExtractionResult(
                 work_items=work_items,
                 work_item_activations=_work_item_activation_receipts(activations, work_items),
+                continuation_coverage=getattr(operations, "continuation_coverage", []),
             )
 
         # Attach caller-provided custom scalar tags to event memories so they
         # ride the same first write into the vector index (人填标量).
         _apply_event_search_tags(operations, event_search_tags)
 
-        extraction_id = uuid4().hex
         extracted_at = datetime.now(timezone.utc).isoformat()
 
         updater = await get_streaming_memory_updater(
@@ -803,6 +887,23 @@ class SessionCompressorV3:
         result = update_result.apply_result
         patch_operations = update_result.operations
         _report_extraction_telemetry(result, patch_operations)
+        if frozen is not None:
+            expected_uris = {uri for op in frozen.upsert_operations for uri in op.uris}
+            successful_uris = set(
+                getattr(result, "written_uris", []) + getattr(result, "edited_uris", [])
+            )
+            failed = [
+                (uri, error) for uri, error in getattr(result, "errors", []) if uri in expected_uris
+            ]
+            if failed:
+                # apply_operations reports per-item failures instead of raising.
+                # Keep the saved plan pending until every planned item succeeds.
+                raise failed[0][1]
+            missing_uris = expected_uris - successful_uris
+            if missing_uris:
+                raise RuntimeError(
+                    "Incomplete work_item replay writes: " + ", ".join(sorted(missing_uris))
+                )
 
         memory_diff = None
         if archive_uri and viking_fs and result is not None:
@@ -828,9 +929,12 @@ class SessionCompressorV3:
             viking_fs=viking_fs,
             ctx=ctx,
             activations=activations,
+            partial_tool_message_ids=partial_tool_message_ids,
+            frozen_source_coverage=frozen_source_coverage,
         )
         return _V3ExtractionResult(
             contexts=contexts,
+            continuation_coverage=getattr(operations, "continuation_coverage", []),
             work_items=work_items,
             work_item_coverage=work_item_coverage,
             work_item_activations=_work_item_activation_receipts(activations, work_items),
@@ -1348,6 +1452,7 @@ class _V3ExtractionResult:
     work_items: list[dict[str, Any]] = field(default_factory=list)
     work_item_coverage: list[dict[str, Any]] = field(default_factory=list)
     work_item_activations: list[dict[str, Any]] = field(default_factory=list)
+    continuation_coverage: list[dict[str, Any]] = field(default_factory=list)
     contexts: list[Context] = field(default_factory=list)
     cases: list[Case] = field(default_factory=list)
     memory_diff: dict[str, Any] | None = None
@@ -2195,6 +2300,8 @@ async def _work_item_extraction_metadata(
     viking_fs: Any,
     ctx: RequestContext,
     activations: Optional[list[dict[str, Any]]] = None,
+    partial_tool_message_ids: Optional[set[str]] = None,
+    frozen_source_coverage: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Return bindings and source attribution, never infer coverage from a read."""
     from openviking.session.memory.utils.memory_file_utils import memory_version_from_fields
@@ -2239,21 +2346,64 @@ async def _work_item_extraction_metadata(
             ):
                 continue
             applied_sources.append((uri, op))
-            ids = list(op.source_message_ids or [])
-            if ids:
-                coverage.append({"uri": uri, "source_message_ids": ids})
+            if frozen_source_coverage is None:
+                ids = list(op.source_message_ids or [])
+                if ids:
+                    coverage.append({"uri": uri, "source_message_ids": ids})
     # One raw message may describe several work items. Count the union of only
     # successfully persisted source chunks, while retaining every destination.
     get_context = getattr(context_provider, "get_extract_context", None)
-    if callable(get_context):
+    if frozen_source_coverage is not None:
+        qualified_uris = {uri for uri, _operation in applied_sources}
+        required_uris: dict[str, set[str]] = {}
+        for entry in frozen_source_coverage:
+            for source_id in entry["source_message_ids"]:
+                required_uris.setdefault(source_id, set()).add(entry["uri"])
+        coverage.extend(
+            {
+                "uri": entry["uri"],
+                "source_message_ids": [
+                    source_id
+                    for source_id in entry["source_message_ids"]
+                    if required_uris[source_id] <= qualified_uris
+                ],
+            }
+            for entry in frozen_source_coverage
+        )
+    elif callable(get_context):
         coverage.extend(_work_item_union_coverage(get_context(), applied_sources))
+    partial_ids = set(partial_tool_message_ids or []) | set(
+        getattr(context_provider, "work_item_partial_tool_message_ids", set())
+    )
     by_uri: dict[str, list[str]] = {}
     for entry in coverage:
-        by_uri.setdefault(entry["uri"], []).extend(entry["source_message_ids"])
+        ids = [identity for identity in entry["source_message_ids"] if identity not in partial_ids]
+        if ids:
+            by_uri.setdefault(entry["uri"], []).extend(ids)
     coverage = [
         {"uri": uri, "source_message_ids": list(dict.fromkeys(ids))} for uri, ids in by_uri.items()
     ]
     return bindings, coverage
+
+
+def _freeze_work_item_coverage(
+    extract_context: Any, operations: list[Any], partial_ids: set[str]
+) -> list[dict[str, Any]]:
+    sources = [(uri, op) for op in operations for uri in op.uris]
+    coverage = [
+        {"uri": uri, "source_message_ids": list(op.source_message_ids or [])} for uri, op in sources
+    ]
+    coverage.extend(_work_item_union_coverage(extract_context, sources))
+    by_uri: dict[str, list[str]] = {}
+    for entry in coverage:
+        ids = [
+            source_id for source_id in entry["source_message_ids"] if source_id not in partial_ids
+        ]
+        if ids:
+            by_uri.setdefault(entry["uri"], []).extend(ids)
+    return [
+        {"uri": uri, "source_message_ids": list(dict.fromkeys(ids))} for uri, ids in by_uri.items()
+    ]
 
 
 def _work_item_union_coverage(
@@ -2309,6 +2459,7 @@ def _v3_extraction_response(
     work_items: Optional[list[dict[str, Any]]] = None,
     work_item_coverage: Optional[list[dict[str, Any]]] = None,
     work_item_activations: Optional[list[dict[str, Any]]] = None,
+    continuation_coverage: Optional[list[dict[str, Any]]] = None,
     include_work_items: bool = False,
 ) -> list[Context] | dict[str, Any]:
     """Build the extraction response.
@@ -2333,13 +2484,21 @@ def _v3_extraction_response(
         or work_items
         or work_item_coverage
         or work_item_activations
+        or continuation_coverage
     ):
         return contexts
     response = {"contexts": contexts, "session_skills": skill_dicts}
-    if include_work_items or work_items or work_item_coverage or work_item_activations:
+    if (
+        include_work_items
+        or work_items
+        or work_item_coverage
+        or work_item_activations
+        or continuation_coverage
+    ):
         response["work_items"] = list(work_items or [])
         response["work_item_coverage"] = list(work_item_coverage or [])
         response["work_item_activations"] = list(work_item_activations or [])
+        response["continuation_coverage"] = list(continuation_coverage or [])
     return response
 
 

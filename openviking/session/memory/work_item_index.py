@@ -4,7 +4,8 @@
 
 Existing local/cuvs collections receive the work_item_version int64 field via
 normal schema migration. Existing remote collections must add that field with
-default 0 and reindex work items before cold checkpoints can become ready.
+default 0 and expose verifiable collection metadata before enabling the mode.
+Reindex existing work items before cold checkpoints can become ready.
 """
 
 from typing import Any, Dict
@@ -17,7 +18,7 @@ from openviking.session.memory.utils.memory_file_utils import (
 )
 from openviking.session.memory.work_item import is_work_item_uri
 from openviking.storage.vector_ids import vector_record_id
-from openviking_cli.exceptions import NotFoundError
+from openviking_cli.exceptions import FailedPreconditionError, NotFoundError
 
 WORK_ITEM_VERSION_FIELD = "work_item_version"
 
@@ -30,6 +31,35 @@ def is_work_item_leaf(uri: str) -> bool:
     )
 
 
+async def ensure_work_item_index_capability(vikingdb: Any, *, ctx: RequestContext) -> None:
+    """Fail before work-item session creation/commit if versioning is unsupported.
+
+    Read account-scoped backend metadata without modifying schema or waiting for
+    embeddings. Do not cache failures: an externally repaired schema can be used
+    by the next request. Record readiness remains a separate per-item check.
+    """
+    from openviking.storage.collection_schemas import validate_work_item_collection_schema
+
+    get_metadata = getattr(vikingdb, "get_collection_meta", None)
+    if not callable(get_metadata):
+        validate_work_item_collection_schema(None)
+        return
+    try:
+        metadata = await get_metadata(ctx=ctx)
+    except Exception as exc:
+        raise FailedPreconditionError(
+            "Cannot verify work_item working-memory capability: failed to read collection schema. "
+            "Restore collection metadata access before enabling work_item; legacy mode remains available.",
+            details={
+                "capability": "work_item_working_memory",
+                "field": WORK_ITEM_VERSION_FIELD,
+                "expected_type": "int64",
+                "reason": "metadata_unavailable",
+            },
+        ) from exc
+    validate_work_item_collection_schema(metadata)
+
+
 async def work_item_index_ready(
     vikingdb: Any,
     uri: str,
@@ -40,8 +70,9 @@ async def work_item_index_ready(
     """Whether the L2 vector record covers the checkpoint's required version.
 
     This exact read never waits for other items or asks an embedding service.
-    Missing version fields, including unmigrated remote collections, are not
-    ready. Backend failures propagate so callers can distinguish a read failure
+    Callers validate collection capability before accepting a work-item commit.
+    Records without a version are still awaiting indexing. Backend failures
+    propagate so callers can distinguish a read failure
     from pending work. Newer indexed versions also satisfy an older checkpoint.
     """
     if version <= 0 or not is_work_item_leaf(uri):

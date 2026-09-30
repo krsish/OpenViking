@@ -86,7 +86,8 @@ class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
         )
         activation_hint = (
             " Include work_item_activations when the user resumes matching already-read work "
-            "even if no fields change. "
+            "even if no fields change. Include continuation_coverage summaries or discard "
+            "reasons for remaining conversation coverage even when no memory fields change. "
             if "work_item_activations" in context.operations_model.model_fields
             else ""
         )
@@ -96,7 +97,8 @@ class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
             "matching the required schema. Do not include explanations or markdown. "
             + activation_hint
             + (
-                "If there are no memory changes or requested activations, return this exact empty-shape JSON with all fields present:\n"
+                "If there are no memory changes, requested activations, or continuation "
+                "classifications, return this exact empty-shape JSON with all fields present:\n"
                 if activation_hint
                 else "If there are no memory changes, return this exact empty-shape JSON with all fields present:\n"
             )

@@ -16,7 +16,15 @@ description: |
   unanswered user questions and commitments. Keep plan, attempted action, and verified
   result distinct. Tool evidence is evidence of execution, not a user preference.
   Account for this conversation's continuation information: update/create the relevant
-  work_item, or return no work_item operation only when there is truly no continuation delta.
+  work_item when its state changes. Do not create a task solely to hold non-task continuation.
+  For messages not fully accounted for by a work_item, use sdk.continuation in Python or
+  continuation_coverage in JSON: ranges plus either a concise continuation summary or an
+  explicit reason that nothing remains to continue. Preserve unresolved questions,
+  constraints and commitments even when another memory stores related facts. Keep all
+  summaries together below 600 estimated tokens. Do not classify unseen/truncated tool
+  evidence as covered. Unclassified messages are retained verbatim and can exceed the
+  checkpoint budget. Previous continuation summaries are background, not new user evidence;
+  carry forward still-relevant details and remove only explicitly resolved information.
   A request to resume existing work needs an activation even if no state changed: select
   that already-read item with activate(ranges=...) in Python, or work_item_activations
   in JSON. Match the current request to its goal and scope, not its title alone. Candidate

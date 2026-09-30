@@ -1426,6 +1426,37 @@ class MemoryUpdater:
                     old_content.links,
                 )
             if is_work_item:
+                from openviking.session.memory.utils.memory_file_utils import (
+                    memory_version_from_fields,
+                )
+                from openviking.session.memory.work_item import WORK_ITEM_FIELDS
+
+                source_id = getattr(resolved_op.source, "extraction_id", None)
+                expected_version = (
+                    memory_version_from_fields(source_content.extra_fields)
+                    if source_content is not None
+                    else 0
+                ) + 1
+                if (
+                    old_content is not None
+                    and source_id
+                    and source_id.startswith("wi-replay-")
+                    and old_content.extra_fields.get("source_extraction_id") == source_id
+                    and memory_version_from_fields(old_content.extra_fields) == expected_version
+                ):
+                    # A durable plan can outlive a successful canonical write.
+                    # Verify its intended state before accepting this replay.
+                    replay_state = validate_work_item_update(
+                        resolved_op.model_copy(update={"old_memory_file_content": old_content}),
+                        old_content,
+                        ctx,
+                        extract_context,
+                    )
+                    if all(
+                        replay_state[name] == old_content.extra_fields.get(name, "")
+                        for name in WORK_ITEM_FIELDS
+                    ):
+                        continue
                 metadata = validate_work_item_update(resolved_op, old_content, ctx, extract_context)
             else:
                 metadata.update(resolved_op.memory_fields)

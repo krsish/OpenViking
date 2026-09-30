@@ -86,10 +86,11 @@ def covered_source_message_ids(extract_context: Any, ranges: str) -> list[str]:
 
 
 def new_work_item_id(extract_context: Any, ranges: str, ordinal: int, namespace: str = "") -> str:
-    """Allocate a server identity stable for retries of the same source slot.
+    """Allocate a server identity for a source slot in an extraction plan.
 
+    Retries reuse the persisted plan: model output order is not task identity.
     No title, semantic hash, or model-supplied ID participates. A collision with
-    a differently classified retry must be read/reconciled, never overwritten.
+    a different extraction must be read/reconciled, never overwritten.
     """
     selected = selected_source_messages(extract_context, ranges)
     if not selected:
@@ -188,12 +189,18 @@ def validate_work_item_update(
             # Compare requests with when completion was evidenced, not when an async
             # extraction eventually persisted it. Otherwise a legitimate queued reopen
             # could precede the slow write and be incorrectly rejected.
-            try:
-                source_messages = selected_source_messages(
-                    extract_context, operation.memory_fields.get("ranges")
-                )
-            except ValueError:
-                source_ids = set(operation.source_message_ids or [])
+            evidence_ids = getattr(operation, "source_evidence_message_ids", None)
+            if evidence_ids is None:
+                try:
+                    source_messages = selected_source_messages(
+                        extract_context, operation.memory_fields.get("ranges")
+                    )
+                except ValueError:
+                    evidence_ids = operation.source_message_ids or []
+            if evidence_ids is not None:
+                # Resolve source IDs fixed by the extractor, never reinterpret
+                # old chunk indices after image preparation or retry batching.
+                source_ids = set(evidence_ids)
                 chunk_meta = getattr(extract_context, "chunk_meta", {}) or {}
                 source_messages = [
                     message

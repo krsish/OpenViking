@@ -792,14 +792,32 @@ class ExtractLoop:
                 item_dict = dict(item)
                 item_dict["memory_type"] = memory_type
                 source_message_ids = None
+                source_evidence_message_ids = None
                 if memory_type == "work_item":
                     from openviking.session.memory.work_item import (
                         covered_source_message_ids,
                         new_work_item_id,
+                        selected_source_messages,
                     )
 
                     ranges = item_dict.get("ranges")
-                    source_message_ids = covered_source_message_ids(self._extract_context, ranges)
+                    partial_ids = getattr(
+                        self.context_provider, "work_item_partial_tool_message_ids", set()
+                    )
+                    source_message_ids = [
+                        identity
+                        for identity in covered_source_message_ids(self._extract_context, ranges)
+                        if identity not in partial_ids
+                    ]
+                    chunk_meta = getattr(self._extract_context, "chunk_meta", {}) or {}
+                    source_evidence_message_ids = list(
+                        dict.fromkeys(
+                            chunk_meta[id(message)].source_message_id
+                            if id(message) in chunk_meta
+                            else message.id
+                            for message in selected_source_messages(self._extract_context, ranges)
+                        )
+                    )
                     item_dict["work_item_id"] = new_work_item_id(
                         self._extract_context,
                         ranges,
@@ -848,6 +866,7 @@ class ExtractLoop:
                     page_id=page_id,
                     resolution_skip=identity_resolution_skip,
                     source_message_ids=source_message_ids,
+                    source_evidence_message_ids=source_evidence_message_ids,
                 )
 
                 if is_event:
@@ -993,7 +1012,19 @@ class ExtractLoop:
                 read_files=self.context_provider.read_file_contents,
                 ctx=self.ctx,
             )
+        continuation_coverage = []
+        if any(schema.memory_type == "work_item" for schema in schemas):
+            from openviking.session.work_items import resolve_continuation_coverage
+
+            continuation_coverage = resolve_continuation_coverage(
+                self._extract_context,
+                getattr(operations, "continuation_coverage", []) or [],
+                partial_tool_message_ids=getattr(
+                    self.context_provider, "work_item_partial_tool_message_ids", set()
+                ),
+            )
         resolved = ResolvedOperations(
+            continuation_coverage=continuation_coverage,
             work_item_activations=activations,
             upsert_operations=upsert_operations,
             delete_file_contents=delete_file_contents,

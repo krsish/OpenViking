@@ -35,19 +35,21 @@ V1 使用 OpenViking 的 token 估算器，当前限制为：
 | 权威 Markdown 渲染正文 | 4,000 估算 tokens |
 | WM 投影，含 residual 和恢复提示 | 3,000 估算 tokens |
 | 单次投影的活跃项 | 最多 3 项 |
-| 未归属原消息的 residual | 1,000 估算 tokens |
+| 续接摘要与未归属原消息的 residual | 1,000 估算 tokens |
 
 投影按完整 work-item 块选择，不通过按字符截断约束来凑预算。调用方的 context 预算还必须容纳未覆盖的原文尾部。超限更新会失败，保留此前的权威正文。
 
 ## Checkpoint 发布与恢复
 
-后台 commit 复用现有记忆提取器。每条源消息要么归属于成功更新的 work item，要么作为原文保留在 residual。多个成功写入的 work item 分担同一原消息的不同片段时，会合并其 ranges 后判断整条消息是否覆盖；失败写入不贡献覆盖。模型提供的 source ranges 是归属声明，账本**不是所有续接事实均已保留的形式证明**。缺少归属不能被解释为允许丢弃消息；residual 超限时不发布 checkpoint。
+后台 commit 复用现有记忆提取器。每条源消息可以归属于成功更新的 work item、保留为有界续接摘要，或明确记录无需续接的原因；没有明确归宿时仍保留原文。同一消息里的任务状态和额外会话约束可以同时保留。摘要通过同一轮提取输出（Python 的 `sdk.continuation` 或 JSON 的 `continuation_coverage`），不新增总结调用；下轮作为 assistant 背景携带，不能作为重新开启终态任务的新用户证据。原始 transcript 不修改，完整来源保存在覆盖账本中。
 
-Archive 保存已完成提取进度供重试复用，生成有界投影，最后通过临时文件加 rename 发布 `.done`。只有 overview 文件不代表 checkpoint 就绪。某项移出热视图前，要逐项确认其向量记录覆盖所需的权威版本；这不是等待全局 embedding 队列的屏障，仍在热视图内的项不必等待无关索引。保存原文与可通过向量检索找回是两个不同条件。
+多个成功写入的 work item 分担同一原消息的不同片段时，会合并其 ranges 后判断整条消息是否覆盖；失败写入不贡献覆盖。工具证据只提供有界预览和原始引用，未完整读取的工具消息不能据此声明已覆盖。模型提供的 source ranges 和分类是归属声明，账本**不是所有续接事实均已保留的形式证明**。缺少归属不能被解释为允许丢弃消息；residual 超限时不发布 checkpoint，并在 archive metadata 保留实际 token 数、预算与逐消息归宿供排查。
+
+Archive 在应用前将已分配 ID 的 work-item 操作保存在现有 metadata，部分写入后重试复用同一计划及来源，不因模型重排或重新分批生成新 ID；已应用的同版本操作不会重复写入，其他 session 的更新仍受版本检查保护。全部计划操作成功后才记录该批完成。生成有界投影后，最后通过临时文件加 rename 发布 `.done`。只有 overview 文件不代表 checkpoint 就绪。未完成项移出热视图前，要逐项确认其向量记录覆盖所需的权威版本；终态项仍异步索引，但不阻塞发布。这不是等待全局 embedding 队列的屏障，仍在热视图内的项不必等待无关索引。保存原文与可通过向量检索找回是两个不同条件。
 
 最后一个就绪 checkpoint 之后的 pending、failed archive 都保留为原文续接。若权威状态刷新后无法生成合法视图，服务端不返回可用 checkpoint，并保留原历史供回退。请求预算不足时返回 `budget_insufficient`，不返回可推进的 checkpoint 边界；调用方必须保留自己的 transcript，或增大预算。
 
-已有本地和 cuvs 向量集合通过现有 schema 迁移增加 `work_item_version` 字段。已有远端集合需要先增加该 int64 字段（默认 0）并重新索引 work item，之后才能确认冷项索引就绪。
+已有本地和 cuvs 向量集合通过现有 schema 迁移增加 `work_item_version` 字段。创建 work-item 会话及提交前，会检查实际集合 schema 是否包含该 int64 字段；缺失、类型不符或无法验证时，在创建归档前明确返回 `FAILED_PRECONDITION`，legacy 模式仍可使用。已有远端集合须在外部完成迁移（新增字段默认 0）并重新索引 work item。Volcengine API-key data-plane 返回的是本地期望 schema，不能证明远端能力；work-item 模式需要能读取实际集合 schema 的连接，例如 AK/SK control-plane 访问。
 
 Pi 请求 compact 时采用两级回退：
 
