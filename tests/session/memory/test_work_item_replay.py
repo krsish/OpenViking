@@ -1,13 +1,14 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from openviking.message import Message, TextPart
+from openviking.message import Message, TextPart, ToolPart
 from openviking.prompts.manager import PromptManager
 from openviking.server.identity import RequestContext, Role
 from openviking.session.compressor_v3 import SessionCompressorV3
@@ -134,6 +135,126 @@ async def extract(case, **kwargs):
         work_item_uris=[],
         **kwargs,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allowed_types", [None, {"profile", "work_item"}])
+@pytest.mark.parametrize("fail_work_item", [False, True])
+async def test_memory_and_work_item_have_independent_prompts_and_calls(
+    replay_case, allowed_types, fail_work_item
+):
+    from openviking.session.memory.schema_model_generator import SchemaModelGenerator
+
+    case = replay_case
+    case.registry.load_from_yaml(
+        str(PromptManager._get_bundled_templates_dir() / "memory/profile.yaml")
+    )
+    case.messages[0].parts.append(ToolPart(tool_name="bash", tool_output="tool-only evidence"))
+    calls = {}
+    both_started = asyncio.Event()
+    ordinary_finished = asyncio.Event()
+
+    def orchestrator(**kwargs):
+        provider = kwargs["context_provider"]
+        schemas = provider.get_memory_schemas(case.ctx)
+        assert len(schemas) == 1
+        kind = schemas[0].memory_type
+        model = SchemaModelGenerator(schemas).create_structured_operations_model()
+        provider.search_files = AsyncMock(return_value=[])
+        provider._append_structured_read_result = AsyncMock(return_value=1)
+
+        async def run():
+            calls[kind] = (model, await provider.prefetch())
+            if len(calls) == 2:
+                both_started.set()
+            await asyncio.wait_for(both_started.wait(), timeout=2)
+            if kind == "profile":
+                # The other pass can fail while this pass is still completing.
+                await asyncio.sleep(0)
+                ordinary_finished.set()
+            elif fail_work_item:
+                raise ValueError("work_item extraction failed")
+            return ResolvedOperations(upsert_operations=[], delete_file_contents=[], errors=[]), []
+
+        return SimpleNamespace(run=run)
+
+    case.compressor._get_or_create_react = Mock(side_effect=orchestrator)
+    kwargs = {
+        "messages": case.messages,
+        "ctx": case.ctx,
+        "allowed_memory_types": allowed_types,
+        "work_item_uris": [],
+    }
+    if fail_work_item:
+        with pytest.raises(ValueError, match="work_item extraction failed"):
+            await case.compressor._extract_user_memories(**kwargs)
+    else:
+        await case.compressor._extract_user_memories(**kwargs)
+
+    assert ordinary_finished.is_set()
+    assert case.compressor._get_or_create_react.call_count == 2
+    ordinary_model, ordinary_prompt = calls["profile"]
+    work_model, work_prompt = calls["work_item"]
+    assert "work_item" not in ordinary_model.model_fields
+    assert "continuation_coverage" not in ordinary_model.model_fields
+    assert "tool-only evidence" not in str(ordinary_prompt)
+    assert "Execution evidence" not in str(ordinary_prompt)
+    assert "profile" not in work_model.model_fields
+    assert "continuation_coverage" in work_model.model_fields
+    assert "tool-only evidence" in str(work_prompt)
+
+
+@pytest.mark.asyncio
+async def test_split_extraction_keeps_both_memory_writes_and_work_item_receipts(replay_case):
+    case = replay_case
+    case.state.fail_after_first = False
+    case.registry.load_from_yaml(
+        str(PromptManager._get_bundled_templates_dir() / "memory/profile.yaml")
+    )
+    profile_uri = "viking://user/alice/memories/profile.md"
+    profile = ResolvedOperation(
+        memory_type="profile",
+        uris=[profile_uri],
+        memory_fields={"content": "# Alice\n- Engineer (as of 2026-09-30)", "ranges": "0"},
+    )
+
+    def orchestrator(**kwargs):
+        schemas = kwargs["context_provider"].get_memory_schemas(case.ctx)
+        operations = (
+            ResolvedOperations(upsert_operations=[profile], delete_file_contents=[], errors=[])
+            if schemas[0].memory_type == "profile"
+            else case.resolved.model_copy(deep=True)
+        )
+        return SimpleNamespace(run=AsyncMock(return_value=(operations, [])))
+
+    case.compressor._get_or_create_react = Mock(side_effect=orchestrator)
+    case.compressor._session_skill_extraction_enabled = lambda: False
+    archive_uri = "viking://user/alice/sessions/test/history/archive_001"
+    save = AsyncMock()
+
+    result = await case.compressor.extract_long_term_memories(
+        messages=case.messages,
+        ctx=case.ctx,
+        session_id="test",
+        allowed_memory_types={"profile", "work_item"},
+        agent_evolution_enabled=False,
+        strict_extract_errors=True,
+        archive_uri=archive_uri,
+        work_item_uris=[],
+        save_work_item_replay=save,
+    )
+
+    assert "Engineer" in MemoryFileUtils.read(case.files[profile_uri]).content
+    assert len(result["contexts"]) == 3
+    assert len(result["work_items"]) == len(result["work_item_coverage"]) == 2
+    diff = json.loads(case.files[f"{archive_uri}/memory_diff.json"])
+    assert {entry["uri"] for entry in diff["operations"]["adds"]} == {
+        profile_uri,
+        *(op.uris[0] for op in case.resolved.upsert_operations),
+    }
+    assert {
+        op["memory_type"] for op in save.await_args.args[0]["operations"]["upsert_operations"]
+    } == {"work_item"}
 
 
 def use_real_apply(case):
@@ -290,15 +411,15 @@ async def test_no_write_plan_keeps_continuation_classification_and_partial_ids(r
 
 
 @pytest.mark.asyncio
-async def test_replay_preserves_partial_evidence_exclusion_from_union_coverage(replay_case):
+async def test_replay_preserves_partial_tool_attribution_in_union_coverage(replay_case):
     case = replay_case
     case.state.partial = {"m2"}
     with pytest.raises(RuntimeError, match="interrupted"):
         await extract(case, save_work_item_replay=case.save)
     result = await extract(case, work_item_replay=case.plans[0])
-    assert [
+    assert sorted(
         identity for item in result.work_item_coverage for identity in item["source_message_ids"]
-    ] == ["m1"]
+    ) == ["m1", "m2"]
 
 
 @pytest.mark.asyncio

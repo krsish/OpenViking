@@ -185,8 +185,9 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
                 "commitments and necessary references; keep all summaries together below 600 "
                 "estimated tokens. Use reason only for content with nothing left to continue, "
                 "such as greetings or fully answered questions. Another memory's existence alone "
-                "does not justify discarding continuation. Never classify unseen/truncated tool "
-                "evidence as covered. Missing classifications keep original messages."
+                "does not justify discarding continuation. Partial tool previews may be classified; "
+                "preserve pending verification and references when outcomes are unclear, without "
+                "inventing unseen results. Missing classifications keep original messages."
             )
             lines.append(
                 '- existing_work_item.activate(ranges="<current user message indices>"): '

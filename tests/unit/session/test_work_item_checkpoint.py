@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from openviking.message import Message, TextPart
+from openviking.message import Message, TextPart, ToolPart
 from openviking.session import work_items as wi
 from openviking.session.memory_policy import MemoryPolicy
 from openviking.session.session import (
@@ -651,6 +651,52 @@ async def test_overflow_keeps_coverage_diagnostics_without_publishing():
     assert meta["coverage"][0]["residual_uri"] == f"{uri}/.done"
     assert f"{uri}/.done" not in fs.files
     assert fs.files[f"{uri}/messages.jsonl"] == source.to_jsonl()
+
+
+@pytest.mark.asyncio
+async def test_long_partial_tools_can_publish_without_copying_raw_outputs_into_residual():
+    from openviking.session.memory.memory_updater import ExtractContext
+    from openviking.session.memory.session_extract_context_provider import (
+        SessionExtractContextProvider,
+    )
+
+    session, fs = session_with_fs()
+    messages = [message(f"text-{i}", "Investigate the checkpoint failure") for i in range(9)]
+    messages.extend(
+        Message(
+            id=f"tool-{i}",
+            role="assistant",
+            parts=[
+                ToolPart(
+                    tool_name="bash",
+                    tool_output="diagnostic output " * 1000,
+                    tool_output_ref=f"{SESSION_URI}/tool-results/{i}",
+                )
+            ],
+        )
+        for i in range(22)
+    )
+    uri = archive(fs, 1, messages)
+    transcript = fs.files[f"{uri}/messages.jsonl"]
+    provider = SessionExtractContextProvider(messages)
+    provider._build_work_item_tool_evidence()
+    assert len(provider.work_item_partial_tool_message_ids) == 22
+    summary = "Checkpoint investigation pending; verify full results at " + uri + "/messages.jsonl"
+    classified = wi.resolve_continuation_coverage(
+        ExtractContext(messages), [{"ranges": "0-30", "summary": summary}]
+    )
+    fs.files[f"{uri}/.meta.json"] = json.dumps({"continuation_coverage": classified})
+
+    published = await session._prepare_work_item_checkpoint(uri, messages, {})
+    await session._write_done_file(uri, messages[0].id, messages[-1].id, checkpoint=published)
+
+    assert published["compact_ready"]
+    assert len(published["coverage"]) == 31
+    assert all(entry["summary"] == summary for entry in published["coverage"])
+    assert len(published["residual"]) == 1
+    assert estimate_text_tokens(wi.residual_text(published["residual"])) <= 1000
+    assert estimate_text_tokens(fs.files[f"{uri}/.overview.md"]) <= 3000
+    assert fs.files[f"{uri}/messages.jsonl"] == transcript
 
 
 @pytest.mark.asyncio

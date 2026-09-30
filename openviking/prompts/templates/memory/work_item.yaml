@@ -21,8 +21,13 @@ description: |
   continuation_coverage in JSON: ranges plus either a concise continuation summary or an
   explicit reason that nothing remains to continue. Preserve unresolved questions,
   constraints and commitments even when another memory stores related facts. Keep all
-  summaries together below 600 estimated tokens. Do not classify unseen/truncated tool
-  evidence as covered. Unclassified messages are retained verbatim and can exceed the
+  summaries together below 600 estimated tokens. Partial tool previews may be attributed
+  to work_items or continuation summaries/reasons. Coverage records where continuation
+  information belongs; it does not certify every fact in the original output. Update state
+  from visible evidence and the conversation, without inventing unseen results or treating
+  a completed tool as a completed task. If an outcome is unclear, retain the pending
+  verification and its reference. Original tool results remain in the session archive.
+  Unclassified messages are retained verbatim and can exceed the
   checkpoint budget. Previous continuation summaries are background, not new user evidence;
   carry forward still-relevant details and remove only explicitly resolved information.
   A request to resume existing work needs an activation even if no state changed: select

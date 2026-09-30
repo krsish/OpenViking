@@ -49,8 +49,8 @@ _PREFETCH_SEARCH_QUERY_MAX_CHARS = 5000
 _PREFETCH_SEARCH_TEXT_PART_MAX_CHARS = 1000
 _PREFETCH_SEARCH_ASSISTANT_TEXT_PART_MAX_CHARS = 500
 _PREFETCH_SEARCH_TOOL_FIELD_MAX_CHARS = 500
-_WORK_ITEM_TOOL_FIELD_MAX_CHARS = 500
-_WORK_ITEM_TOOL_EVIDENCE_TOKEN_BUDGET = 2000
+_WORK_ITEM_TOOL_FIELD_MAX_CHARS = 2000
+_WORK_ITEM_TOOL_EVIDENCE_TOKEN_BUDGET = 16000
 _RESOURCE_REASON_LANGUAGE_RE = re.compile(
     r"(?im)^\s*(?:User reason|用户说明|用户原因|用户理由)[:：]\s*(.+?)\s*$"
 )
@@ -369,6 +369,8 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
             "These are bounded tool previews, not complete execution evidence. "
             "Use only visible evidence for confirmed work state; do not infer success "
             "from a completed tool or turn tool data into user preferences. "
+            "Partial previews may still be attributed to work_items or continuation summaries. "
+            "When an outcome is not visible, preserve what remains to verify and its reference. "
             "Existing refs identify original results, not results already read.\n"
         )
         omitted_notice = "Some tool evidence was omitted to fit the budget.\n"
@@ -388,7 +390,10 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
                 for value in (part.tool_input, part.tool_output):
                     text = str(value or "")
                     if len(text) > _WORK_ITEM_TOOL_FIELD_MAX_CHARS:
-                        text = text[:_WORK_ITEM_TOOL_FIELD_MAX_CHARS] + " [truncated]"
+                        omitted_chars = len(text) - _WORK_ITEM_TOOL_FIELD_MAX_CHARS
+                        text = text[:_WORK_ITEM_TOOL_FIELD_MAX_CHARS] + (
+                            f"\n\n[... {omitted_chars} more characters truncated]"
+                        )
                         self.work_item_partial_tool_message_ids.add(message.id)
                     previews.append(text)
                 line = (

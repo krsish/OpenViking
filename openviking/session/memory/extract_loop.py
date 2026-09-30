@@ -801,14 +801,7 @@ class ExtractLoop:
                     )
 
                     ranges = item_dict.get("ranges")
-                    partial_ids = getattr(
-                        self.context_provider, "work_item_partial_tool_message_ids", set()
-                    )
-                    source_message_ids = [
-                        identity
-                        for identity in covered_source_message_ids(self._extract_context, ranges)
-                        if identity not in partial_ids
-                    ]
+                    source_message_ids = covered_source_message_ids(self._extract_context, ranges)
                     chunk_meta = getattr(self._extract_context, "chunk_meta", {}) or {}
                     source_evidence_message_ids = list(
                         dict.fromkeys(
@@ -1019,9 +1012,6 @@ class ExtractLoop:
             continuation_coverage = resolve_continuation_coverage(
                 self._extract_context,
                 getattr(operations, "continuation_coverage", []) or [],
-                partial_tool_message_ids=getattr(
-                    self.context_provider, "work_item_partial_tool_message_ids", set()
-                ),
             )
         resolved = ResolvedOperations(
             continuation_coverage=continuation_coverage,

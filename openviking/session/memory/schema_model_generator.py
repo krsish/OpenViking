@@ -332,7 +332,9 @@ class SchemaModelGenerator:
                         "summaries together below 600 estimated tokens. Reason explicitly explains "
                         "why nothing remains to continue (e.g. a greeting or an answered question). "
                         "Storage in another memory alone is not permission to discard unresolved "
-                        "information. Never claim coverage for unseen/truncated tool evidence. "
+                        "information. Partial tool previews may be classified; preserve pending "
+                        "verification and references when outcomes are unclear, without inventing "
+                        "unseen results. "
                         "Missing classification retains original messages."
                     ),
                 ),

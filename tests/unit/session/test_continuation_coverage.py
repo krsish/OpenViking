@@ -131,8 +131,14 @@ def test_work_item_attribution_does_not_discard_additional_continuation_from_sam
     assert ledger[0]["summary"] == CONSTRAINT
 
 
-@pytest.mark.parametrize("classification", [{"summary": "The command ran."}, {"reason": "Done."}])
-def test_partial_tool_result_cannot_be_released_by_summary_or_discard(classification):
+@pytest.mark.parametrize(
+    "classification",
+    [
+        {"summary": "Read preview received; verify the full result at tool-results/result."},
+        {"reason": "Intermediate read; the subsequent answer resolved the request."},
+    ],
+)
+def test_partial_tool_result_can_be_classified_by_summary_or_reason(classification):
     raw = Message(
         id="partial-tool",
         role="assistant",
@@ -149,14 +155,18 @@ def test_partial_tool_result_cannot_be_released_by_summary_or_discard(classifica
     classified = wi.resolve_continuation_coverage(
         ExtractContext([raw]),
         [{"ranges": "0", **classification}],
-        partial_tool_message_ids={raw.id},
     )
 
     residual, ledger = wi.coverage_report([raw], [], ARCHIVE, classified)
 
-    assert classified == []
-    assert residual == [raw.to_dict()]
-    assert ledger == [{"message_id": raw.id, "residual_uri": f"{ARCHIVE}/.done"}]
+    assert classified[0]["source_message_ids"] == [raw.id]
+    if "summary" in classification:
+        projection, _ = wi.build_projection([], residual)
+        assert classification["summary"] in projection
+        assert ledger[0]["summary"] == classification["summary"]
+    else:
+        assert residual == []
+        assert ledger[0]["explicitly_dropped"] == classification["reason"]
 
 
 def test_partial_chunks_do_not_release_full_original_message():
@@ -295,12 +305,9 @@ async def test_operation_resolution_preserves_continuation_without_writes(protoc
 
     assert resolved.upsert_operations == []
     assert resolved.errors == []
-    if partial:
-        assert resolved.continuation_coverage == []
-    else:
-        assert resolved.continuation_coverage == [
-            {"source_message_ids": [source.id], "summary": CONSTRAINT, "reason": ""}
-        ]
+    assert resolved.continuation_coverage == [
+        {"source_message_ids": [source.id], "summary": CONSTRAINT, "reason": ""}
+    ]
 
 
 def test_summary_survives_next_round_as_background_context_with_constraints():

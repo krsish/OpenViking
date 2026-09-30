@@ -155,10 +155,8 @@ def coverage_report(
 def resolve_continuation_coverage(
     extract_context: Any,
     raw_items: list[Any],
-    *,
-    partial_tool_message_ids: Any = (),
 ) -> list[dict[str, Any]]:
-    """Validate model attribution; partial source chunks never release raw messages."""
+    """Validate attribution; all source chunks must be classified to release a raw message."""
     from openviking.session.memory.work_item import covered_source_message_ids
 
     result = []
@@ -172,11 +170,7 @@ def resolve_continuation_coverage(
         summary, reason = summary.strip(), reason.strip()
         if bool(summary) == bool(reason):
             raise ValueError("continuation requires exactly one of summary or reason")
-        ids = [
-            identity
-            for identity in covered_source_message_ids(extract_context, fields.get("ranges"))
-            if identity not in partial_tool_message_ids
-        ]
+        ids = covered_source_message_ids(extract_context, fields.get("ranges"))
         if seen.intersection(ids):
             raise ValueError("continuation classifications must not overlap")
         seen.update(ids)

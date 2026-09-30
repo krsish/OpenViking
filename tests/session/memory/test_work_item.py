@@ -317,8 +317,8 @@ async def test_exact_prefetch_and_bounded_tools_are_scoped_to_work_items(registr
     )
     assert output[:500] in evidence
     assert output not in evidence
-    assert "i" * 1000 not in evidence
-    assert evidence.count("[truncated]") == 2
+    assert "i" * 1000 in evidence
+    assert evidence.count("more characters truncated]") == 1
     assert "not complete execution evidence" in evidence
     assert ref in evidence
     assert provider.work_item_partial_tool_message_ids == {"msg"}
@@ -352,19 +352,19 @@ def test_work_item_tool_evidence_budget_preserves_recent_refs(text, ctx):
                 )
             ],
         )
-        for index in range(30)
+        for index in range(150)
     ]
     provider = SessionExtractContextProvider(messages, ctx=ctx)
 
     evidence = provider._build_work_item_tool_evidence()
 
-    assert estimate_text_tokens(evidence) <= 2000
+    assert estimate_text_tokens(evidence) <= 16000
     assert "Some tool evidence was omitted" in evidence
-    assert "tool=tool-29;" in evidence
-    assert "tool-results/29" in evidence
+    assert "tool=tool-149;" in evidence
+    assert "tool-results/149" in evidence
     assert "tool=tool-0;" not in evidence
     assert "msg-0" in provider.work_item_partial_tool_message_ids
-    assert "msg-29" not in provider.work_item_partial_tool_message_ids
+    assert "msg-149" not in provider.work_item_partial_tool_message_ids
 
 
 def test_work_item_tool_evidence_bounds_metadata_without_claiming_it_was_read(ctx):
@@ -372,7 +372,7 @@ def test_work_item_tool_evidence_bounds_metadata_without_claiming_it_was_read(ct
         Message(
             id="large-metadata",
             role="assistant",
-            parts=[ToolPart(tool_name="n" * 10000, tool_output="done")],
+            parts=[ToolPart(tool_name="n" * 100000, tool_output="done")],
         )
     ]
     provider = SessionExtractContextProvider(messages, ctx=ctx)
@@ -387,7 +387,7 @@ def test_work_item_tool_evidence_bounds_metadata_without_claiming_it_was_read(ct
 @pytest.mark.parametrize(
     "output_length, original_chars, partial", [(30, 300, True), (300, 300, False), (30, None, True)]
 )
-def test_work_item_tool_evidence_keeps_unhydrated_result_uncovered(
+def test_work_item_tool_evidence_marks_unhydrated_result_partial(
     output_length, original_chars, partial, ctx
 ):
     messages = [
@@ -410,6 +410,104 @@ def test_work_item_tool_evidence_keeps_unhydrated_result_uncovered(
     provider._build_work_item_tool_evidence()
 
     assert ("externalized" in provider.work_item_partial_tool_message_ids) is partial
+
+
+@pytest.mark.parametrize("body", ["x" * 12000, "结果" * 1500, "🙂" * 3000])
+def test_tool_preview_keeps_first_2000_characters_and_marks_truncation(body, ctx):
+    output = "Starting tests\n" + body + "\nFAILED: rerun the failing test"
+    message = Message(
+        id="long-result",
+        role="assistant",
+        parts=[ToolPart(tool_name="bash", tool_output=output)],
+    )
+    provider = SessionExtractContextProvider([message], ctx=ctx)
+
+    evidence = provider._build_work_item_tool_evidence()
+    preview = evidence.split("; output=", 1)[1]
+
+    assert preview == output[:2000] + f"\n\n[... {len(output) - 2000} more characters truncated]"
+    assert "FAILED: rerun the failing test" not in preview
+    assert provider.work_item_partial_tool_message_ids == {message.id}
+    assert message.parts[0].tool_output == output
+
+
+def test_tool_output_above_500_characters_is_not_automatically_partial(ctx):
+    output = "visible result " * 100
+    source = Message(
+        id="result", role="assistant", parts=[ToolPart(tool_name="read", tool_output=output)]
+    )
+    provider = SessionExtractContextProvider([source], ctx=ctx)
+
+    assert output in provider._build_work_item_tool_evidence()
+    assert provider.work_item_partial_tool_message_ids == set()
+
+
+@pytest.mark.parametrize("char", ["x", "结", "🙂"])
+@pytest.mark.parametrize("length", [2000, 2001])
+def test_tool_preview_character_limit_boundary(char, length, ctx):
+    source = Message(
+        id="result",
+        role="assistant",
+        parts=[ToolPart(tool_name="read", tool_output=char * length)],
+    )
+    provider = SessionExtractContextProvider([source], ctx=ctx)
+
+    evidence = provider._build_work_item_tool_evidence()
+
+    assert char * 2000 in evidence
+    assert ("more characters truncated]" in evidence) is (length > 2000)
+    assert (source.id in provider.work_item_partial_tool_message_ids) is (length > 2000)
+
+
+@pytest.mark.asyncio
+async def test_partial_tool_can_support_work_item_state_and_attribution(registry, ctx):
+    messages = [
+        Message(id="request", role="user", parts=[TextPart("Fix the tests")]),
+        Message(
+            id="result",
+            role="assistant",
+            parts=[ToolPart(tool_name="bash", tool_output="1 test failed\n" + "logs " * 3000)],
+        ),
+    ]
+    provider = SessionExtractContextProvider(messages, ctx=ctx, memory_registry=registry)
+    context = provider.get_extract_context()
+    isolation = MemoryIsolationHandler(ctx, context)
+    isolation.prepare_messages()
+    provider._build_work_item_tool_evidence()
+    assert provider.work_item_partial_tool_message_ids == {"result"}
+    loop = ExtractLoop(
+        vlm=MagicMock(),
+        viking_fs=MagicMock(),
+        ctx=ctx,
+        context_provider=provider,
+        isolation_handler=isolation,
+    )
+    loop._extract_context = context
+    generator = SchemaModelGenerator([registry.get("work_item")])
+    model = generator.create_structured_operations_model()
+    operations = model.model_validate(
+        {
+            "work_item": [
+                {
+                    "page_id": 100,
+                    "title": "Fix tests",
+                    "goal": "Tests pass",
+                    "status": "in_progress",
+                    "current_state": "One test still fails",
+                    "next_action": "Inspect the failed test",
+                    "ranges": "0-1",
+                }
+            ]
+        }
+    )
+
+    resolved, _ = await loop.resolve_operations(operations)
+
+    assert resolved.errors == []
+    operation = resolved.upsert_operations[0]
+    assert operation.source_message_ids == ["request", "result"]
+    assert operation.memory_fields["status"] == "in_progress"
+    assert operation.memory_fields["current_state"] == "One test still fails"
 
 
 @pytest.mark.asyncio

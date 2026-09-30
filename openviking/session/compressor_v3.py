@@ -12,6 +12,7 @@ submitted to the process-global StreamingPolicyTrainer.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from dataclasses import dataclass, field
@@ -39,7 +40,7 @@ from openviking.session.memory.dataclass import (
     StoredLink,
 )
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
-from openviking.session.memory.memory_type_registry import get_default_registry
+from openviking.session.memory.memory_type_registry import MemoryTypeRegistry, get_default_registry
 from openviking.session.memory.memory_updater import ExtractContext, write_stored_links
 from openviking.session.memory.session_extract_context_provider import (
     SessionExtractContextProvider,
@@ -705,15 +706,96 @@ class SessionCompressorV3:
         registry = await resolve_account_memory_registry(
             viking_fs, ctx.account_id, get_default_registry()
         )
+        if self.vlm_resolver is None:
+            raise RuntimeError("SessionCompressorV3 requires a VLM resolver for account-owned work")
+        vlm_config = await self.vlm_resolver.get_vlm(ctx.account_id)
+        extraction_args = {
+            "messages": messages,
+            "ctx": ctx,
+            "registry": registry,
+            "viking_fs": viking_fs,
+            "vlm_config": vlm_config,
+            "session_id": session_id,
+            "strict_extract_errors": strict_extract_errors,
+            "latest_archive_overview": latest_archive_overview,
+            "archive_uri": archive_uri,
+            "allow_self_memory": allow_self_memory,
+            "peer_memory_enabled": peer_memory_enabled,
+            "allowed_peer_ids": allowed_peer_ids,
+            "event_search_tags": event_search_tags,
+        }
+        memory_types = (
+            set(registry.list_names(include_disabled=False))
+            if allowed_memory_types is None
+            else set(allowed_memory_types)
+        )
+        if "work_item" not in memory_types:
+            return await self._extract_memory_types(
+                **extraction_args, allowed_memory_types=allowed_memory_types
+            )
+
+        # Separate prompts and prefetch scopes keep continuation bookkeeping out
+        # of ordinary memory extraction. Both passes use the same updater.
+        results = await asyncio.gather(
+            self._extract_memory_types(
+                **extraction_args, allowed_memory_types=memory_types - {"work_item"}
+            ),
+            self._extract_memory_types(
+                **extraction_args,
+                allowed_memory_types={"work_item"},
+                work_item_uris=work_item_uris,
+                work_item_replay=work_item_replay,
+                save_work_item_replay=save_work_item_replay,
+            ),
+            return_exceptions=True,
+        )
+        # Finish both passes before propagating failure, so a retry cannot race
+        # writes left running by the other pass.
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        ordinary, work = results
+        ordinary.contexts.extend(work.contexts)
+        ordinary.work_items = work.work_items
+        ordinary.work_item_coverage = work.work_item_coverage
+        ordinary.work_item_activations = work.work_item_activations
+        ordinary.continuation_coverage = work.continuation_coverage
+        ordinary.skipped_operations.extend(work.skipped_operations)
+        ordinary.memory_diff = _merge_memory_diffs(
+            [diff for diff in (ordinary.memory_diff, work.memory_diff) if diff is not None],
+            archive_uri=archive_uri or "",
+        )
+        return ordinary
+
+    async def _extract_memory_types(
+        self,
+        *,
+        messages: List[Message],
+        ctx: RequestContext,
+        registry: MemoryTypeRegistry,
+        viking_fs: Any,
+        vlm_config: "VLMHandle",
+        session_id: Optional[str],
+        strict_extract_errors: bool,
+        latest_archive_overview: str,
+        archive_uri: Optional[str],
+        allowed_memory_types: Optional[set[str]],
+        allow_self_memory: bool,
+        peer_memory_enabled: bool,
+        allowed_peer_ids: Optional[set[str]],
+        event_search_tags: Optional[List[str]],
+        work_item_uris: Optional[List[str]] = None,
+        work_item_replay: Optional[dict[str, Any]] = None,
+        save_work_item_replay: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None,
+    ) -> "_V3ExtractionResult":
+        if allowed_memory_types == set():
+            return _V3ExtractionResult()
         if allow_self_memory:
             await registry.initialize_memory_files(
                 ctx,
                 allowed_memory_types=allowed_memory_types,
             )
 
-        if self.vlm_resolver is None:
-            raise RuntimeError("SessionCompressorV3 requires a VLM resolver for account-owned work")
-        vlm_config = await self.vlm_resolver.get_vlm(ctx.account_id)
         context_provider = SessionExtractContextProvider(
             messages=messages,
             latest_archive_overview=latest_archive_overview,
@@ -734,7 +816,7 @@ class SessionCompressorV3:
                 message.id for message in messages
             ]:
                 raise ValueError("work_item replay does not match its original message batch")
-            # Keep ordinary memory extraction; reuse the frozen work-item decisions.
+            # Reuse the frozen work-item decisions without another LLM call.
             extraction_types = (
                 set(registry.list_names(include_disabled=False))
                 if allowed_memory_types is None
@@ -811,7 +893,7 @@ class SessionCompressorV3:
                 continuation_coverage=getattr(operations, "continuation_coverage", []),
             )
             frozen_source_coverage = _freeze_work_item_coverage(
-                extract_context, frozen.upsert_operations, partial_tool_message_ids
+                extract_context, frozen.upsert_operations
             )
             # Save before any canonical write. A failed metadata write leaves
             # canonical items untouched; retries reuse URI and source identity.
@@ -840,7 +922,6 @@ class SessionCompressorV3:
                 viking_fs=viking_fs,
                 ctx=ctx,
                 activations=activations,
-                partial_tool_message_ids=partial_tool_message_ids,
             )
             return _V3ExtractionResult(
                 work_items=work_items,
@@ -929,7 +1010,6 @@ class SessionCompressorV3:
             viking_fs=viking_fs,
             ctx=ctx,
             activations=activations,
-            partial_tool_message_ids=partial_tool_message_ids,
             frozen_source_coverage=frozen_source_coverage,
         )
         return _V3ExtractionResult(
@@ -2300,7 +2380,6 @@ async def _work_item_extraction_metadata(
     viking_fs: Any,
     ctx: RequestContext,
     activations: Optional[list[dict[str, Any]]] = None,
-    partial_tool_message_ids: Optional[set[str]] = None,
     frozen_source_coverage: Optional[list[dict[str, Any]]] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Return bindings and source attribution, never infer coverage from a read."""
@@ -2372,12 +2451,9 @@ async def _work_item_extraction_metadata(
         )
     elif callable(get_context):
         coverage.extend(_work_item_union_coverage(get_context(), applied_sources))
-    partial_ids = set(partial_tool_message_ids or []) | set(
-        getattr(context_provider, "work_item_partial_tool_message_ids", set())
-    )
     by_uri: dict[str, list[str]] = {}
     for entry in coverage:
-        ids = [identity for identity in entry["source_message_ids"] if identity not in partial_ids]
+        ids = entry["source_message_ids"]
         if ids:
             by_uri.setdefault(entry["uri"], []).extend(ids)
     coverage = [
@@ -2386,9 +2462,7 @@ async def _work_item_extraction_metadata(
     return bindings, coverage
 
 
-def _freeze_work_item_coverage(
-    extract_context: Any, operations: list[Any], partial_ids: set[str]
-) -> list[dict[str, Any]]:
+def _freeze_work_item_coverage(extract_context: Any, operations: list[Any]) -> list[dict[str, Any]]:
     sources = [(uri, op) for op in operations for uri in op.uris]
     coverage = [
         {"uri": uri, "source_message_ids": list(op.source_message_ids or [])} for uri, op in sources
@@ -2396,9 +2470,7 @@ def _freeze_work_item_coverage(
     coverage.extend(_work_item_union_coverage(extract_context, sources))
     by_uri: dict[str, list[str]] = {}
     for entry in coverage:
-        ids = [
-            source_id for source_id in entry["source_message_ids"] if source_id not in partial_ids
-        ]
+        ids = entry["source_message_ids"]
         if ids:
             by_uri.setdefault(entry["uri"], []).extend(ids)
     return [
