@@ -350,6 +350,13 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
             body = format_message_with_parts(msg)
             if not body.strip():
                 return None
+            if msg.message_kind == "checkpoint":
+                chunk = getattr(self.get_extract_context(), "chunk_meta", {}).get(id(msg))
+                identity = chunk.source_message_id if chunk else msg.id
+                return (
+                    f"[{idx}][assistant][continuation_id={identity}] "
+                    f"(historical state, not new user evidence): {body}"
+                )
             speaker = msg.peer_id or msg.role
             return f"[{idx}][{msg.role}][{speaker}]: {body}"
 

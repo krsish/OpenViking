@@ -358,7 +358,8 @@ def test_shared_summary_is_emitted_once_and_all_source_ids_remain_auditable():
     assert [row["message_id"] for row in ledger] == ["one", "two"]
     assert all(row["summary"] == CONSTRAINT for row in ledger)
     assert next_residual == residual
-    assert f"Source coverage: {ARCHIVE}/.done" in restored[0].content
+    assert residual[0]["source_checkpoint_uri"] == f"{ARCHIVE}/.done"
+    assert "Source coverage:" not in restored[0].content
     assert restored[0].role == "assistant"
 
 
@@ -429,12 +430,15 @@ def test_combined_summary_recency_uses_latest_source_not_first_emission_position
     assert ledger[0]["summary"] == ledger[2]["summary"]
 
 
-def test_previous_continuation_is_kept_until_explicitly_resolved():
+@pytest.mark.parametrize("legacy_checkpoint", [True, False])
+def test_previous_continuation_is_kept_until_explicitly_resolved(legacy_checkpoint):
     original = message("constraint", CONSTRAINT)
     classified = wi.resolve_continuation_coverage(
         ExtractContext([original]), [{"ranges": "0", "summary": CONSTRAINT}]
     )
     previous, _ = wi.coverage_report([original], [], ARCHIVE, classified)
+    if legacy_checkpoint:
+        previous[0].pop("continuation_state_version")
     inherited = Message.from_dict(previous[0])
     later = message("approval", "The invoices are backed up and email approval is granted.")
     sources = [inherited, later]
@@ -445,6 +449,22 @@ def test_previous_continuation_is_kept_until_explicitly_resolved():
     resolved = wi.resolve_continuation_coverage(
         ExtractContext(sources),
         [{"ranges": "0", "reason": "The newer approval resolves the previous restriction."}],
+    )
+    # Legacy classifications cannot close a stable item using only background.
+    protected, _ = wi.coverage_report(
+        sources, [], ARCHIVE + "-next", resolved, previous_residual=previous
+    )
+    assert protected == previous
+    resolved = wi.resolve_continuation_coverage(
+        ExtractContext(sources),
+        [
+            {
+                "action": "resolve",
+                "continuation_id": inherited.id,
+                "ranges": "1",
+                "reason": "The newer approval resolves the previous restriction.",
+            }
+        ],
     )
     residual, ledger = wi.coverage_report(
         sources, [], ARCHIVE + "-next", resolved, previous_residual=previous
@@ -515,3 +535,235 @@ def test_background_summary_cannot_authorize_reopening_a_terminal_work_item():
         )
     # The actual newer user request, in contrast, is sufficient evidence.
     assert validate_work_item_update(operation, old, ctx, ExtractContext([raw]))["status"] == "open"
+
+
+@pytest.mark.parametrize("legacy_checkpoint", [True, False])
+def test_work_item_write_without_explicit_promotion_does_not_consume_stable_item(legacy_checkpoint):
+    previous = [wi.continuation_message(CONSTRAINT, ARCHIVE, ["old"], CREATED_AT)]
+    if legacy_checkpoint:
+        previous[0].pop("continuation_state_version")
+    inherited = Message.from_dict(previous[0])
+    residual, _ = wi.coverage_report(
+        [inherited],
+        [
+            {
+                "uri": "viking://user/alice/memories/work_item/wi-test.md",
+                "source_message_ids": [inherited.id],
+            }
+        ],
+        ARCHIVE + "-next",
+        previous_residual=previous,
+    )
+    assert residual == previous
+
+
+@pytest.mark.parametrize("legacy_checkpoint", [True, False])
+def test_legacy_combined_summary_cannot_erase_distinct_stable_item_ids(legacy_checkpoint):
+    previous = [
+        wi.continuation_message(CONSTRAINT, ARCHIVE, ["one"], CREATED_AT),
+        wi.continuation_message("Verify the attachment.", ARCHIVE, ["two"], CREATED_AT),
+    ]
+    if legacy_checkpoint:
+        for value in previous:
+            value.pop("continuation_state_version")
+    inherited = [Message.from_dict(value) for value in previous]
+    residual, _ = wi.coverage_report(
+        inherited,
+        [],
+        ARCHIVE + "-next",
+        [
+            {
+                "source_message_ids": [value.id for value in inherited],
+                "summary": "Do not deploy without approval.",
+                "reason": "",
+            }
+        ],
+        previous_residual=previous,
+    )
+    assert residual == previous
+
+
+def test_ordered_batches_keep_latest_update_without_reviving_resolved_state():
+    previous = [wi.continuation_message(CONSTRAINT, ARCHIVE, ["old"], CREATED_AT)]
+    identity = previous[0]["id"]
+    messages = [
+        Message.from_dict(previous[0]),
+        message("new-1", "Tests passed."),
+        message("new-2", "Review passed."),
+    ]
+    updates = [
+        {
+            "action": "update",
+            "continuation_id": identity,
+            "source_message_ids": ["new-1"],
+            "summary": "Tests passed; review pending.",
+        },
+        {
+            "action": "update",
+            "continuation_id": identity,
+            "source_message_ids": ["new-2"],
+            "summary": "Review passed; approval pending.",
+        },
+        {"action": "keep", "continuation_id": identity, "source_message_ids": []},
+    ]
+    residual, _ = wi.coverage_report(
+        messages,
+        [],
+        ARCHIVE + "-next",
+        updates,
+        previous_residual=previous,
+    )
+    assert len(residual) == 1
+    assert residual[0]["id"] == identity
+    assert Message.from_dict(residual[0]).content == "Review passed; approval pending."
+    assert residual[0]["source_message_ids"] == ["new-1", "new-2"]
+    assert residual[0]["source_checkpoint_uri"] == previous[0]["source_checkpoint_uri"]
+    updates.extend(
+        [
+            {
+                "action": "resolve",
+                "continuation_id": identity,
+                "source_message_ids": ["new-2"],
+                "reason": "Approval granted.",
+            },
+            {"action": "keep", "continuation_id": identity, "source_message_ids": []},
+        ]
+    )
+    residual, report = wi.coverage_report(
+        messages,
+        [],
+        ARCHIVE + "-next",
+        updates,
+        previous_residual=previous,
+    )
+    assert residual == []
+    assert report[0]["continuation_actions"][-1]["state"] == "resolved"
+
+
+def test_promotion_cannot_use_a_historical_receipt_for_an_updated_item():
+    from openviking.session.continuation_state import confirm_continuation_promotions
+
+    previous = [wi.continuation_message(CONSTRAINT, ARCHIVE, ["old"], CREATED_AT)]
+    identity = previous[0]["id"]
+    target = "viking://user/alice/memories/work_item/wi-test.md"
+    fresh = message("new-evidence", "Preserve the attachment too.")
+    messages = [Message.from_dict(previous[0]), fresh]
+    update = {
+        "action": "update",
+        "continuation_id": identity,
+        "source_message_ids": [fresh.id],
+        "summary": CONSTRAINT + " Keep the attachment.",
+    }
+    promotion = {
+        "action": "promote",
+        "continuation_id": identity,
+        "source_message_ids": [fresh.id],
+        "work_item_uri": target,
+        "reason": "Moved into the task.",
+    }
+    historical = [{"uri": target, "source_message_ids": [identity, "old-evidence"]}]
+    actions = confirm_continuation_promotions([update, promotion], historical)
+    residual, _ = wi.coverage_report(
+        messages,
+        historical,
+        ARCHIVE + "-next",
+        actions,
+        previous_residual=previous,
+    )
+    assert len(residual) == 1
+    assert "Keep the attachment." in Message.from_dict(residual[0]).content
+    assert actions[1]["promotion_receipt"] is None
+
+    # Even a previously confirmed action is insufficient for a newer in-archive update.
+    stale_action = {
+        **promotion,
+        "source_message_ids": ["old-evidence"],
+        "promotion_receipt": historical[0],
+    }
+    residual, _ = wi.coverage_report(
+        messages,
+        historical,
+        ARCHIVE + "-next",
+        [update, stale_action],
+        previous_residual=previous,
+    )
+    assert len(residual) == 1
+    fresh_coverage = [{"uri": target, "source_message_ids": [identity, fresh.id]}]
+    confirmed = confirm_continuation_promotions([update, promotion], fresh_coverage)
+    residual, _ = wi.coverage_report(
+        messages,
+        historical,
+        ARCHIVE + "-next",
+        confirmed,
+        previous_residual=previous,
+    )
+    assert residual == []
+
+
+def test_a_later_batch_can_update_a_newly_created_continuation_item():
+    first = message("first", "Test pending.")
+    later = message("later", "Tests passed; review next.")
+    create = {"action": "create", "source_message_ids": [first.id], "summary": "Test pending."}
+    state, _ = wi.coverage_report([first], [], ARCHIVE, [create])
+    identity = state[0]["id"]
+    update = {
+        "action": "update",
+        "continuation_id": identity,
+        "source_message_ids": [later.id],
+        "summary": "Tests passed; review next.",
+    }
+    result, _ = wi.coverage_report([first, later], [], ARCHIVE, [create, update])
+    assert len(result) == 1
+    assert result[0]["id"] == identity
+    assert Message.from_dict(result[0]).content == "Tests passed; review next."
+    assert result[0]["source_message_ids"] == [first.id, later.id]
+
+
+@pytest.mark.parametrize("uses_latest_background", [True, False])
+def test_resolution_of_stale_background_cannot_close_updated_continuation(uses_latest_background):
+    previous = [wi.continuation_message("Tests pending.", ARCHIVE, ["old"], CREATED_AT)]
+    identity = previous[0]["id"]
+    first = message("tests", "Tests passed; deployment still pending.")
+    second = message("done", "The pending step is complete.")
+    messages = [Message.from_dict(previous[0]), first]
+    update = wi.resolve_continuation_coverage(
+        ExtractContext(messages),
+        [
+            {
+                "action": "update",
+                "continuation_id": identity,
+                "ranges": "1",
+                "summary": "Tests passed; deployment pending.",
+            }
+        ],
+    )
+    current, _ = wi.coverage_report(
+        messages, [], ARCHIVE + "-next", update, previous_residual=previous
+    )
+    background = current[0] if uses_latest_background else previous[0]
+    resolve = wi.resolve_continuation_coverage(
+        ExtractContext([Message.from_dict(background), second]),
+        [
+            {
+                "action": "resolve",
+                "continuation_id": identity,
+                "ranges": "1",
+                "reason": "The pending step is complete.",
+            }
+        ],
+    )
+    final, report = wi.coverage_report(
+        [*messages, second],
+        [],
+        ARCHIVE + "-next",
+        [*update, *resolve],
+        previous_residual=previous,
+    )
+
+    if uses_latest_background:
+        assert final == []
+    else:
+        assert [value["id"] for value in final] == [identity]
+        assert wi.continuation_content(final[0]) == "Tests passed; deployment pending."
+        row = next(value for value in report if value["message_id"] == identity)
+        assert row["continuation_actions"][-1]["pending_resolution"] is True

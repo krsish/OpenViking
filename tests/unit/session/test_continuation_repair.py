@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -23,17 +24,20 @@ def previous():
     ]
 
 
+def response(summary, identity=None):
+    return json.dumps({"items": [{"id": identity or previous()[0]["id"], "summary": summary}]})
+
+
 @pytest.mark.asyncio
 async def test_repair_keeps_source_identity_as_historical_assistant_state():
     summary = "Fix X and rerun tests. Deployment requires approval."
-    vlm = SimpleNamespace(
-        get_completion_async=AsyncMock(return_value=json.dumps({"summary": summary}))
-    )
+    vlm = SimpleNamespace(get_completion_async=AsyncMock(return_value=response(summary)))
     source = previous()
     result = await compact_continuation(vlm, source, 200)
     assert result[0]["role"] == "assistant"
     assert result[0]["message_kind"] == "checkpoint"
-    assert result[0]["id"] not in ["m1", "m2", source[0]["id"]]
+    assert result[0]["id"] == source[0]["id"]
+    assert result[0]["continuation_state_version"] == 1
     assert not result[0].get("source_message_ids")
     assert result[0]["created_at"] == source[0]["created_at"]
     assert summary in residual_text(result)
@@ -44,9 +48,7 @@ async def test_repair_keeps_source_identity_as_historical_assistant_state():
 @pytest.mark.asyncio
 async def test_repeated_repair_does_not_accumulate_source_ids_in_model_input():
     summary = "Do not deploy without approval."
-    vlm = SimpleNamespace(
-        get_completion_async=AsyncMock(return_value=json.dumps({"summary": summary}))
-    )
+    vlm = SimpleNamespace(get_completion_async=AsyncMock(return_value=response(summary)))
     residual = previous()
     prompts = []
     identities = []
@@ -68,12 +70,14 @@ async def test_repeated_repair_does_not_accumulate_source_ids_in_model_input():
         assert "2026-10-01T00:00:00Z" in prompt
     assert prompts[1] == prompts[2]
     assert identities[1] == identities[2]
-    assert max(map(len, prompts)) < 2000
+    assert max(map(len, prompts)) < 3000
 
 
 @pytest.mark.asyncio
 async def test_repair_preserves_all_legacy_message_content_and_reference_fields():
-    vlm = SimpleNamespace(get_completion_async=AsyncMock(return_value='{"summary":"Fix X."}'))
+    vlm = SimpleNamespace(
+        get_completion_async=AsyncMock(return_value=response("Fix X.", "old-raw"))
+    )
     residual = [
         {
             "id": "old-raw",
@@ -105,9 +109,9 @@ async def test_repair_retries_invalid_and_over_budget_candidates_without_truncat
     vlm = SimpleNamespace(
         get_completion_async=AsyncMock(
             side_effect=[
-                '{"summary": ""}',
-                json.dumps({"summary": "long " * 1000}),
-                '```json\n{"summary":"Do not deploy; fix X next."}\n```',
+                response(""),
+                response("long " * 1000),
+                "```json\n" + response("Do not deploy; fix X next.") + "\n```",
             ]
         )
     )
@@ -141,16 +145,21 @@ async def test_session_repair_reserves_source_reference_before_candidate_retry(m
     from tests.unit.session.test_work_item_checkpoint import MemoryFS
 
     archive_uri = "viking://user/default/sessions/work-items/history/archive_002"
-    first_response = json.dumps({"summary": "a" * 275})
+    legacy = [
+        Message(
+            id="legacy", role="user", parts=[TextPart("Do not deploy without approval.")]
+        ).to_dict()
+    ]
+    first_response = response("a" * 275, "legacy")
     probe = SimpleNamespace(get_completion_async=AsyncMock(return_value=first_response))
-    near_limit = await compact_continuation(probe, previous(), 100)
-    assert estimate_text_tokens(residual_text(near_limit)) == 90
+    near_limit = await compact_continuation(probe, legacy, 1000)
+    budget = estimate_text_tokens(residual_text(near_limit))
     near_limit[0]["source_checkpoint_uri"] = f"{archive_uri}/.done"
-    assert estimate_text_tokens(residual_text(near_limit)) == 111
+    assert estimate_text_tokens(residual_text(near_limit)) > budget
 
     vlm = SimpleNamespace(
         get_completion_async=AsyncMock(
-            side_effect=[first_response, '{"summary":"Do not deploy without approval."}']
+            side_effect=[first_response, response("Do not deploy without approval.", "legacy")]
         )
     )
     owner = SimpleNamespace(
@@ -161,13 +170,8 @@ async def test_session_repair_reserves_source_reference_before_candidate_retry(m
             vlm, residual, budget
         ),
     )
-    legacy = [
-        Message(
-            id="legacy", role="user", parts=[TextPart("Do not deploy without approval.")]
-        ).to_dict()
-    ]
     monkeypatch.setattr(
-        wi, "get_work_item_budgets", lambda: WorkItemBudgets(continuation_token_budget=100)
+        wi, "get_work_item_budgets", lambda: WorkItemBudgets(continuation_token_budget=budget)
     )
     result = await Session._prepare_work_item_continuation(owner, archive_uri, legacy, {})
 
@@ -175,7 +179,7 @@ async def test_session_repair_reserves_source_reference_before_candidate_retry(m
     assert "exceeding" in vlm.get_completion_async.call_args.args[0]
     assert "Do not deploy without approval." in residual_text(result)
     assert result[0]["source_checkpoint_uri"] == f"{archive_uri}/.done"
-    assert estimate_text_tokens(residual_text(result)) <= 100
+    assert estimate_text_tokens(residual_text(result)) <= budget
     saved = owner._merge_archive_meta.call_args.args[1]
     assert saved["continuation_projection"]["status"] == "ready"
     cached = await Session._prepare_work_item_continuation(owner, archive_uri, legacy, saved)
@@ -216,9 +220,7 @@ async def test_legacy_summary_migration_and_next_update_keep_both_original_archi
     }
     vlm = SimpleNamespace(
         get_completion_async=AsyncMock(
-            return_value=json.dumps(
-                {"summary": "Deployment needs approval; review remains pending."}
-            )
+            return_value=response("Deployment needs approval; review remains pending.", "m1")
         )
     )
     owner = SimpleNamespace(
@@ -252,13 +254,20 @@ async def test_legacy_summary_migration_and_next_update_keep_both_original_archi
     assert migrated["coverage"][0]["source_checkpoint_uri"] == f"{old_archive}/.done"
 
     next_archive = f"{session_uri}/history/archive_004"
+    current_evidence = Message(
+        id="new-review-note",
+        role="user",
+        parts=[TextPart("Approval and review are still required.")],
+    )
     updated, ledger = wi.coverage_report(
-        [Message.from_dict(value)],
+        [Message.from_dict(value), current_evidence],
         [],
         next_archive,
         [
             {
-                "source_message_ids": [value["id"]],
+                "action": "update",
+                "continuation_id": value["id"],
+                "source_message_ids": [value["id"], current_evidence.id],
                 "summary": "Approval and review are still required.",
                 "reason": "",
             }
@@ -267,7 +276,7 @@ async def test_legacy_summary_migration_and_next_update_keep_both_original_archi
         previous_checkpoint_uri=f"{current_archive}/.done",
     )
     assert "Approval and review" in residual_text(updated)
-    assert updated[0]["source_message_ids"] == [value["id"]]
+    assert updated[0]["source_message_ids"] == [value["id"], current_evidence.id]
     assert ledger[0]["source_checkpoint_uri"] == f"{current_archive}/.done"
     # The new update reaches the migration ledger, then the legacy checkpoint
     # which retains both raw source destinations, not just the reused first ID.
@@ -315,7 +324,7 @@ async def test_below_budget_legacy_sources_move_to_ledger_without_model_and_stay
 
 
 @pytest.mark.asyncio
-async def test_ready_legacy_cache_migrates_source_ids_without_repeating_successful_compaction(
+async def test_ready_legacy_cache_cannot_replace_stable_item_id_with_merged_summary(
     monkeypatch,
 ):
     import hashlib
@@ -338,18 +347,19 @@ async def test_ready_legacy_cache_migrates_source_ids_without_repeating_successf
         "continuation_projection": {
             "status": "ready",
             "input_hash": old_hash,
-            "residual": candidate,
+            "residual": deepcopy(candidate),
         }
     }
-    compactor = AsyncMock(side_effect=AssertionError("The cached model result must be reused"))
+    candidate[0]["id"] = residual[0]["id"]
+    compactor = AsyncMock(return_value=candidate)
     monkeypatch.setattr(session, "_compact_work_item_continuation", compactor)
 
     result = await session._prepare_work_item_continuation(uri, residual, meta)
     reused = await session._prepare_work_item_continuation(uri, residual, meta)
 
-    compactor.assert_not_awaited()
+    compactor.assert_awaited_once()
     assert reused == result
-    assert result[0]["id"] == "already-compacted"
+    assert result[0]["id"] == residual[0]["id"]
     assert not result[0].get("source_message_ids")
     assert not result[0].get("source_continuation_ids")
     assert "Do not deploy without approval" in residual_text(result)
@@ -357,3 +367,125 @@ async def test_ready_legacy_cache_migrates_source_ids_without_repeating_successf
     ledger = json.loads(fs.files[f"{uri}/continuation-provenance.json"])
     assert ledger["inputs"] == residual
     assert ledger["outputs"][result[0]["id"]] == [residual[0]["id"]]
+
+
+@pytest.mark.asyncio
+async def test_stateful_repair_preserves_omitted_item_and_original_order():
+    source = previous()
+    other = continuation_message(
+        "Review the performance change before release.",
+        "viking://user/u/sessions/s/history/archive_001",
+        ["m3"],
+        "2026-10-01T01:00:00Z",
+    )
+    vlm = SimpleNamespace(get_completion_async=AsyncMock(return_value=response("Fix X next.")))
+
+    result = await compact_continuation(vlm, [*source, other], 1000)
+
+    assert [item["id"] for item in result] == [source[0]["id"], other["id"]]
+    assert result[0]["parts"][0]["text"] == "Fix X next."
+    assert result[1]["parts"][0]["text"] == "Review the performance change before release."
+    assert result[1]["created_at"] == other["created_at"]
+    assert all(item["continuation_state_version"] == 1 for item in result)
+
+
+@pytest.mark.asyncio
+async def test_omitting_an_oversized_item_cannot_make_compaction_pass_its_budget():
+    source = previous()
+    source[0]["parts"][0]["text"] = "Pending approval. " * 1000
+    vlm = SimpleNamespace(get_completion_async=AsyncMock(return_value='{"items": []}'))
+
+    with pytest.raises(ValueError, match="within its token budget"):
+        await compact_continuation(vlm, source, 200)
+
+    assert vlm.get_completion_async.await_count == 3
+    assert "exceeding" in vlm.get_completion_async.call_args.args[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "items",
+    [
+        [{"id": "invented", "summary": "No pending work."}],
+        [{"id": "existing", "summary": "A"}, {"id": "existing", "summary": "B"}],
+        [{"id": "existing", "summary": "", "status": "resolved"}],
+        [{"id": "existing", "summary": "A", "status": "resolved"}],
+        [{"id": "existing", "summary": "Previous continuation summary:"}],
+    ],
+)
+async def test_repair_rejects_invented_duplicate_or_state_changing_outputs(items):
+    source = previous()
+    source[0]["id"] = "existing"
+    vlm = SimpleNamespace(get_completion_async=AsyncMock(return_value=json.dumps({"items": items})))
+    with pytest.raises(ValueError, match="within its token budget"):
+        await compact_continuation(vlm, source, 1000)
+    assert vlm.get_completion_async.await_count == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_kind", [None, "checkpoint"])
+async def test_omitted_legacy_tool_entry_is_preserved_whole_when_converted_to_checkpoint(
+    message_kind,
+):
+    source = {
+        "id": "legacy-tool",
+        "role": "assistant",
+        "message_kind": message_kind,
+        "parts": [
+            {"type": "text", "text": "The test failed."},
+            {"type": "tool", "tool_name": "pytest", "tool_output": "Assertion X failed"},
+        ],
+    }
+    vlm = SimpleNamespace(get_completion_async=AsyncMock(return_value='{"items": []}'))
+
+    result = await compact_continuation(vlm, [source], 1000)
+
+    assert result[0]["id"] == source["id"]
+    assert result[0]["message_kind"] == "checkpoint"
+    assert "The test failed." in result[0]["parts"][0]["text"]
+    assert "Assertion X failed" in result[0]["parts"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_empty_continuation_does_not_call_model():
+    vlm = SimpleNamespace(get_completion_async=AsyncMock())
+    assert await compact_continuation(vlm, [], 200) == []
+    vlm.get_completion_async.assert_not_awaited()
+
+
+def test_updated_item_provenance_reaches_prior_checkpoint_without_self_reference():
+    from openviking.message import Message, TextPart
+    from openviking.session.continuation_provenance import prepare_continuation_provenance
+    from openviking.session.work_items import coverage_report
+
+    old = previous()[0]
+    old.pop("source_message_ids")  # Published hot entries keep provenance in the sidecar.
+    current_archive = "viking://user/u/sessions/s/history/archive_002"
+    evidence = Message(id="new-evidence", role="user", parts=[TextPart("The fix is implemented.")])
+    updated, coverage = coverage_report(
+        [Message.from_dict(old), evidence],
+        [],
+        current_archive,
+        [
+            {
+                "action": "update",
+                "continuation_id": old["id"],
+                "source_message_ids": [evidence.id],
+                "summary": "Rerun tests before seeking deployment approval.",
+            }
+        ],
+        previous_residual=[old],
+    )
+    hot, ledger = prepare_continuation_provenance(
+        updated, updated, current_archive, compacted=False
+    )
+
+    assert hot[0]["id"] == old["id"]
+    assert hot[0]["source_checkpoint_uri"] == f"{current_archive}/.done"
+    source = ledger["inputs"][0]
+    assert source["source_checkpoint_uri"] == old["source_checkpoint_uri"]
+    assert source["source_message_ids"] == [evidence.id]
+    assert ledger["outputs"] == {old["id"]: [old["id"]]}
+    assert next(row for row in coverage if row["message_id"] == evidence.id)["archive_uri"] == (
+        f"{current_archive}/messages.jsonl"
+    )

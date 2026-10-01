@@ -11,6 +11,7 @@ from openviking.session.memory.extraction_output_protocol.base import (
     ExtractionOutputContext,
     ExtractionOutputProtocol,
 )
+from openviking.session.memory.schema_model_generator import ContinuationCoverage
 from openviking.session.memory.tools import add_tool_call_pair_to_messages
 from openviking.session.memory.utils import parse_json_with_stability
 
@@ -71,6 +72,25 @@ class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
     def parse(
         self, content: str, context: ExtractionOutputContext
     ) -> tuple[Any | None, str | None]:
+        if "continuation_coverage" in context.operations_model.model_fields:
+            # Preserve JSON repair and legacy field tolerance, but never silently
+            # filter a malformed state transition into a successful empty result.
+            # The extraction loop must get an error so it can request a repair.
+            raw, _ = parse_json_with_stability(content=content)
+            entries = raw.get("continuation_coverage", []) if isinstance(raw, dict) else []
+            if isinstance(entries, dict):
+                entries = [entries]
+            for index, entry in enumerate(entries if isinstance(entries, list) else []):
+                if not isinstance(entry, dict) or not (
+                    entry.get("action", "") != ""
+                    or entry.get("continuation_id", "") != ""
+                    or entry.get("work_item_page_id") is not None
+                ):
+                    continue
+                try:
+                    ContinuationCoverage.model_validate(entry)
+                except (TypeError, ValueError) as exc:
+                    return None, f"Invalid continuation_coverage[{index}] action: {exc}"
         return parse_json_with_stability(
             content=content,
             model_class=context.operations_model,
@@ -86,8 +106,14 @@ class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
         )
         activation_hint = (
             " Include work_item_activations when the user resumes matching already-read work "
-            "even if no fields change. Include continuation_coverage summaries or discard "
-            "reasons for selected continuation even when no memory fields change. "
+            "even if no fields change. Maintain each supplied continuation_id with a "
+            "continuation_coverage action: keep, update, resolve or promote. Use create only "
+            "for a new matter. Progress and changed next steps within the same matter require "
+            "update with the same ID; never resolve plus create to rewrite it. Resolve only "
+            "when no continuation of that matter remains. Promotion requires a successful "
+            "work_item create/update whose "
+            "ranges cover every source index of the old continuation and the new evidence; "
+            "reading or activating a work_item alone does not transfer the continuation. "
             if "work_item_activations" in context.operations_model.model_fields
             else ""
         )

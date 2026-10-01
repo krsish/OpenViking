@@ -27,6 +27,7 @@ from openviking.session.memory.merge_op import (
     SearchReplaceBlock,
     StrPatch,
 )
+from openviking.session.memory.schema_model_generator import ContinuationCoverage
 from openviking.session.memory.utils.description_template import render_description_template
 from openviking.session.memory.utils.line_numbers import (
     every_line_has_line_numbers,
@@ -179,10 +180,29 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         for schema in context.schemas:
             lines.extend(self._render_schema_contract(context, schema))
         if any(schema.memory_type == "work_item" for schema in context.schemas):
-            lines.append(
-                '- sdk.continuation(ranges="0-3", summary="""Remaining continuation state""") '
-                'or sdk.continuation(ranges="4", reason="""No remaining continuation because ..."""): '
-                + continuation_selection_instruction()
+            lines.extend(
+                [
+                    '- sdk.continuation(action="create", ranges="0-3", '
+                    'summary="""One new pending matter or constraint""")',
+                    '- sdk.continuation(action="update", continuation_id="<supplied ID>", '
+                    'ranges="4", summary="""Complete latest state of this item"""): '
+                    "use the same ID for progress, new phases and changed next actions; "
+                    "do not resolve and recreate the same matter.",
+                    '- sdk.continuation(action="keep", continuation_id="<supplied ID>"): '
+                    "preserve this item's content unchanged.",
+                    '- sdk.continuation(action="resolve", continuation_id="<supplied ID>", '
+                    'ranges="4", reason="""Evidence that this item is resolved"""): '
+                    "only when no continuation of this matter remains, not merely when "
+                    "its previous next step is complete.",
+                    '- sdk.continuation(action="promote", continuation_id="<supplied ID>", '
+                    'ranges="4", work_item=task, reason="""This task preserves the item"""): '
+                    "task must be an existing work_item binding or the result of "
+                    "sdk.create_work_item(...); first save its complete state with supporting "
+                    "ranges including the old continuation. For example, if this item is "
+                    "source index 2 and new evidence is index 3, the task create/update must "
+                    'use ranges="2-3", not only ranges="3". Do not pass an ID or URI string.',
+                    continuation_selection_instruction(),
+                ]
             )
             lines.append(
                 '- existing_work_item.activate(ranges="<current user message indices>"): '
@@ -322,9 +342,11 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
     def render_final_instruction(self, context: ExtractionOutputContext) -> str:
         activation_hint = (
             " Include .activate(ranges=...) when the user resumes a matching existing work_item "
-            "even if no fields change. Include sdk.continuation(ranges=..., summary=...) "
-            "or sdk.continuation(ranges=..., reason=...) for selected continuation, "
-            "even when no memory fields change."
+            "even if no fields change. Maintain each supplied continuation ID with "
+            "sdk.continuation(action=..., continuation_id=...): keep, update, resolve or promote. "
+            "Keep the same ID when a matter progresses or its next step changes: use update, "
+            "never resolve plus create. Resolve only when nothing remains to continue for "
+            "that matter. Use action='create' only for a new matter."
             if any(schema.memory_type == "work_item" for schema in context.schemas)
             else ""
         )
@@ -933,13 +955,33 @@ class _PythonProgramCompiler:
         if method == "continuation":
             if "continuation_coverage" not in self.context.operations_model.model_fields:
                 self._error(node, "continuation() is available only with work_item extraction")
-            kwargs = self._eval_keywords(node)
-            if node.args or set(kwargs) not in ({"ranges", "summary"}, {"ranges", "reason"}):
-                self._error(
-                    node, "continuation() requires ranges= and exactly one of summary=/reason="
-                )
-            if not all(isinstance(value, str) and value.strip() for value in kwargs.values()):
-                self._error(node, "continuation() arguments must be non-empty strings")
+            if node.args:
+                self._error(node, "continuation() accepts keyword arguments only")
+            kwargs = self._eval_keywords(
+                node,
+                allowed={"action", "continuation_id", "ranges", "summary", "reason", "work_item"},
+            )
+            if not kwargs.get("action"):
+                if set(kwargs) not in ({"ranges", "summary"}, {"ranges", "reason"}):
+                    self._error(
+                        node, "continuation() requires ranges= and exactly one of summary=/reason="
+                    )
+                if not all(isinstance(value, str) and value.strip() for value in kwargs.values()):
+                    self._error(node, "continuation() arguments must be non-empty strings")
+            else:
+                if "work_item" in kwargs:
+                    target = kwargs.pop("work_item")
+                    if (
+                        not isinstance(target, _MemoryObject)
+                        or target.memory_type != "work_item"
+                        or target.deleted
+                    ):
+                        self._error(node, "work_item= requires a live work_item binding")
+                    kwargs["work_item_page_id"] = target.page_id
+                try:
+                    kwargs = ContinuationCoverage.model_validate(kwargs).model_dump()
+                except (TypeError, ValueError) as exc:
+                    self._error(node, f"invalid continuation action: {exc}")
             self.continuation_coverage.append(kwargs)
             return None
         if method.startswith(("create_", "set_")):
@@ -1318,6 +1360,12 @@ class _PythonProgramCompiler:
                     if field_name in obj.fields and field_name not in fields:
                         fields[field_name] = obj.fields[field_name]
             payload[obj.memory_type].append({"page_id": obj.page_id, **fields})
+        if any(
+            entry.get("work_item_page_id") in deleted_ids for entry in self.continuation_coverage
+        ):
+            raise ExtractionOutputProtocolError(
+                "continuation promotion cannot target a deleted work_item"
+            )
         if self.context.link_enabled:
             payload["links"] = []
             for link in self.links:

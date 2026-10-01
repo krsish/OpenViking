@@ -209,6 +209,24 @@ def _message_peer_ids(messages: List[Message]) -> set[str]:
     }
 
 
+def _continuation_background_messages(values: List[Dict[str, Any]]) -> List[Message]:
+    """Expose current state as background, without accumulating provenance lists."""
+    return [
+        Message(
+            id=value["id"],
+            role="assistant",
+            message_kind="checkpoint",
+            parts=(
+                [TextPart(wi.continuation_content(value))]
+                if all(part.get("type", "text") == "text" for part in value.get("parts", []))
+                else Message.from_dict(value).parts
+            ),
+            created_at=value.get("created_at"),
+        )
+        for value in values
+    ]
+
+
 @dataclass(frozen=True)
 class _MemoryExtractionScope:
     allow_self_memory: bool
@@ -2014,9 +2032,9 @@ class Session:
                 previous_checkpoint, uncovered = await self._work_item_history(
                     before_index=archive_index
                 )
-                residual = [
-                    Message.from_dict(value) for value in previous_checkpoint.get("residual", [])
-                ]
+                residual = _continuation_background_messages(
+                    previous_checkpoint.get("residual", [])
+                )
                 messages = self._archives.stable_deduplicate_messages(
                     residual + uncovered + messages
                 )
@@ -2265,6 +2283,20 @@ class Session:
                                 work_item_kwargs = {}
                                 if work_item_mode:
                                     current_meta = await self._archives.read_meta(archive_uri)
+                                    # Batches and completed-message filtering must not hide
+                                    # old issues from later evidence. Rebuild the current
+                                    # state from all completed transitions, then pass it
+                                    # separately from this batch's source/replay boundary.
+                                    continuation_state, _ = wi.coverage_report(
+                                        messages,
+                                        current_meta.get("work_item_coverage", []),
+                                        archive_uri,
+                                        current_meta.get("continuation_coverage", []),
+                                        previous_residual=previous_checkpoint.get("residual", []),
+                                    )
+                                    work_item_kwargs["continuation_background"] = (
+                                        _continuation_background_messages(continuation_state)
+                                    )
                                     source_messages = (
                                         long_term_messages
                                         if batch_messages is None
@@ -2749,7 +2781,7 @@ class Session:
         return {
             "mode": wi.WORK_ITEM_MODE,
             "version": 1,
-            "continuation_version": 3,
+            "continuation_version": 4,
             "continuation_provenance_uri": f"{archive_uri}/continuation-provenance.json",
             "pending_continuation_uri": pending_uri,
             "continuation_degraded": bool(pending_uri),
@@ -2807,7 +2839,7 @@ class Session:
             raise ValueError("work_item projection has no room for continuation")
         fingerprint = hashlib.sha256(
             json.dumps(
-                [residual, limit, pending_continuation_uri, 3],
+                [residual, limit, pending_continuation_uri, 4],
                 sort_keys=True,
                 ensure_ascii=False,
             ).encode()
@@ -2819,6 +2851,7 @@ class Session:
                 isinstance(result, list)
                 and all(value.get("message_kind") == "checkpoint" for value in result)
                 and cached.get("provenance_version") == 1
+                and all(value.get("continuation_state_version") == 1 for value in result)
                 and not any(
                     value.get("source_message_ids") or value.get("source_continuation_ids")
                     for value in result
@@ -2858,6 +2891,8 @@ class Session:
             and cached.get("input_hash") == legacy_fingerprint
             and isinstance(cached.get("residual"), list)
             and cached["residual"]
+            and {value.get("id") for value in cached["residual"]}
+            == {value.get("id") for value in residual}
         ):
             # Reuse an already-durable v2 summary while moving its large source
             # lists to the ledger. Metadata migration does not need another LLM.

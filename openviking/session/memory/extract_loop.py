@@ -207,6 +207,7 @@ class ExtractLoop:
         # Reset format retry counter for each run
         self._format_retry_count = 0
         patch_repair_count = 0
+        continuation_repair_count = 0
         resolution_repair_count = 0
         pending_resolution_repair: Optional[Tuple[ResolvedOperations, List]] = None
 
@@ -337,7 +338,33 @@ class ExtractLoop:
                         operations,
                         pending_resolution_repair[0],
                     )
-                candidate_operations, candidate_links = await self.resolve_operations(operations)
+                from openviking.session.continuation_state import ContinuationResolutionError
+
+                try:
+                    candidate_operations, candidate_links = await self.resolve_operations(
+                        operations
+                    )
+                except ContinuationResolutionError as exc:
+                    if continuation_repair_count:
+                        raise
+                    continuation_repair_count += 1
+                    max_iterations += 1
+                    self._disable_tools_for_iteration = True
+                    prior_output = getattr(self, "_last_operation_content", "")
+                    if prior_output:
+                        messages.append({"role": "assistant", "content": prior_output})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": self._output_protocol.render_format_retry(str(exc))
+                            + "\nRe-emit the complete set of intended memory operations and "
+                            "continuation actions, not just the correction. Preserve already-valid "
+                            "actions and item IDs; correct only the reported error. No writes have "
+                            "been applied. A promoted work_item's own ranges must include "
+                            "every chunk of the old continuation item plus the new evidence.",
+                        }
+                    )
+                    continue
                 if pending_resolution_repair is not None:
                     base_operations, base_links = pending_resolution_repair
                     final_operations = self._merge_event_resolution_repair(
@@ -1009,10 +1036,43 @@ class ExtractLoop:
         if any(schema.memory_type == "work_item" for schema in schemas):
             from openviking.session.work_items import resolve_continuation_coverage
 
-            continuation_coverage = resolve_continuation_coverage(
-                self._extract_context,
-                getattr(operations, "continuation_coverage", []) or [],
-            )
+            continuation_items = []
+            for item in getattr(operations, "continuation_coverage", []) or []:
+                fields = item.model_dump() if hasattr(item, "model_dump") else dict(item)
+                if fields.get("action") == "promote":
+                    requested = fields.get("work_item_page_id")
+                    target, ambiguous = self._normalize_page_id_reference(
+                        requested, page_id_assignments, page_id_map
+                    )
+                    if ambiguous or requested in invalid_reference_page_ids:
+                        from openviking.session.continuation_state import (
+                            ContinuationResolutionError,
+                        )
+
+                        raise ContinuationResolutionError(
+                            "Ambiguous or invalid work_item promotion target"
+                        )
+                    fields["work_item_page_id"] = target
+                continuation_items.append(fields)
+            deleted_uris = {file.uri for file in delete_file_contents}
+            try:
+                continuation_coverage = resolve_continuation_coverage(
+                    self._extract_context,
+                    continuation_items,
+                    work_item_operations=[
+                        operation
+                        for operation in upsert_operations
+                        if not any(uri in deleted_uris for uri in operation.uris)
+                    ],
+                    read_files=self.context_provider.read_file_contents,
+                    namespace=getattr(self.context_provider, "work_item_namespace", ""),
+                )
+            except ValueError as exc:
+                from openviking.session.continuation_state import ContinuationResolutionError
+
+                if any(entry.get("action") for entry in continuation_items):
+                    raise ContinuationResolutionError(str(exc)) from exc
+                raise
         resolved = ResolvedOperations(
             continuation_coverage=continuation_coverage,
             work_item_activations=activations,
@@ -1288,6 +1348,7 @@ class ExtractLoop:
 
         # Parse operations from content
         if content:
+            self._last_operation_content = content
             try:
                 # print(f'LLM response content: {content}')
                 logger.debug(f"[assistant]\n{content}")

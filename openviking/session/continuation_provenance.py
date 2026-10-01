@@ -6,6 +6,7 @@ from copy import deepcopy
 from typing import Any
 
 from openviking.message import Message, TextPart
+from openviking.session.work_items import continuation_content
 
 
 def prepare_continuation_provenance(
@@ -37,29 +38,16 @@ def prepare_continuation_provenance(
         identity = value.get("id")
         if not isinstance(identity, str) or not identity or identity in edges:
             raise ValueError("continuation outputs require unique nonempty message IDs")
-        sources = list(input_by_id) if compacted else [identity]
+        # Stateful repair keeps the same ID and therefore one direct edge per
+        # item. Changed IDs remain supported only for older merged snapshots.
+        sources = [identity] if identity in input_by_id else list(input_by_id) if compacted else []
         if not sources or any(source not in input_by_id for source in sources):
             raise ValueError("continuation output has no matching source input")
 
         message = Message.from_dict(value)
         if any(not isinstance(part, TextPart) for part in message.parts):
             raise ValueError("continuation checkpoint output must contain only text")
-        content = "\n".join(part.text for part in message.parts).rstrip()
-        known_refs = {
-            reference
-            for source in [value, *(input_by_id[source] for source in sources)]
-            if isinstance(reference := source.get("source_checkpoint_uri"), str) and reference
-        }
-        known_refs.add(checkpoint_uri)
-        # Only remove generated-looking final lines whose destination is known.
-        # In particular, references elsewhere in the summary remain untouched.
-        suffixes = {f"Source coverage: {reference}" for reference in known_refs}
-        while content:
-            head, separator, tail = content.rpartition("\n")
-            if tail not in suffixes:
-                break
-            content = head.rstrip() if separator else ""
-        content += ("\n" if content else "") + f"Source coverage: {checkpoint_uri}"
+        content = continuation_content(value)
 
         result = Message(
             id=identity,
@@ -69,6 +57,7 @@ def prepare_continuation_provenance(
             created_at=message.created_at,
         ).to_dict()
         result["source_checkpoint_uri"] = checkpoint_uri
+        result["continuation_state_version"] = 1
         hot.append(result)
         edges[identity] = sources
 

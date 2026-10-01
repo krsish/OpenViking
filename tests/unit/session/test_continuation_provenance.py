@@ -49,6 +49,7 @@ def test_large_legacy_source_lists_are_archived_without_growing_hot_state():
             "parts",
             "created_at",
             "source_checkpoint_uri",
+            "continuation_state_version",
         }
         assert set(hot[0]["parts"][0]) == {"type", "text"}
         sizes.append(len(json.dumps(hot)))
@@ -105,7 +106,8 @@ def test_replaces_known_generated_suffix_but_preserves_references_in_body():
         text=f"{body}\nSource coverage: {previous_uri}", source_checkpoint_uri=previous_uri
     )
     hot, _ = prepare_continuation_provenance([source], [source], next_archive, compacted=False)
-    assert Message.from_dict(hot[0]).content == (f"{body}\nSource coverage: {next_archive}/.done")
+    assert Message.from_dict(hot[0]).content == body
+    assert hot[0]["source_checkpoint_uri"] == f"{next_archive}/.done"
     # A second normalization does not append a duplicate current suffix.
     again, _ = prepare_continuation_provenance(hot, hot, next_archive, compacted=False)
     assert again == hot
@@ -115,7 +117,7 @@ def test_keeps_unknown_source_coverage_suffix_written_in_body():
     body = "Approval required.\nSource coverage: viking://user/u/resources/manual.md"
     source = checkpoint(text=body)
     hot, _ = prepare_continuation_provenance([source], [source], ARCHIVE, compacted=False)
-    assert Message.from_dict(hot[0]).content == f"{body}\nSource coverage: {ARCHIVE}/.done"
+    assert Message.from_dict(hot[0]).content == body
 
 
 def test_preserves_all_text_parts_and_forces_historical_assistant_role():
@@ -125,7 +127,7 @@ def test_preserves_all_text_parts_and_forces_historical_assistant_role():
     assert hot[0]["role"] == "assistant"
     assert hot[0]["message_kind"] == "checkpoint"
     assert Message.from_dict(hot[0]).content == (
-        f"Deployment requires approval.\nRun the tests first.\nSource coverage: {ARCHIVE}/.done"
+        "Deployment requires approval.\nRun the tests first."
     )
 
 
@@ -159,3 +161,28 @@ def test_empty_continuation_has_empty_provenance():
         "inputs": [],
         "outputs": {},
     }
+
+
+def test_stateful_repair_preserves_item_ids_and_individual_provenance():
+    inputs = [checkpoint("approval"), checkpoint("verification", "Rerun tests.")]
+    outputs = [checkpoint("approval", "Approval is still required."), inputs[1]]
+    hot, ledger = prepare_continuation_provenance(inputs, outputs, ARCHIVE, compacted=True)
+
+    assert [item["id"] for item in hot] == ["approval", "verification"]
+    assert ledger["outputs"] == {"approval": ["approval"], "verification": ["verification"]}
+    assert all(item["continuation_state_version"] == 1 for item in hot)
+    assert "Source coverage:" not in json.dumps([item["parts"] for item in hot])
+
+
+def test_legacy_labels_are_removed_from_hot_body_without_mutating_archive_snapshot():
+    source = checkpoint(
+        text=(
+            "Previous continuation summary (background, not new user evidence):\n"
+            "Previous continuation summary: Deployment requires approval.\n"
+            + f"Source coverage: {ARCHIVE}/.done"
+        ),
+        source_checkpoint_uri=f"{ARCHIVE}/.done",
+    )
+    hot, ledger = prepare_continuation_provenance([source], [source], ARCHIVE, compacted=False)
+    assert Message.from_dict(hot[0]).content == "Deployment requires approval."
+    assert "Previous continuation summary" in ledger["inputs"][0]["parts"][0]["text"]

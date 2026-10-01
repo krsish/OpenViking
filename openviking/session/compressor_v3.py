@@ -24,6 +24,9 @@ from uuid import uuid4
 from openviking.core.context import Context
 from openviking.message import Message
 from openviking.server.identity import RequestContext
+from openviking.session.continuation_state import (
+    confirm_continuation_promotions as _confirm_continuation_promotions,
+)
 from openviking.session.memory import ExtractLoop, MemoryUpdater, StreamingMemoryUpdaterConfig
 from openviking.session.memory.constants import (
     AGENT_EVOLUTION_MEMORY_TYPES,
@@ -435,6 +438,7 @@ class SessionCompressorV3:
         work_item_uris: Optional[List[str]] = None,
         work_item_replay: Optional[dict[str, Any]] = None,
         save_work_item_replay: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None,
+        continuation_background: Optional[List[Message]] = None,
     ):
         if not agent_evolution_enabled:
             effective_types = (
@@ -478,6 +482,7 @@ class SessionCompressorV3:
                 work_item_uris=work_item_uris,
                 work_item_replay=work_item_replay,
                 save_work_item_replay=save_work_item_replay,
+                continuation_background=continuation_background,
             )
             agent_memory_types = _allowed_agent_memory_types(allowed_memory_types)
             cases_allowed = (
@@ -688,6 +693,7 @@ class SessionCompressorV3:
         work_item_uris: Optional[List[str]] = None,
         work_item_replay: Optional[dict[str, Any]] = None,
         save_work_item_replay: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None,
+        continuation_background: Optional[List[Message]] = None,
     ) -> "_V3ExtractionResult":
         del user
         if not messages:
@@ -749,6 +755,7 @@ class SessionCompressorV3:
                 work_item_uris=work_item_uris,
                 work_item_replay=work_item_replay,
                 save_work_item_replay=save_work_item_replay,
+                continuation_background=continuation_background,
             ),
             return_exceptions=True,
         )
@@ -790,6 +797,7 @@ class SessionCompressorV3:
         work_item_uris: Optional[List[str]] = None,
         work_item_replay: Optional[dict[str, Any]] = None,
         save_work_item_replay: Optional[Callable[[dict[str, Any]], Awaitable[None]]] = None,
+        continuation_background: Optional[List[Message]] = None,
     ) -> "_V3ExtractionResult":
         if allowed_memory_types == set():
             return _V3ExtractionResult()
@@ -799,8 +807,26 @@ class SessionCompressorV3:
                 allowed_memory_types=allowed_memory_types,
             )
 
+        provider_messages = messages
+        background_snapshot = None
+        if allowed_memory_types and "work_item" in allowed_memory_types:
+            if work_item_replay is not None:
+                # Frozen ranges refer to the exact background visible when this
+                # plan was created. Legacy plans have no independent background.
+                if "continuation_background" in work_item_replay:
+                    background_snapshot = deepcopy(work_item_replay["continuation_background"])
+            elif continuation_background is not None:
+                background_snapshot = [value.to_dict() for value in continuation_background]
+            if background_snapshot is not None:
+                background = [Message.from_dict(value) for value in background_snapshot]
+                if any(value.message_kind != "checkpoint" for value in background):
+                    raise ValueError("continuation background requires checkpoint messages")
+                provider_messages = background + [
+                    value for value in messages if value.message_kind != "checkpoint"
+                ]
+
         context_provider = SessionExtractContextProvider(
-            messages=messages,
+            messages=provider_messages,
             latest_archive_overview=latest_archive_overview,
             isolation_handler=None,
             ctx=ctx,
@@ -839,7 +865,7 @@ class SessionCompressorV3:
         if work_item_replay is None or context_provider.get_memory_schemas(ctx):
             orchestrator = self._get_or_create_react(
                 ctx=ctx,
-                messages=messages,
+                messages=provider_messages,
                 latest_archive_overview=latest_archive_overview,
                 isolation_handler=isolation_handler,
                 transaction_handle=None,
@@ -868,7 +894,7 @@ class SessionCompressorV3:
                     compressor=self,
                     frozen=frozen,
                     conflict_uris=replay_state.conflicts,
-                    messages=messages,
+                    messages=provider_messages,
                     ctx=ctx,
                     registry=registry,
                     viking_fs=viking_fs,
@@ -934,6 +960,11 @@ class SessionCompressorV3:
                     "receipt_archive_uri": archive_uri,
                     "completed_uris": [],
                     "conflict_uris": [],
+                    **(
+                        {"continuation_background": background_snapshot}
+                        if background_snapshot is not None
+                        else {}
+                    ),
                 },
                 save_work_item_replay,
             )
@@ -979,7 +1010,9 @@ class SessionCompressorV3:
                 work_items=work_items,
                 work_item_coverage=coverage,
                 work_item_activations=_work_item_activation_receipts(activations, work_items),
-                continuation_coverage=getattr(operations, "continuation_coverage", []),
+                continuation_coverage=_confirm_continuation_promotions(
+                    getattr(operations, "continuation_coverage", []), coverage
+                ),
             )
 
         # Attach caller-provided custom scalar tags to event memories so they
@@ -998,7 +1031,7 @@ class SessionCompressorV3:
         update_result = await updater.submit(
             MemoryUpdateRequest(
                 operations=operations,
-                messages=list(messages),
+                messages=list(provider_messages),
                 ctx=ctx,
                 strict_extract_errors=strict_extract_errors,
                 memory_registry=registry,
@@ -1069,7 +1102,9 @@ class SessionCompressorV3:
         )
         return _V3ExtractionResult(
             contexts=contexts,
-            continuation_coverage=getattr(operations, "continuation_coverage", []),
+            continuation_coverage=_confirm_continuation_promotions(
+                getattr(operations, "continuation_coverage", []), work_item_coverage
+            ),
             work_items=work_items,
             work_item_coverage=work_item_coverage,
             work_item_activations=_work_item_activation_receipts(activations, work_items),

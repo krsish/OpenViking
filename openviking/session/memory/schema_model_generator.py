@@ -8,7 +8,7 @@ definitions, with discriminator support for polymorphic fields.
 """
 
 import re
-from typing import Annotated, Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple, Type, Union
 
 from pydantic import BaseModel, Field, WithJsonSchema, create_model, model_validator
 from pydantic.config import ConfigDict
@@ -76,15 +76,76 @@ class WorkItemActivation(BaseModel):
 
 
 class ContinuationCoverage(BaseModel):
-    """Account for continuation that does not belong to a work item."""
+    """Maintain stable continuation items outside canonical work items."""
 
-    ranges: str = Field(..., description="Complete current conversation source indices.")
+    action: Literal["", "create", "update", "keep", "resolve", "promote"] = Field(
+        default="",
+        description=(
+            "create a new item; update/keep an existing continuation_id; resolve with new "
+            "evidence; promote into a successfully saved work_item. Empty is legacy coverage."
+        ),
+    )
+    continuation_id: str = Field(
+        default="",
+        description=(
+            "Existing continuation item ID from the supplied background. Required for "
+            "update, keep, resolve and promote; omit for create. Never invent an ID."
+        ),
+    )
+    ranges: str = Field(
+        default="",
+        description=(
+            "Current conversation source indices supporting the action. Required except "
+            "for keep. Updates and resolutions must include new supporting evidence."
+        ),
+    )
     summary: str = Field(
         default="", description="Concise continuation state, including constraints."
     )
     reason: str = Field(
         default="", description="Why these messages have no remaining continuation."
     )
+    work_item_page_id: Optional[int] = Field(
+        default=None,
+        strict=True,
+        ge=0,
+        description=(
+            "For promote only: page_id of the already-read or newly created work_item "
+            "that preserves this item's state. The server confirms successful persistence."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_action(self):
+        # Keep legacy semantic checks in the resolver for archived plans and clients
+        # that still emit ranges plus summary/reason without an action.
+        if not self.action:
+            if self.continuation_id or self.work_item_page_id is not None:
+                raise ValueError("continuation_id and work_item_page_id require an explicit action")
+            return self
+        has_id = bool(self.continuation_id.strip())
+        has_summary = bool(self.summary.strip())
+        has_reason = bool(self.reason.strip())
+        if self.action == "create":
+            if has_id or not has_summary or has_reason:
+                raise ValueError("create requires summary and no continuation_id or reason")
+        else:
+            if not has_id:
+                raise ValueError(f"{self.action} requires continuation_id")
+            if self.action == "update" and (not has_summary or has_reason):
+                raise ValueError("update requires summary and no reason")
+            if self.action == "keep" and (has_summary or has_reason):
+                raise ValueError("keep preserves original content; omit summary and reason")
+            if self.action in {"resolve", "promote"} and (not has_reason or has_summary):
+                raise ValueError(f"{self.action} requires reason and no summary")
+        if self.action != "keep" and not self.ranges.strip():
+            raise ValueError(f"{self.action} requires supporting ranges")
+        if self.action == "promote":
+            if self.work_item_page_id is None:
+                raise ValueError("promote requires work_item_page_id")
+        elif self.work_item_page_id is not None:
+            raise ValueError("work_item_page_id is only allowed for promote")
+        return self
 
 
 class SchemaModelGenerator:

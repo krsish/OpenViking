@@ -18,8 +18,12 @@ description: |
   Account for this conversation's continuation information: update/create the relevant
   work_item when its state changes. Do not create a task solely to hold non-task continuation.
   For continuation not fully accounted for by a work_item, use sdk.continuation in Python or
-  continuation_coverage in JSON: ranges plus either a concise continuation summary or an
-  explicit reason that nothing remains to continue. Preserve unresolved questions,
+  continuation_coverage in JSON. Maintain stable continuation items: use each supplied
+  continuation_id with action keep (no content change), update (complete latest summary),
+  resolve (new evidence and reason), or promote (specific work_item and reason). Use action
+  create with summary only for a genuinely new matter; the server assigns its ID. Supply
+  supporting conversation ranges except for keep. Never recreate the previous items as a
+  new round-by-round summary. Preserve unresolved questions,
   constraints and commitments even when another memory stores related facts. Keep all
   continuation within the configured token budget given in the output contract, including
   previous continuation and formatting. Partial tool previews may be attributed
@@ -30,9 +34,18 @@ description: |
   verification and its reference. Original tool results remain in the session archive.
   New original messages not selected for work_items or continuation are archive_only:
   their complete original text stays in storage without being copied into working memory.
-  Previous continuation summaries are background, not new user evidence, and remain active
-  by default. Carry forward still-relevant details; update, merge, resolve, or transfer them
-  to a specific work_item only with supporting evidence. Omission does not resolve them.
+  Previous continuation items are background, not new user evidence, and remain active
+  by default under the same ID. Omission does not resolve them. Keep unchanged items without
+  rewriting; update only with supporting new evidence and preserve all still-valid details.
+  Progress, completed substeps, new phases and changed next actions within the same matter
+  are updates under the same ID while any follow-up remains. Never resolve an old item and
+  create a new item merely to express its progress. Resolve only when evidence settles every
+  pending part and no continuation of the same matter remains. Promote only after updating or
+  creating a work_item that preserves the complete item, with ranges including every
+  source index of the old continuation (including all chunks) and the new evidence.
+  Reading or activating the work_item alone cannot transfer the item. Reference it as
+  work_item=the_binding in Python, or
+  work_item_page_id in JSON. The server confirms its successful persistence before removal.
   A request to resume existing work needs an activation even if no state changed: select
   that already-read item with activate(ranges=...) in Python, or work_item_activations
   in JSON. Match the current request to its goal and scope, not its title alone. Candidate

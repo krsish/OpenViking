@@ -87,7 +87,8 @@ async def test_compaction_failure_publishes_bounded_checkpoint_with_complete_ove
     assert overflow["version"] == 1
     assert not overflow.get("previous_pending_continuation_uri")
     assert overflow["entries"] == compactor.call_args.args[0]
-    assert summary in wi.residual_text(overflow["entries"])
+    assert summary.strip() in wi.residual_text(overflow["entries"])
+    assert overflow["entries"][0]["parts"][0]["text"] == summary
     assert overflow["reason"]
     # No entry fits by itself. Publish the recovery instruction, never a sliced
     # prefix that could silently remove the deployment constraint.

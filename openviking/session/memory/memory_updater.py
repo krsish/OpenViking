@@ -268,6 +268,8 @@ class ExtractContext:
                 peer_id=getattr(message, "peer_id", None),
                 parts=[TextPart(chunk)],
                 created_at=message.created_at,
+                message_kind=message.message_kind,
+                source_message_ids=message.source_message_ids,
             )
             chunk_messages.append(
                 (
