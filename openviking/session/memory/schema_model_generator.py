@@ -183,7 +183,7 @@ class SchemaModelGenerator:
         )
 
         identity_field_names = set(memory_type.identity_fields(include_peer_id=False))
-        server_fields = {"work_item_id"} if memory_type.memory_type == "work_item" else set()
+        server_fields = memory_type.server_assigned_fields()
         required_on_create = [
             field.name
             for field in memory_type.fields

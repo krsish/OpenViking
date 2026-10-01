@@ -212,11 +212,18 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             ", ".join(_identifier_alias(name) for name in identity_fields)
             or "target scope (fixed to self)"
         )
-        lines = [
-            f"- sdk.{verb}_{type_alias}(*, {signature})",
-            f"  - Identity fields (primary key): {identity_label}. Calls with identical "
-            "identity field values address the same memory object.",
-        ]
+        lines = [f"- sdk.{verb}_{type_alias}(*, {signature})"]
+        if schema.server_assigned_fields().intersection(schema.identity_fields()):
+            lines.append(
+                "  - Identity is assigned by the server when creating a new memory. "
+                "Each create call creates a distinct object. To update an existing memory, "
+                "use its supplied existing-object variable."
+            )
+        else:
+            lines.append(
+                f"  - Identity fields (primary key): {identity_label}. Calls with identical "
+                "identity field values address the same memory object."
+            )
         operation_field = context.operations_model.model_fields.get(schema.memory_type)
         schema_description = getattr(operation_field, "description", None)
         if schema_description:
@@ -968,7 +975,12 @@ class _PythonProgramCompiler:
                     f"field edits (obj.field.edit/drop) cannot be used when {action} a memory; "
                     "pass the complete field value",
                 )
-            missing_fields = [field.name for field in schema.fields if field.name not in kwargs]
+            server_fields = schema.server_assigned_fields()
+            missing_fields = [
+                field.name
+                for field in schema.fields
+                if field.name not in server_fields and field.name not in kwargs
+            ]
             if missing_fields:
                 self._error(
                     node,
@@ -1619,9 +1631,11 @@ def _field_type_name(field_type: FieldType) -> str:
 def _protocol_fields(
     context: ExtractionOutputContext, schema: MemoryTypeSchema
 ) -> list[tuple[str, str, str]]:
+    server_fields = schema.server_assigned_fields()
     static_fields = [
         (field.name, _field_type_name(field.field_type), field.description)
         for field in schema.fields
+        if field.name not in server_fields
     ]
     static_names = {name for name, _type, _description in static_fields}
     operations_field = context.operations_model.model_fields.get(schema.memory_type)
@@ -1630,7 +1644,7 @@ def _protocol_fields(
     dynamic_fields = getattr(model_type, "model_fields", {})
     extras = []
     for name, model_field in dynamic_fields.items():
-        if name == "page_id" or name in static_names:
+        if name == "page_id" or name in static_names or name in server_fields:
             continue
         # Non-identifier field names are aliased on the DSL surface (see
         # _identifier_alias), so they need not be valid Python identifiers here.

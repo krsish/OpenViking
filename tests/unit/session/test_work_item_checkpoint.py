@@ -507,7 +507,7 @@ async def test_failed_raw_residual_recovers_on_next_archive_without_rewriting_co
 
 
 @pytest.mark.asyncio
-async def test_continuation_budget_repair_retries_without_repeating_canonical_extraction(
+async def test_continuation_publication_retries_without_repeating_canonical_extraction(
     monkeypatch,
 ):
     from copy import deepcopy
@@ -527,14 +527,9 @@ async def test_continuation_budget_repair_retries_without_repeating_canonical_ex
         }
     )
     tracker = wire_work_item_phase2(monkeypatch, session, extractor)
-    attempts = 0
 
     async def repair(residual, token_budget):
-        nonlocal attempts
-        attempts += 1
         assert estimate_text_tokens(wi.residual_text(residual)) > token_budget
-        if attempts == 1:
-            raise RuntimeError("continuation compactor temporarily failed")
         repaired = deepcopy(residual)
         repaired[0]["parts"] = [
             {
@@ -546,6 +541,18 @@ async def test_continuation_budget_repair_retries_without_repeating_canonical_ex
 
     compactor = AsyncMock(side_effect=repair)
     monkeypatch.setattr(session, "_compact_work_item_continuation", compactor)
+    write = fs.write_file
+    provenance_attempts = 0
+
+    async def fail_first_provenance_write(uri, content, ctx=None, **kwargs):
+        nonlocal provenance_attempts
+        if uri.endswith("/continuation-provenance.json"):
+            provenance_attempts += 1
+            if provenance_attempts == 1:
+                raise OSError("continuation provenance storage temporarily failed")
+        return await write(uri, content, ctx=ctx, **kwargs)
+
+    monkeypatch.setattr(fs, "write_file", fail_first_provenance_write)
     policy = {"working_memory": {"mode": "work_item"}, "memory_types": ["work_item"]}
     await session._run_memory_extraction(
         "first-attempt", uri, [source], source.id, source.id, policy
@@ -590,10 +597,15 @@ async def test_legacy_raw_continuation_migrates_once_and_reuses_persisted_repair
 
     compactor.assert_awaited_once()
     assert compactor.call_args.args[0] == [old.to_dict()]
-    assert first["residual"] == second["residual"] == [migrated]
+    assert first["residual"] == second["residual"]
+    assert first["residual"][0]["id"] == migrated["id"]
     assert migrated["message_kind"] == "checkpoint"
     assert migrated["id"] != old.id
-    assert migrated["source_message_ids"] == [old.id]
+    assert not first["residual"][0].get("source_message_ids")
+    assert not first["residual"][0].get("source_continuation_ids")
+    provenance = json.loads(fs.files[first["continuation_provenance_uri"]])
+    assert provenance["outputs"][migrated["id"]] == [old.id]
+    assert provenance["inputs"] == [old.to_dict()]
     assert "Do not deploy until approval" in fs.files[f"{uri}/.overview.md"]
     assert fs.files[f"{old_uri}/.done"] == previous_done
     assert fs.files[f"{old_uri}/messages.jsonl"] == old.to_jsonl()

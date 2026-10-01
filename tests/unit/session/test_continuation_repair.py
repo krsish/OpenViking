@@ -34,10 +34,70 @@ async def test_repair_keeps_source_identity_as_historical_assistant_state():
     assert result[0]["role"] == "assistant"
     assert result[0]["message_kind"] == "checkpoint"
     assert result[0]["id"] not in ["m1", "m2", source[0]["id"]]
-    assert result[0]["source_message_ids"] == ["m1", "m2"]
+    assert not result[0].get("source_message_ids")
+    assert result[0]["created_at"] == source[0]["created_at"]
     assert summary in residual_text(result)
     assert estimate_text_tokens(residual_text(result)) <= 200
     assert "Do not deploy without approval" in vlm.get_completion_async.call_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_repeated_repair_does_not_accumulate_source_ids_in_model_input():
+    summary = "Do not deploy without approval."
+    vlm = SimpleNamespace(
+        get_completion_async=AsyncMock(return_value=json.dumps({"summary": summary}))
+    )
+    residual = previous()
+    prompts = []
+    identities = []
+    for step in range(3):
+        residual[0]["source_message_ids"] = [
+            f"historical-message-{i:05}" for i in range((step + 1) * 1000)
+        ]
+        residual[0]["internal_metadata"] = {"never_send_this": "x" * 10000}
+        residual[0]["parts"][0]["internal_metadata"] = "never_send_this"
+        residual = await compact_continuation(vlm, residual, 200)
+        prompt = vlm.get_completion_async.call_args.args[0]
+        prompts.append(prompt)
+        identities.append(residual[0]["id"])
+        assert "source_message_ids" not in prompt
+        assert "historical-message-" not in prompt
+        assert "never_send_this" not in prompt
+        assert not residual[0].get("source_message_ids")
+        assert '"role": "assistant"' in prompt
+        assert "2026-10-01T00:00:00Z" in prompt
+    assert prompts[1] == prompts[2]
+    assert identities[1] == identities[2]
+    assert max(map(len, prompts)) < 2000
+
+
+@pytest.mark.asyncio
+async def test_repair_preserves_all_legacy_message_content_and_reference_fields():
+    vlm = SimpleNamespace(get_completion_async=AsyncMock(return_value='{"summary":"Fix X."}'))
+    residual = [
+        {
+            "id": "old-raw",
+            "role": "user",
+            "created_at": "2026-10-01T00:00:00Z",
+            "parts": [
+                {"type": "text", "text": "Only deploy after approval."},
+                {"type": "text", "text": "Also rerun the failing test."},
+                {
+                    "type": "tool",
+                    "tool_name": "pytest",
+                    "tool_output": "X failed",
+                    "tool_output_ref": "tool-output.txt",
+                },
+            ],
+        }
+    ]
+    await compact_continuation(vlm, residual, 200)
+    prompt = vlm.get_completion_async.call_args.args[0]
+    assert "Only deploy after approval." in prompt
+    assert "Also rerun the failing test." in prompt
+    assert "X failed" in prompt
+    assert "tool-output.txt" in prompt
+    assert '"role": "user"' in prompt
 
 
 @pytest.mark.asyncio
@@ -78,6 +138,7 @@ async def test_session_repair_reserves_source_reference_before_candidate_retry(m
     from openviking.session import work_items as wi
     from openviking.session.session import Session
     from openviking.session.work_item_budget import WorkItemBudgets
+    from tests.unit.session.test_work_item_checkpoint import MemoryFS
 
     archive_uri = "viking://user/default/sessions/work-items/history/archive_002"
     first_response = json.dumps({"summary": "a" * 275})
@@ -93,6 +154,8 @@ async def test_session_repair_reserves_source_reference_before_candidate_retry(m
         )
     )
     owner = SimpleNamespace(
+        _viking_fs=MemoryFS(),
+        ctx=None,
         _merge_archive_meta=AsyncMock(),
         _compact_work_item_continuation=lambda residual, budget: compact_continuation(
             vlm, residual, budget
@@ -125,6 +188,7 @@ async def test_legacy_summary_migration_and_next_update_keep_both_original_archi
     from openviking.message import Message, TextPart
     from openviking.session import work_items as wi
     from openviking.session.session import Session
+    from tests.unit.session.test_work_item_checkpoint import MemoryFS
 
     session_uri = "viking://user/u/sessions/s"
     first_archive = f"{session_uri}/history/archive_001"
@@ -163,13 +227,13 @@ async def test_legacy_summary_migration_and_next_update_keep_both_original_archi
         _archives=SimpleNamespace(read_meta=AsyncMock(return_value={})),
         _work_item_source_archives=AsyncMock(return_value={legacy.id: first_archive}),
         _merge_archive_meta=AsyncMock(),
-        _viking_fs=SimpleNamespace(write_file=AsyncMock()),
+        _viking_fs=MemoryFS(),
         _compact_work_item_continuation=lambda residual, budget: compact_continuation(
             vlm, residual, budget
         ),
     )
-    owner._prepare_work_item_continuation = lambda uri, residual, meta: (
-        Session._prepare_work_item_continuation(owner, uri, residual, meta)
+    owner._prepare_work_item_continuation = lambda uri, residual, meta, **kwargs: (
+        Session._prepare_work_item_continuation(owner, uri, residual, meta, **kwargs)
     )
     migrated = await Session._prepare_work_item_checkpoint(
         owner, current_archive, [legacy], previous_checkpoint
@@ -178,7 +242,11 @@ async def test_legacy_summary_migration_and_next_update_keep_both_original_archi
     assert old_archive not in residual_text([value]), (
         "recovery must not depend on the model repeating an old URI"
     )
-    assert value["source_continuation_ids"] == [legacy.id]
+    assert not value.get("source_continuation_ids")
+    assert not value.get("source_message_ids")
+    provenance = json.loads(owner._viking_fs.files[migrated["continuation_provenance_uri"]])
+    assert provenance["outputs"][value["id"]] == [legacy.id]
+    assert provenance["inputs"] == previous_checkpoint["residual"]
     assert value["source_checkpoint_uri"] == f"{current_archive}/.done"
     assert migrated["coverage"][0]["archive_uri"] == f"{first_archive}/messages.jsonl"
     assert migrated["coverage"][0]["source_checkpoint_uri"] == f"{old_archive}/.done"
@@ -213,3 +281,79 @@ async def test_legacy_summary_migration_and_next_update_keep_both_original_archi
         f"{first_archive}/messages.jsonl",
         f"{old_archive}/messages.jsonl",
     }
+
+
+@pytest.mark.asyncio
+async def test_below_budget_legacy_sources_move_to_ledger_without_model_and_stay_out_of_cache(
+    monkeypatch,
+):
+    from tests.unit.session.test_work_item_checkpoint import archive, message, session_with_fs
+
+    session, fs = session_with_fs()
+    uri = archive(fs, 1, [message("new")])
+    residual = previous()
+    source_ids = [f"old-source-{index}" for index in range(1000)]
+    residual[0]["source_message_ids"] = source_ids
+    residual[0]["source_continuation_ids"] = [f"old-summary-{index}" for index in range(1000)]
+    compactor = AsyncMock(side_effect=AssertionError("The summary already fits"))
+    monkeypatch.setattr(session, "_compact_work_item_continuation", compactor)
+    meta = {}
+
+    result = await session._prepare_work_item_continuation(uri, residual, meta)
+    cached = await session._prepare_work_item_continuation(uri, residual, meta)
+
+    compactor.assert_not_awaited()
+    assert cached == result
+    assert result[0]["id"] == residual[0]["id"]
+    assert not result[0].get("source_message_ids")
+    assert not result[0].get("source_continuation_ids")
+    assert "old-source-999" not in json.dumps(meta["continuation_projection"])
+    ledger = json.loads(fs.files[f"{uri}/continuation-provenance.json"])
+    assert ledger["inputs"] == residual
+    assert ledger["inputs"][0]["source_message_ids"] == source_ids
+    assert ledger["outputs"][result[0]["id"]] == [residual[0]["id"]]
+
+
+@pytest.mark.asyncio
+async def test_ready_legacy_cache_migrates_source_ids_without_repeating_successful_compaction(
+    monkeypatch,
+):
+    import hashlib
+
+    from tests.unit.session.test_work_item_checkpoint import archive, message, session_with_fs
+
+    session, fs = session_with_fs()
+    uri = archive(fs, 1, [message("new")])
+    residual = previous()
+    residual[0]["parts"][0]["text"] = "Unresolved deployment constraint. " * 10000
+    candidate = previous()
+    candidate[0]["id"] = "already-compacted"
+    candidate[0]["source_message_ids"] = [f"old-source-{index}" for index in range(1000)]
+    residual[0]["source_message_ids"] = candidate[0]["source_message_ids"]
+    candidate[0]["source_continuation_ids"] = [residual[0]["id"]]
+    old_hash = hashlib.sha256(
+        json.dumps([residual, 10000], sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()
+    meta = {
+        "continuation_projection": {
+            "status": "ready",
+            "input_hash": old_hash,
+            "residual": candidate,
+        }
+    }
+    compactor = AsyncMock(side_effect=AssertionError("The cached model result must be reused"))
+    monkeypatch.setattr(session, "_compact_work_item_continuation", compactor)
+
+    result = await session._prepare_work_item_continuation(uri, residual, meta)
+    reused = await session._prepare_work_item_continuation(uri, residual, meta)
+
+    compactor.assert_not_awaited()
+    assert reused == result
+    assert result[0]["id"] == "already-compacted"
+    assert not result[0].get("source_message_ids")
+    assert not result[0].get("source_continuation_ids")
+    assert "Do not deploy without approval" in residual_text(result)
+    assert meta["continuation_projection"]["provenance_version"] == 1
+    ledger = json.loads(fs.files[f"{uri}/continuation-provenance.json"])
+    assert ledger["inputs"] == residual
+    assert ledger["outputs"][result[0]["id"]] == [residual[0]["id"]]

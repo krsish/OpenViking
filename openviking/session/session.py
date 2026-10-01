@@ -39,6 +39,11 @@ from openviking.session.checkpoints import (
 from openviking.session.checkpoints import (
     CheckpointRequest as _CheckpointRequest,
 )
+from openviking.session.continuation_overflow import (
+    continuation_recovery_notice,
+    select_continuation_fallback,
+)
+from openviking.session.continuation_provenance import prepare_continuation_provenance
 from openviking.session.extraction_batch import (
     ExtractionBatchLimits,
     ExtractionMessageBatch,
@@ -2695,11 +2700,19 @@ class Session:
         )
         # This stage is independently repeatable after canonical writes finish.
         # It never replays those writes or the frozen extraction plan.
-        residual = await self._prepare_work_item_continuation(archive_uri, residual, meta)
-        repaired_tokens = estimate_text_tokens(wi.residual_text(residual))
+        residual = await self._prepare_work_item_continuation(
+            archive_uri,
+            residual,
+            meta,
+            pending_continuation_uri=previous.get("pending_continuation_uri"),
+        )
+        pending_uri = meta.get("continuation_projection", {}).get("pending_continuation_uri")
+        repaired_tokens = estimate_text_tokens(wi.residual_text(residual, pending_uri))
         if repaired_tokens != residual_tokens:
             await self._merge_archive_meta(archive_uri, {"residual_tokens": repaired_tokens})
-        overview, active = wi.build_projection(items, residual)
+        overview, active = wi.build_projection(
+            items, residual, pending_continuation_uri=pending_uri
+        )
         active_uris = {item["uri"] for item in active}
         cold = [
             item
@@ -2736,7 +2749,10 @@ class Session:
         return {
             "mode": wi.WORK_ITEM_MODE,
             "version": 1,
-            "continuation_version": 2,
+            "continuation_version": 3,
+            "continuation_provenance_uri": f"{archive_uri}/continuation-provenance.json",
+            "pending_continuation_uri": pending_uri,
+            "continuation_degraded": bool(pending_uri),
             "archive_id": archive_uri.rsplit("/", 1)[-1],
             "compact_ready": True,
             "work_items": [
@@ -2771,9 +2787,14 @@ class Session:
         return sources
 
     async def _prepare_work_item_continuation(
-        self, archive_uri: str, residual: List[Dict[str, Any]], meta: Dict[str, Any]
+        self,
+        archive_uri: str,
+        residual: List[Dict[str, Any]],
+        meta: Dict[str, Any],
+        *,
+        pending_continuation_uri: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Migrate legacy raw carry and repair oversized summaries independently."""
+        """Bound hot state, preserving complete provenance and overflow in storage."""
         budgets = wi.get_work_item_budgets()
         # Reserve the fixed projection wrapper even when the caller configures
         # an overall budget smaller than the continuation allowance.
@@ -2782,22 +2803,30 @@ class Session:
             budgets.continuation_token_budget,
             budgets.projection_token_budget - estimate_text_tokens(wrapper) - 8,
         )
-        needs_migration = any(value.get("message_kind") != "checkpoint" for value in residual)
-        if not needs_migration and estimate_text_tokens(wi.residual_text(residual)) <= limit:
-            return residual
         if limit <= 0:
             raise ValueError("work_item projection has no room for continuation")
         fingerprint = hashlib.sha256(
-            json.dumps([residual, limit], sort_keys=True, ensure_ascii=False).encode()
+            json.dumps(
+                [residual, limit, pending_continuation_uri, 3],
+                sort_keys=True,
+                ensure_ascii=False,
+            ).encode()
         ).hexdigest()
         cached = meta.get("continuation_projection", {})
         if cached.get("input_hash") == fingerprint and cached.get("status") == "ready":
             result = cached.get("residual")
             if (
                 isinstance(result, list)
-                and result
                 and all(value.get("message_kind") == "checkpoint" for value in result)
-                and estimate_text_tokens(wi.residual_text(result)) <= limit
+                and cached.get("provenance_version") == 1
+                and not any(
+                    value.get("source_message_ids") or value.get("source_continuation_ids")
+                    for value in result
+                )
+                and estimate_text_tokens(
+                    wi.residual_text(result, cached.get("pending_continuation_uri"))
+                )
+                <= limit
             ):
                 return result
         await self._merge_archive_meta(
@@ -2806,30 +2835,124 @@ class Session:
                 "continuation_projection": {"status": "pending", "input_hash": fingerprint},
             },
         )
-        # The model candidate is rendered before we attach the publication URI.
-        # Reserve that mandatory suffix so a near-limit candidate participates
-        # in the compactor's shrinking retries instead of failing forever here.
-        repair_limit = limit - estimate_text_tokens(f"\nSource coverage: {archive_uri}/.done")
-        if repair_limit <= 0:
-            raise ValueError("work_item continuation budget cannot fit its source reference")
-        result = await self._compact_work_item_continuation(residual, repair_limit)
-        if not result or any(value.get("message_kind") != "checkpoint" for value in result):
-            raise ValueError("continuation repair returned no valid continuation state")
-        for value in result:
-            value["source_checkpoint_uri"] = f"{archive_uri}/.done"
-            value["source_continuation_ids"] = [source["id"] for source in residual]
-        # A model or adapter must never bypass the actual rendered budget check.
-        wi.build_projection([], result, residual_token_budget=limit)
-        await self._merge_archive_meta(
-            archive_uri,
-            {
-                "continuation_projection": {
-                    "status": "ready",
-                    "input_hash": fingerprint,
-                    "residual": result,
-                },
-            },
+        # Normalization also runs below the body budget and on legacy caches:
+        # provenance must not accumulate in an otherwise short hot summary.
+        checkpoint_inputs = [
+            value for value in residual if value.get("message_kind") == "checkpoint"
+        ]
+        normalized, ledger = prepare_continuation_provenance(
+            residual, checkpoint_inputs, archive_uri, compacted=False
         )
+        needs_repair = (
+            len(checkpoint_inputs) != len(residual)
+            or estimate_text_tokens(wi.residual_text(normalized, pending_continuation_uri)) > limit
+        )
+        result = normalized
+        mode = "unchanged"
+        repair_error = None
+        legacy_fingerprint = hashlib.sha256(
+            json.dumps([residual, limit], sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest()
+        if (
+            cached.get("status") == "ready"
+            and cached.get("input_hash") == legacy_fingerprint
+            and isinstance(cached.get("residual"), list)
+            and cached["residual"]
+        ):
+            # Reuse an already-durable v2 summary while moving its large source
+            # lists to the ledger. Metadata migration does not need another LLM.
+            try:
+                migrated, migrated_ledger = prepare_continuation_provenance(
+                    residual, cached["residual"], archive_uri, compacted=True
+                )
+                wi.build_projection(
+                    [],
+                    migrated,
+                    residual_token_budget=limit,
+                    pending_continuation_uri=pending_continuation_uri,
+                )
+            except ValueError:
+                pass
+            else:
+                result, ledger = migrated, migrated_ledger
+                mode = "compacted"
+                needs_repair = False
+        if needs_repair:
+            try:
+                # Reserve mandatory references and any inherited recovery notice.
+                overhead = f"\nSource coverage: {archive_uri}/.done"
+                if pending_continuation_uri:
+                    overhead += "\n\n" + continuation_recovery_notice(pending_continuation_uri)
+                repair_limit = limit - estimate_text_tokens(overhead) - 4
+                if repair_limit <= 0:
+                    raise ValueError("continuation budget cannot fit its source reference")
+                candidate = await self._compact_work_item_continuation(residual, repair_limit)
+                if not candidate or any(
+                    value.get("message_kind") != "checkpoint" for value in candidate
+                ):
+                    raise ValueError("continuation repair returned no valid continuation state")
+                result, ledger = prepare_continuation_provenance(
+                    residual, candidate, archive_uri, compacted=True
+                )
+                wi.build_projection(
+                    [],
+                    result,
+                    residual_token_budget=limit,
+                    pending_continuation_uri=pending_continuation_uri,
+                )
+                mode = "compacted"
+            except Exception as exc:
+                # Preserve complete entries before allowing a reduced hot view.
+                # Storage failures remain failures; they never authorize loss.
+                repair_error = str(exc)[:1000]
+                overflow_uri = f"{archive_uri}/continuation-overflow.json"
+                if pending_continuation_uri == overflow_uri:
+                    raise ValueError("continuation overflow cannot reference itself") from exc
+                result, _omitted = select_continuation_fallback(normalized, limit, overflow_uri)
+                await self._viking_fs.write_file(
+                    overflow_uri,
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "previous_pending_continuation_uri": pending_continuation_uri,
+                            "entries": residual,
+                            "reason": repair_error,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    ctx=self.ctx,
+                )
+                pending_continuation_uri = overflow_uri
+                result, ledger = prepare_continuation_provenance(
+                    residual, result, archive_uri, compacted=False
+                )
+                mode = "fallback"
+        # This pointer is independent of model classifications. Reading an
+        # archive or omitting its reminder is not proof its constraints resolved.
+        wi.build_projection(
+            [],
+            result,
+            residual_token_budget=limit,
+            pending_continuation_uri=pending_continuation_uri,
+        )
+        await self._viking_fs.write_file(
+            f"{archive_uri}/continuation-provenance.json",
+            json.dumps(ledger, ensure_ascii=False),
+            ctx=self.ctx,
+        )
+        updates = {
+            "continuation_projection": {
+                "status": "ready",
+                "mode": mode,
+                "provenance_version": 1,
+                "input_hash": fingerprint,
+                "residual": result,
+                "pending_continuation_uri": pending_continuation_uri,
+                "repair_error": repair_error,
+            }
+        }
+        await self._merge_archive_meta(archive_uri, updates)
+        meta.update(updates)
         return result
 
     async def _compact_work_item_continuation(
@@ -2858,7 +2981,11 @@ class Session:
                     raise
                 # An explicitly removed memory must not reappear from a cached
                 # archive snapshot. The original archive remains auditable.
-        overview, active = wi.build_projection(items, checkpoint.get("residual", []))
+        overview, active = wi.build_projection(
+            items,
+            checkpoint.get("residual", []),
+            pending_continuation_uri=checkpoint.get("pending_continuation_uri"),
+        )
         active_uris = {item["uri"] for item in active}
         for item in items:
             if (

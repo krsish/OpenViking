@@ -254,6 +254,10 @@ class MemoryTypeSchema(BaseModel):
     def filename_has_variables(self):
         return "{{" in self.filename_template and "}}" in self.filename_template
 
+    def server_assigned_fields(self) -> frozenset[str]:
+        """Fields supplied by the resolver, never required from extraction output."""
+        return frozenset({"work_item_id"}) if self.memory_type == "work_item" else frozenset()
+
     def identity_fields(self, *, include_peer_id: bool = True) -> tuple[str, ...]:
         """Return fields whose values determine the memory object's URI identity."""
         identity = ["peer_id"] if include_peer_id and self.peer_enabled else []

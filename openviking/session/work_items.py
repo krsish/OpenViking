@@ -12,6 +12,7 @@ import json
 from typing import Any
 
 from openviking.message import Message, TextPart
+from openviking.session.continuation_overflow import continuation_recovery_notice
 from openviking.session.memory.utils.memory_file_utils import (
     MemoryFileUtils,
     memory_version_from_fields,
@@ -39,9 +40,12 @@ def ready_checkpoint(done: dict[str, Any], archive_id: str) -> bool:
     )
 
 
-def residual_text(messages: list[dict[str, Any]]) -> str:
+def residual_text(
+    messages: list[dict[str, Any]], pending_continuation_uri: str | None = None
+) -> str:
     if not messages:
-        return ""
+        notice = continuation_recovery_notice(pending_continuation_uri)
+        return "## Continuation\n" + notice if notice else ""
     parts = []
     for message in messages:
         if message.get("message_kind") != "checkpoint":
@@ -52,6 +56,9 @@ def residual_text(messages: list[dict[str, Any]]) -> str:
         if source and source not in content:
             content += f"\nSource coverage: {source}"
         parts.append(content)
+    notice = continuation_recovery_notice(pending_continuation_uri)
+    if notice:
+        parts.append(notice)
     return "## Continuation\n" + "\n\n".join(parts)
 
 
@@ -95,6 +102,7 @@ def build_projection(
     token_budget: int | None = None,
     *,
     residual_token_budget: int | None = None,
+    pending_continuation_uri: str | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Pack whole item blocks in priority order; never truncate constraints."""
     budgets = get_work_item_budgets()
@@ -102,7 +110,7 @@ def build_projection(
         token_budget = budgets.projection_token_budget
     if residual_token_budget is None:
         residual_token_budget = budgets.continuation_token_budget
-    remaining = residual_text(residual)
+    remaining = residual_text(residual, pending_continuation_uri)
     residual_tokens = estimate_text_tokens(remaining)
     if residual_tokens > residual_token_budget:
         identities = [message.get("id") for message in residual]
@@ -156,6 +164,9 @@ def coverage_report(
     The session owner, not this pure function, verifies extraction completion.
     """
     previous = {value["id"]: value for value in previous_residual or []}
+    previous_order = {identity: index for index, identity in enumerate(previous)}
+    message_order = {message.id: index for index, message in enumerate(messages)}
+    recency: dict[str, tuple[int, int]] = {}
     source_archives = source_archives or {}
     destinations: dict[str, list[str]] = {}
     for operation in operations:
@@ -188,13 +199,18 @@ def coverage_report(
             entry = classifications[message.id]
             if entry.get("summary"):
                 if id(entry) not in emitted_summaries:
-                    residual.append(
-                        continuation_message(
-                            entry["summary"],
-                            archive_uri,
-                            entry["source_message_ids"],
-                            message.created_at,
-                        )
+                    summary = continuation_message(
+                        entry["summary"],
+                        archive_uri,
+                        entry["source_message_ids"],
+                        message.created_at,
+                    )
+                    residual.append(summary)
+                    recency[summary["id"]] = (
+                        1,
+                        max(
+                            message_order.get(source, -1) for source in entry["source_message_ids"]
+                        ),
                     )
                     emitted_summaries.add(id(entry))
                 row.update(
@@ -229,6 +245,12 @@ def coverage_report(
                 or previous_checkpoint_uri,
             }
         )
+    # Fallback retains the newest whole entries. A merged summary's recency is
+    # its latest source, not the first source at which it happened to be emitted;
+    # untouched previous state stays older even if absent from this transcript.
+    residual.sort(
+        key=lambda value: recency.get(value["id"], (0, previous_order.get(value["id"], -1)))
+    )
     return residual, report
 
 

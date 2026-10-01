@@ -362,6 +362,73 @@ def test_shared_summary_is_emitted_once_and_all_source_ids_remain_auditable():
     assert restored[0].role == "assistant"
 
 
+def test_omitted_previous_continuations_sort_before_new_transcript_summaries():
+    previous = [
+        wi.continuation_message("First old pending action.", ARCHIVE, ["old-1"], CREATED_AT),
+        wi.continuation_message("Second old pending action.", ARCHIVE, ["old-2"], CREATED_AT),
+    ]
+    new_message = message("new", "Verify the newest fix before continuing.")
+    classified = [
+        {
+            "source_message_ids": [new_message.id],
+            "summary": "Verify the newest fix before continuing.",
+            "reason": "",
+        }
+    ]
+
+    residual, ledger = wi.coverage_report(
+        [new_message],
+        [],
+        ARCHIVE + "-next",
+        classified,
+        previous_residual=previous,
+    )
+
+    assert residual[:2] == previous
+    assert len(residual) == 3
+    assert "Verify the newest fix" in Message.from_dict(residual[-1]).content
+    assert {row["message_id"] for row in ledger} == {
+        new_message.id,
+        previous[0]["id"],
+        previous[1]["id"],
+    }
+
+
+def test_combined_summary_recency_uses_latest_source_not_first_emission_position():
+    previous = [wi.continuation_message(CONSTRAINT, ARCHIVE, ["old"], CREATED_AT)]
+    inherited = Message.from_dict(previous[0])
+    middle = message("middle", "Run the invoice parser tests.")
+    latest = message("latest", "Approval is still pending; include the attachment too.")
+    # The combined entry is encountered at the inherited checkpoint first. Its
+    # newest evidence nevertheless comes after the independent test reminder.
+    classified = [
+        {
+            "source_message_ids": [inherited.id, latest.id],
+            "summary": "Approval is still pending; preserve the attachment.",
+            "reason": "",
+        },
+        {
+            "source_message_ids": [middle.id],
+            "summary": "Run the invoice parser tests.",
+            "reason": "",
+        },
+    ]
+
+    residual, ledger = wi.coverage_report(
+        [inherited, middle, latest],
+        [],
+        ARCHIVE + "-next",
+        classified,
+        previous_residual=previous,
+    )
+
+    assert len(residual) == 2
+    assert "Run the invoice parser tests." in Message.from_dict(residual[0]).content
+    assert "Approval is still pending" in Message.from_dict(residual[1]).content
+    assert residual[1]["source_message_ids"] == [inherited.id, latest.id]
+    assert ledger[0]["summary"] == ledger[2]["summary"]
+
+
 def test_previous_continuation_is_kept_until_explicitly_resolved():
     original = message("constraint", CONSTRAINT)
     classified = wi.resolve_continuation_coverage(

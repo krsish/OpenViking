@@ -48,7 +48,7 @@ V1 使用 OpenViking 的 token 估算器，默认限制为：
 }
 ```
 
-默认总预算可容纳三个达到上限的 work item、一份完整 continuation 和格式开销。这些是容量上限，不是要求模型写满的目标。来源 ID 和逐消息归宿保存在 archive 覆盖账本中，不将整个账本渲染进 working memory。
+默认总预算可容纳三个达到上限的 work item、一份完整 continuation 和格式开销。这些是容量上限，不是要求模型写满的目标。来源 ID 和逐消息归宿保存在 archive 覆盖账本中，不将整个账本渲染进 working memory。每个 archive 的 `continuation-provenance.json` 保存本轮续接摘要的直接来源；历史出处通过 checkpoint 引用追溯，不递归复制到热 continuation。即使正文未超预算，也会移出旧版携带的来源 ID 清单；压缩模型只接收正文和必要引用。
 
 投影按完整 work-item 块选择，不通过按字符截断约束来凑预算。调用方的 context 预算还必须容纳未覆盖的原文尾部。超限更新会失败，保留此前的权威正文。
 
@@ -66,7 +66,11 @@ Archive 在应用前将已分配 ID 的 work-item 操作保存在现有 metadata
 
 遇到版本冲突时，下一次后台重试只读取冲突项的最新权威状态，并结合原始证据重新提取这些项的更新；已成功项、原有续接分类和任务身份保持不变。修订后的计划必须先持久化，才能再次尝试版本检查和写入；后续 archive 继承最高修订版本。每次处理最多执行一轮冲突重提取，再次冲突则保留进度等待下次重试。全部计划操作成功后才记录该批完成。模型、存储持续不可用或冲突持续发生时仍会失败，不会强行覆盖最新状态或发布不完整 checkpoint。
 
-提取完成与 checkpoint 就绪分开记录。完整 continuation 超预算，或旧 checkpoint 仍携带旧格式原文 residual 时，单独的后台 repair 阶段负责压缩续接内容。这个异常恢复路径会调用 LLM；正常投影、context 读取、archive 读取和 Pi compact hook 不调用 LLM。Repair 重试复用已完成的权威状态写入，不重新执行这些写入，也不因冻结的旧提取结果而反复使用同一份超大 continuation。成功的 repair 结果会持久化，后续发布失败时可以复用；repair 失败或结果仍超预算时不发布 checkpoint，保留进度和诊断信息供下次重试。
+提取完成与 checkpoint 就绪分开记录。完整 continuation 超预算，或旧 checkpoint 仍携带旧格式原文 residual 时，单独的后台 repair 阶段负责压缩续接内容。这个异常恢复路径会调用 LLM；正常投影、context 读取、archive 读取和 Pi compact hook 不调用 LLM。Repair 重试复用已完成的权威状态写入，不重新执行这些写入。成功的 repair 或降级结果会持久化，后续发布失败时可以复用。
+
+模型调用失败、返回无效结果或仍然超预算时，先将完整续接快照写入 `continuation-overflow.json`，再按最新相关消息优先保留能装下的完整条目，较旧条目优先移出热视图，不按字符截断。单条本身过大时可以只保留恢复提示。标题、来源引用和恢复提示都计入 continuation 与整体 WM 预算。归档或来源账本写入失败、预算小到容不下提示时，仍拒绝发布。
+
+降级 checkpoint 标记 `continuation_degraded: true`，并携带独立的 `pending_continuation_uri`。后续摘要省略它或将普通 continuation 标为已解决，都不会清除该指针；context、archive 和 Pi compact 的视图持续提示先读取相关归档。再次溢出时，新快照引用此前待恢复快照，热视图仅携带一个入口。当前不会因一次读取自动清除待恢复状态；该提示保证可追溯，不是强制 agent 读取的执行门禁，也不代表所有约束仍完整位于热记忆中。
 
 生成有界投影后，最后通过临时文件加 rename 发布 `.done`。只有 overview 文件不代表 checkpoint 就绪。未完成项移出热视图前，要逐项确认其向量记录覆盖所需的权威版本；终态项仍异步索引，但不阻塞发布。这不是等待全局 embedding 队列的屏障，仍在热视图内的项不必等待无关索引。保存原文与可通过向量检索找回是两个不同条件。
 

@@ -12,22 +12,59 @@ from openviking.session.work_items import residual_text
 from openviking.utils.token_estimation import estimate_text_tokens
 
 
+def _continuation_source(residual: list[dict[str, Any]]) -> str:
+    """Expose continuation content, never its recursively accumulated bookkeeping."""
+    part_fields = {
+        "text": ("text",),
+        "context": ("uri", "context_type", "abstract"),
+        "image_url": ("image_url",),
+        "tool": (
+            "tool_id",
+            "tool_name",
+            "tool_input",
+            "tool_output",
+            "tool_status",
+            "tool_uri",
+            "skill_uri",
+            "tool_output_ref",
+            "tool_output_storage_uri",
+            "tool_output_truncated",
+        ),
+    }
+    visible = []
+    for value in residual:
+        entry = {
+            key: value[key]
+            for key in ("role", "created_at", "message_kind", "source_checkpoint_uri")
+            if value.get(key) is not None
+        }
+        parts = value.get("parts")
+        if parts is None:
+            parts = [{"type": "text", "text": value.get("content", "")}]
+        entry["parts"] = [
+            {
+                "type": part.get("type", "text"),
+                **{
+                    key: part[key]
+                    for key in part_fields.get(part.get("type", "text"), ("text",))
+                    if key in part
+                },
+            }
+            for part in parts
+        ]
+        visible.append(entry)
+    return json.dumps(visible, ensure_ascii=False)
+
+
 async def compact_continuation(
     vlm: Any, residual: list[dict[str, Any]], token_budget: int
 ) -> list[dict[str, Any]]:
     """Merge a full continuation snapshot, checking each candidate before use.
 
-    Calls are bounded; an unsuccessful repair leaves publication pending, so a
-    later Phase 2 attempt can retry without repeating successful task writes.
+    Calls are bounded. A failed repair raises to the session owner, which can
+    archive the complete state and publish a bounded view with a recovery notice.
     """
-    source = json.dumps(residual, ensure_ascii=False)
-    source_ids = list(
-        dict.fromkeys(
-            identity
-            for value in residual
-            for identity in value.get("source_message_ids") or [value["id"]]
-        )
-    )
+    source = _continuation_source(residual)
     target = max(1, int(token_budget * 0.6))
     feedback = ""
     for _ in range(3):
@@ -60,7 +97,6 @@ async def compact_continuation(
                     id=f"wi-continuation-{identity}",
                     role="assistant",
                     message_kind="checkpoint",
-                    source_message_ids=source_ids,
                     parts=[
                         TextPart(
                             "Previous continuation summary (background, not new user evidence):\n"
