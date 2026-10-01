@@ -76,6 +76,28 @@ class MemoryConfig(BaseModel):
             "notice asking it to choose between coherent splitting and single-file compaction."
         ),
     )
+    work_item_token_budget: int = Field(
+        default=10000,
+        gt=0,
+        strict=True,
+        description="Maximum estimated tokens in one canonical work_item state and rendered body.",
+    )
+    continuation_token_budget: int = Field(
+        default=10000,
+        gt=0,
+        strict=True,
+        description="Maximum estimated tokens in the complete working-memory continuation block.",
+    )
+    work_item_projection_token_budget: int = Field(
+        default=42000,
+        gt=0,
+        strict=True,
+        description=(
+            "Maximum estimated tokens in the work_item working-memory projection. "
+            "The default accommodates three 10000-token items, a 10000-token continuation, "
+            "and formatting overhead."
+        ),
+    )
     extraction_enabled: bool = Field(
         default=True,
         description=(

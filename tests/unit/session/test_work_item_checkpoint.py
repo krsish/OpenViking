@@ -15,6 +15,7 @@ from openviking.session.session import (
     _apply_agent_evolution_setting,
     _effective_memory_types,
 )
+from openviking.session.work_item_replay import merge_work_item_replays
 from openviking.utils.token_estimation import estimate_text_tokens
 
 SESSION_URI = "viking://user/default/sessions/work-items"
@@ -179,17 +180,19 @@ def test_projection_does_not_reactivate_terminal_item():
     assert "## work_item A" not in projection
 
 
-def test_coverage_retains_unassigned_original_and_rejects_residual_overflow():
+def test_coverage_archives_unselected_original_and_rejects_oversized_selected_continuation():
     messages = [message("covered"), message("unassigned", "important constraint")]
     residual, ledger = wi.coverage_report(
         messages, [{"uri": item("A")["uri"], "source_message_ids": ["covered"]}], "archive"
     )
-    assert residual == [messages[1].to_dict()]
+    assert residual == []
     assert len(ledger) == len(messages)
+    assert ledger[1]["disposition"] == "archive_only"
+    assert ledger[1]["archive_uri"] == "archive/messages.jsonl"
     projection, _ = wi.build_projection([item("A")], residual)
-    assert "important constraint" in projection
+    assert "important constraint" not in projection
     with pytest.raises(ValueError, match="residual"):
-        wi.build_projection([], [message("huge", "x" * 10000).to_dict()])
+        wi.build_projection([], [message("huge", "x" * 100000).to_dict()])
 
 
 @pytest.mark.asyncio
@@ -322,8 +325,8 @@ async def test_activation_restores_cold_item_without_claiming_new_message_covera
     result = await session._prepare_work_item_checkpoint(uri, messages, previous)
     assert [value["fields"]["title"] for value in result["active_work_items"]] == ["A", "B", "C"]
     assert result["active_work_items"][0]["version"] == 1
-    assert result["residual"] == [messages[0].to_dict()]
-    assert "residual_uri" in result["coverage"][0]
+    assert result["residual"] == []
+    assert result["coverage"][0]["disposition"] == "archive_only"
 
 
 @pytest.mark.asyncio
@@ -374,6 +377,227 @@ async def test_phase2_builds_checkpoint_from_extraction_without_summary_llm(monk
     await session._run_memory_extraction("test-task", uri, messages, "1", "1", policy)
     session._session_compressor.extract_long_term_memories.assert_awaited_once()
     assert (await session.get_session_archive("archive_001"))["status"] == "ready"
+
+
+def wire_work_item_phase2(monkeypatch, session, extractor, *, extraction_enabled=True):
+    tracker = SimpleNamespace(start=AsyncMock(), complete=AsyncMock(), fail=AsyncMock())
+    wait_tracker = SimpleNamespace(
+        register_request=lambda _: None, cleanup=lambda _: None, wait_for_request=AsyncMock()
+    )
+    config = SimpleNamespace(
+        memory=SimpleNamespace(
+            extraction_enabled=extraction_enabled, session_skill_extraction_enabled=False
+        )
+    )
+    monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
+    monkeypatch.setattr("openviking.session.session.get_request_wait_tracker", lambda: wait_tracker)
+    monkeypatch.setattr("openviking.session.session.get_openviking_config", lambda: config)
+    monkeypatch.setattr("openviking.session.session.is_retryable_api_error", lambda exc: False)
+    monkeypatch.setattr(session, "_run_usage_reporting", AsyncMock(return_value=[]))
+    monkeypatch.setattr(session, "_merge_and_save_commit_meta", AsyncMock())
+    monkeypatch.setattr(
+        session._tool_outputs,
+        "hydrate_for_extraction",
+        AsyncMock(side_effect=lambda values: values),
+    )
+    session._session_compressor = SimpleNamespace(extract_long_term_memories=extractor)
+    return tracker
+
+
+@pytest.mark.asyncio
+async def test_successful_empty_extraction_can_archive_a_large_log_without_hot_residual(
+    monkeypatch,
+):
+    session, fs = session_with_fs()
+    source = message("large-log", "completed historical tool diagnostics " * 30000)
+    uri = archive(fs, 1, [source])
+    extractor = AsyncMock(return_value={})
+    tracker = wire_work_item_phase2(monkeypatch, session, extractor)
+    policy = {"working_memory": {"mode": "work_item"}, "memory_types": ["work_item"]}
+
+    await session._run_memory_extraction("archive-log", uri, [source], source.id, source.id, policy)
+
+    tracker.fail.assert_not_awaited()
+    tracker.complete.assert_awaited_once()
+    extractor.assert_awaited_once()
+    published = json.loads(fs.files[f"{uri}/.done"])
+    assert published["compact_ready"]
+    assert published["residual"] == []
+    assert published["coverage"][0]["disposition"] == "archive_only"
+    assert published["coverage"][0]["archive_uri"] == f"{uri}/messages.jsonl"
+    assert fs.files[f"{uri}/messages.jsonl"] == source.to_jsonl()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["no_result", "exception", "not_run"])
+async def test_unprocessed_extraction_cannot_publish_archive_only_as_success(monkeypatch, outcome):
+    session, fs = session_with_fs()
+    source = message("pending", "Approval is still required before deployment.")
+    uri = archive(fs, 1, [source])
+    extractor = AsyncMock(
+        return_value=None if outcome == "no_result" else {},
+        side_effect=RuntimeError("model request failed") if outcome == "exception" else None,
+    )
+    tracker = wire_work_item_phase2(
+        monkeypatch, session, extractor, extraction_enabled=outcome != "not_run"
+    )
+    policy = {"working_memory": {"mode": "work_item"}, "memory_types": ["work_item"]}
+
+    await session._run_memory_extraction(
+        "failed-extraction", uri, [source], source.id, source.id, policy
+    )
+
+    assert f"{uri}/.done" not in fs.files
+    assert f"{uri}/.failed.json" in fs.files
+    tracker.complete.assert_not_awaited()
+    tracker.fail.assert_awaited_once()
+    if outcome == "not_run":
+        extractor.assert_not_awaited()
+    meta = json.loads(fs.files[f"{uri}/.meta.json"])
+    assert source.id not in meta.get("completed_memory_steps", {}).get("long_term", [])
+
+
+@pytest.mark.asyncio
+async def test_failed_raw_residual_recovers_on_next_archive_without_rewriting_completed_item(
+    monkeypatch,
+):
+    session, fs = session_with_fs()
+    task = message("task", "Investigate the build failure.")
+    log = message("old-log", "unselected build output " * 30000)
+    first_uri = archive(fs, 1, [task, log], failed=True)
+    state = item("A")
+    _persist_canonical_work_item(fs, state)
+    canonical_before = fs.files[state["uri"]]
+    fs.files[f"{first_uri}/.meta.json"] = json.dumps(
+        {
+            "working_memory_mode": "work_item",
+            "completed_memory_steps": {"long_term": [task.id, log.id]},
+            "work_items": [{"uri": state["uri"], "version": 1}],
+            "work_item_coverage": [{"uri": state["uri"], "source_message_ids": [task.id]}],
+            "work_item_replays": [
+                {"extraction_id": "wi-replay-old-log", "message_ids": [task.id, log.id]}
+            ],
+            "residual_tokens": 30000,
+            "residual_token_budget": 1000,
+        }
+    )
+    fresh = message("fresh", "Continue the build investigation.")
+    second_uri = archive(fs, 2, [fresh])
+    extractor = AsyncMock(return_value={})
+    tracker = wire_work_item_phase2(monkeypatch, session, extractor)
+    policy = {"working_memory": {"mode": "work_item"}, "memory_types": ["work_item"]}
+
+    await session._run_memory_extraction(
+        "recover-old-overflow", second_uri, [fresh], fresh.id, fresh.id, policy
+    )
+
+    tracker.fail.assert_not_awaited()
+    extractor.assert_awaited_once()
+    assert [value.id for value in extractor.call_args.kwargs["messages"]] == [fresh.id]
+    published = json.loads(fs.files[f"{second_uri}/.done"])
+    assert published["compact_ready"]
+    assert published["residual"] == []
+    log_row = next(row for row in published["coverage"] if row["message_id"] == log.id)
+    assert log_row["disposition"] == "archive_only"
+    assert log_row["archive_uri"] == f"{first_uri}/messages.jsonl"
+    assert fs.files[state["uri"]] == canonical_before
+    assert fs.files[f"{first_uri}/messages.jsonl"] == "\n".join(
+        value.to_jsonl() for value in [task, log]
+    )
+
+
+@pytest.mark.asyncio
+async def test_continuation_budget_repair_retries_without_repeating_canonical_extraction(
+    monkeypatch,
+):
+    from copy import deepcopy
+
+    session, fs = session_with_fs()
+    source = message("source", "Keep the deployment gate pending until approval.")
+    uri = archive(fs, 1, [source])
+    extractor = AsyncMock(
+        return_value={
+            "continuation_coverage": [
+                {
+                    "source_message_ids": [source.id],
+                    "summary": "Pending deployment gate and historical context. " * 10000,
+                    "reason": "",
+                }
+            ]
+        }
+    )
+    tracker = wire_work_item_phase2(monkeypatch, session, extractor)
+    attempts = 0
+
+    async def repair(residual, token_budget):
+        nonlocal attempts
+        attempts += 1
+        assert estimate_text_tokens(wi.residual_text(residual)) > token_budget
+        if attempts == 1:
+            raise RuntimeError("continuation compactor temporarily failed")
+        repaired = deepcopy(residual)
+        repaired[0]["parts"] = [
+            {
+                "type": "text",
+                "text": "Deployment remains pending; obtain approval before deploying.",
+            }
+        ]
+        return repaired
+
+    compactor = AsyncMock(side_effect=repair)
+    monkeypatch.setattr(session, "_compact_work_item_continuation", compactor)
+    policy = {"working_memory": {"mode": "work_item"}, "memory_types": ["work_item"]}
+    await session._run_memory_extraction(
+        "first-attempt", uri, [source], source.id, source.id, policy
+    )
+
+    assert f"{uri}/.done" not in fs.files
+    tracker.fail.assert_awaited_once()
+    meta = json.loads(fs.files[f"{uri}/.meta.json"])
+    assert meta["completed_memory_steps"]["long_term"] == [source.id]
+    assert meta["coverage"][0]["disposition"] == "continuation"
+    assert meta["residual_tokens"] > meta["residual_token_budget"]
+    await session._run_memory_extraction(
+        "repair-attempt", uri, [source], source.id, source.id, policy
+    )
+
+    tracker.complete.assert_awaited_once()
+    extractor.assert_awaited_once()
+    assert compactor.await_count == 2
+    published = json.loads(fs.files[f"{uri}/.done"])
+    assert published["compact_ready"]
+    assert "obtain approval" in wi.residual_text(published["residual"])
+    assert estimate_text_tokens(wi.residual_text(published["residual"])) <= wi.RESIDUAL_TOKEN_BUDGET
+    assert fs.files[f"{uri}/messages.jsonl"] == source.to_jsonl()
+
+
+@pytest.mark.asyncio
+async def test_legacy_raw_continuation_migrates_once_and_reuses_persisted_repair(monkeypatch):
+    session, fs = session_with_fs()
+    old = message("old-constraint", "Do not deploy until approval is granted.")
+    previous = checkpoint()
+    previous["residual"] = [old.to_dict()]
+    old_uri = archive(fs, 1, [old], previous)
+    previous_done = fs.files[f"{old_uri}/.done"]
+    fresh = message("fresh-log", "Completed routine diagnostic output.")
+    uri = archive(fs, 2, [fresh])
+    migrated = wi.continuation_message(old.content, uri, [old.id], old.created_at)
+    compactor = AsyncMock(return_value=[migrated])
+    monkeypatch.setattr(session, "_compact_work_item_continuation", compactor)
+
+    first = await session._prepare_work_item_checkpoint(uri, [old, fresh], previous)
+    second = await session._prepare_work_item_checkpoint(uri, [old, fresh], previous)
+
+    compactor.assert_awaited_once()
+    assert compactor.call_args.args[0] == [old.to_dict()]
+    assert first["residual"] == second["residual"] == [migrated]
+    assert migrated["message_kind"] == "checkpoint"
+    assert migrated["id"] != old.id
+    assert migrated["source_message_ids"] == [old.id]
+    assert "Do not deploy until approval" in fs.files[f"{uri}/.overview.md"]
+    assert fs.files[f"{old_uri}/.done"] == previous_done
+    assert fs.files[f"{old_uri}/messages.jsonl"] == old.to_jsonl()
+    assert json.loads(fs.files[f"{uri}/.meta.json"])["continuation_projection"]["status"] == "ready"
 
 
 def _persist_canonical_work_item(fs, state):
@@ -568,6 +792,14 @@ async def test_refreshed_state_exceeding_request_budget_retains_uncovered_raw_ta
 async def test_projection_growth_with_unindexed_eviction_replays_all_raw_history(monkeypatch):
     from copy import deepcopy
 
+    from openviking.session.work_item_budget import WorkItemBudgets
+
+    monkeypatch.setattr(
+        wi,
+        "get_work_item_budgets",
+        lambda: WorkItemBudgets(projection_token_budget=3000, continuation_token_budget=1000),
+    )
+
     session, fs = session_with_fs()
     original_items = [item(name) for name in ("A", "B", "C")]
     for state in original_items:
@@ -640,15 +872,23 @@ async def test_residual_summary_publishes_and_carries_forward_with_auditable_sou
 
 
 @pytest.mark.asyncio
-async def test_overflow_keeps_coverage_diagnostics_without_publishing():
+async def test_huge_unselected_tool_log_publishes_archive_reference_without_raw_residual():
     session, fs = session_with_fs()
-    source = message("unassigned-long", "unclassified constraint " * 2000)
+    source = Message(
+        id="unselected-tool-log",
+        role="assistant",
+        parts=[ToolPart(tool_name="bash", tool_output="historical diagnostics " * 30000)],
+        created_at="2026-01-01T00:00:00Z",
+    )
     uri = archive(fs, 1, [source])
-    with pytest.raises(ValueError, match="residual_tokens=.*message_ids=.*unassigned-long"):
-        await session._prepare_work_item_checkpoint(uri, [source], {})
+    published = await session._prepare_work_item_checkpoint(uri, [source], {})
     meta = json.loads(fs.files[f"{uri}/.meta.json"])
-    assert meta["residual_tokens"] > meta["residual_token_budget"]
-    assert meta["coverage"][0]["residual_uri"] == f"{uri}/.done"
+    assert published["compact_ready"]
+    assert published["residual"] == []
+    assert meta["residual_tokens"] == 0
+    assert meta["coverage"][0]["disposition"] == "archive_only"
+    assert meta["coverage"][0]["archive_uri"] == f"{uri}/messages.jsonl"
+    assert "historical diagnostics" not in fs.files[f"{uri}/.overview.md"]
     assert f"{uri}/.done" not in fs.files
     assert fs.files[f"{uri}/messages.jsonl"] == source.to_jsonl()
 
@@ -747,3 +987,115 @@ async def test_next_archive_inherits_partial_write_plan_and_success_receipts():
     assert completed == {"long_term": {"1"}}
     assert meta["work_item_coverage"] == [receipt]
     assert meta["work_item_replays"] == [plan]
+
+
+def test_replay_merge_keeps_highest_revision_and_original_batch_order():
+    legacy = {"extraction_id": "first", "message_ids": ["1", "2"], "operations": []}
+    unrelated = {"extraction_id": "second", "message_ids": ["3"], "revision": 1}
+    latest = {**legacy, "revision": 3, "completed_uris": [item("A")["uri"]]}
+    stale = {**legacy, "revision": 1, "completed_uris": []}
+
+    merged = merge_work_item_replays([legacy, unrelated], [latest], [stale, legacy])
+
+    assert merged == [latest, unrelated]
+    assert "revision" not in legacy
+    merged[0]["completed_uris"].clear()
+    assert latest["completed_uris"] == [item("A")["uri"]]
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"extraction_id": "first", "message_ids": ["2", "1"], "revision": 1},
+        {"extraction_id": "other", "message_ids": ["1", "2"], "revision": 1},
+        {"extraction_id": "first", "message_ids": ["1", "2"], "revision": -1},
+        {"extraction_id": "first", "message_ids": ["1", "2"], "revision": True},
+    ],
+)
+def test_replay_merge_rejects_changed_identity_or_invalid_revision(changed):
+    legacy = {"extraction_id": "first", "message_ids": ["1", "2"]}
+    with pytest.raises(ValueError, match="work_item replay"):
+        merge_work_item_replays([legacy], [changed])
+
+
+@pytest.mark.asyncio
+async def test_inherited_replay_never_regresses_to_an_ancestor_revision():
+    session, fs = session_with_fs()
+    first = archive(fs, 1, [message("1"), message("2")], failed=True)
+    second = archive(fs, 2, [message("3")], failed=True)
+    third = archive(fs, 3, [message("4")])
+    base = {"extraction_id": "wi-replay-task", "message_ids": ["1", "2"], "operations": []}
+    latest = {
+        **base,
+        "revision": 2,
+        "completed_uris": [item("A")["uri"]],
+        "conflict_uris": [item("B")["uri"]],
+    }
+    stale = {**base, "revision": 1, "completed_uris": []}
+    fs.files[f"{first}/.meta.json"] = json.dumps({"work_item_replays": [base, latest]})
+    fs.files[f"{second}/.meta.json"] = json.dumps({"work_item_replays": [stale]})
+    fs.files[f"{third}/.meta.json"] = json.dumps({"work_item_replays": [base]})
+
+    await session._inherit_work_item_progress(third, {}, {})
+    await session._inherit_work_item_progress(third, {}, {})
+
+    meta = json.loads(fs.files[f"{third}/.meta.json"])
+    assert meta["work_item_replays"] == [latest]
+    assert json.loads(fs.files[f"{first}/.meta.json"])["work_item_replays"] == [base, latest]
+
+
+@pytest.mark.asyncio
+async def test_reconciled_replay_replaces_old_plan_and_retries_with_original_batch(monkeypatch):
+    session, fs = session_with_fs()
+    messages = [message("1", "Continue A"), message("2", "Keep B pending")]
+    uri = archive(fs, 1, messages)
+    base = {
+        "version": 1,
+        "extraction_id": "wi-replay-reconcile",
+        "message_ids": ["1", "2"],
+        "operations": [],
+    }
+    latest = {**base, "revision": 2, "completed_uris": [item("A")["uri"]]}
+    revised = {
+        **latest,
+        "revision": 3,
+        "completed_uris": [item("A")["uri"], item("B")["uri"]],
+        "conflict_uris": [],
+    }
+    fs.files[f"{uri}/.meta.json"] = json.dumps({"work_item_replays": [base, latest]})
+    calls = []
+
+    async def extract(**kwargs):
+        plan = kwargs["work_item_replay"]
+        calls.append(([value.id for value in kwargs["messages"]], plan["revision"]))
+        if len(calls) == 1:
+            assert plan == latest
+            await kwargs["save_work_item_replay"](revised)
+            # A delayed copy of an older snapshot must not undo reconciliation.
+            await kwargs["save_work_item_replay"](base)
+            raise RuntimeError("process interrupted after saving reconciliation")
+        assert plan == revised
+        return {}
+
+    extractor = AsyncMock(side_effect=extract)
+    tracker = wire_work_item_phase2(monkeypatch, session, extractor)
+    policy = {"working_memory": {"mode": "work_item"}, "memory_types": ["work_item"]}
+    batching = {"message_count_threshold": 1, "pending_token_threshold": 0}
+
+    await session._run_memory_extraction(
+        "reconcile", uri, messages, "1", "2", policy, auto_commit_policy=batching
+    )
+    tracker.fail.assert_awaited_once()
+    assert f"{uri}/.done" not in fs.files
+    meta = json.loads(fs.files[f"{uri}/.meta.json"])
+    assert meta["work_item_replays"] == [revised]
+    assert not meta.get("completed_memory_steps", {}).get("long_term")
+
+    await session._run_memory_extraction(
+        "resume", uri, messages, "1", "2", policy, auto_commit_policy=batching
+    )
+
+    tracker.complete.assert_awaited_once()
+    assert calls == [(["1", "2"], 2), (["1", "2"], 3)]
+    assert (await session.get_session_archive("archive_001"))["status"] == "ready"
+    assert json.loads(fs.files[f"{uri}/.meta.json"])["work_item_replays"] == [revised]

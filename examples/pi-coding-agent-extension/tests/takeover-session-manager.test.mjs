@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { TakeoverCore } from "../lib/takeover-core.mjs";
+import { TakeoverCore, estimateTokens } from "../lib/takeover-core.mjs";
 
 const EXTENSION_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -125,6 +125,59 @@ test("work-item pending fallback survives real Pi compaction with uncovered tool
   assert.equal(await core.resumePending(() => sm.getBranch()), false);
   assert.equal(core.state.coveredThroughEntryId, "");
   assert.deepEqual(core.transformContext(context, sm.getBranch()), context);
+});
+
+test("100 work-item compactions keep carry bounded through real Pi storage and context projection", async (t) => {
+  const session = await openSession(t, { workingMemoryMode: "work_item" }, {
+    readArchiveCheckpoint: async (uri) => {
+      const sequence = uri.match(/archive_(\d+)$/)[1];
+      return {
+        overview: `REAL_PI_WM_${sequence}`,
+        checkpoint: { mode: "work_item", version: 1, compact_ready: true,
+          starting_message_id: `ov-first-${sequence}`, ending_message_id: `ov-last-${sequence}`, work_items: [] },
+      };
+    },
+  });
+  if (!session) return;
+  const { sm, core, turn } = session;
+  sm.appendCustomMessageEntry("notice", 'REAL_PI_CUSTOM_MARKER: remember "approval" C:\\tmp', false);
+  await turn("turn 0");
+  let retained = await turn("turn 1");
+  let previousOverview = "";
+  const sizes = [];
+  for (let round = 1; round <= 100; round++) {
+    const context = sm.buildSessionContext().messages.filter((message) => message.role !== "system");
+    const transformed = core.transformContext(context, () => sm.getBranch());
+    const text = JSON.stringify(transformed);
+    assert.equal(text.split("REAL_PI_CUSTOM_MARKER").length - 1, 1, `custom context before compact ${round}`);
+    assert.equal(text.split(core.state.overview).length - 1, 1, `current WM before compact ${round}`);
+    if (previousOverview) assert.equal(text.includes(previousOverview), false, `old WM replaced before compact ${round}`);
+
+    const result = await core.handleBeforeCompact({
+      firstKeptEntryId: retained.userId, tokensBefore: 15000,
+      contextWindow: 16000, reserveTokens: 1000, overheadTokens: 200,
+    }, () => sm.getBranch());
+    assert.ok(result, `compact ${round} must fit`);
+    const compacted = JSON.parse(JSON.stringify(result.compaction));
+    assert.equal(compacted.summary.split("REAL_PI_CUSTOM_MARKER").length - 1, 1);
+    assert.equal(compacted.summary.split("REAL_PI_WM_").length - 1, 1);
+    previousOverview = compacted.details.continuation.overview;
+    sizes.push(estimateTokens(compacted.summary));
+
+    const compactionId = sm.appendCompaction(compacted.summary, compacted.firstKeptEntryId,
+      compacted.tokensBefore, compacted.details);
+    const stored = sm.getBranch().find((entry) => entry.id === compactionId);
+    assert.deepEqual(stored.details, compacted.details, "Pi stores extension metadata directly on its compaction entry");
+    const projected = sm.buildSessionContext().messages;
+    const savedSummary = projected.find((message) => message.role === "compactionSummary");
+    assert.equal(savedSummary.summary, compacted.summary);
+    assert.equal(JSON.stringify(projected).split("REAL_PI_CUSTOM_MARKER").length - 1, 1);
+
+    if (round < 100) retained = await turn(`turn ${round + 1}`);
+  }
+  assert.ok(Math.max(...sizes) - Math.min(...sizes) < 10,
+    `real Pi compacted summary token range: ${Math.min(...sizes)}..${Math.max(...sizes)}`);
+  t.diagnostic(`100 real Pi compact/context cycles: ${Math.min(...sizes)}..${Math.max(...sizes)} estimated summary tokens`);
 });
 
 test("takeover state entries between turns do not reset the boundary", async (t) => {

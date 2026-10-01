@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from openviking.core.namespace import canonical_user_root, uri_parts
 from openviking.session.memory.utils.memory_file_utils import memory_version_from_fields
+from openviking.session.work_item_budget import get_work_item_budgets
 from openviking.utils.time_utils import parse_iso_datetime
 from openviking.utils.token_estimation import estimate_text_tokens
 from openviking_cli.exceptions import ConflictError
@@ -28,8 +29,6 @@ WORK_ITEM_FIELDS = (
     "decisions",
     "refs",
 )
-WORK_ITEM_FIELD_TOKEN_CAP = 1200
-WORK_ITEM_BODY_TOKEN_CAP = 4000
 WORK_ITEM_STATUSES = frozenset({"open", "in_progress", "waiting", "blocked", "done", "cancelled"})
 WORK_ITEM_TERMINAL_STATUSES = frozenset({"done", "cancelled"})
 _WORK_ITEM_ID_RE = re.compile(r"wi-[A-Za-z0-9_-]+$")
@@ -146,11 +145,9 @@ def validate_work_item_update(
         raise ValueError("work_item requires a title and a goal")
     if metadata["status"] not in WORK_ITEM_STATUSES:
         raise ValueError("Invalid work_item status")
-    if (
-        estimate_text_tokens("\n".join(metadata[name] for name in WORK_ITEM_FIELDS))
-        > WORK_ITEM_FIELD_TOKEN_CAP
-    ):
-        raise ValueError(f"work_item state exceeds {WORK_ITEM_FIELD_TOKEN_CAP} estimated tokens")
+    token_budget = get_work_item_budgets().work_item_token_budget
+    if estimate_text_tokens("\n".join(metadata[name] for name in WORK_ITEM_FIELDS)) > token_budget:
+        raise ValueError(f"work_item state exceeds {token_budget} estimated tokens")
 
     prior_status = old_file.extra_fields.get("status") if old_file is not None else None
     if prior_status in WORK_ITEM_TERMINAL_STATUSES and metadata["status"] != prior_status:

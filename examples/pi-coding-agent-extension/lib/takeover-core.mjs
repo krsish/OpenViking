@@ -1,5 +1,10 @@
+import {
+  OVERVIEW_MARKER, transcriptText, renderWorkItemSummary,
+  compactionContinuation, assembleCompactionCarry,
+} from "./compaction-carry.mjs";
+
 export const TAKEOVER_ENTRY_TYPE = "ov-takeover";
-export const OVERVIEW_MARKER = "[OpenViking Session Context]";
+export { OVERVIEW_MARKER };
 
 const DEFAULT_CONFIG = {
   takeoverEnabled: true,
@@ -29,12 +34,14 @@ function numberOr(value, fallback) {
 }
 
 function takeoverConfig(config = {}) {
+  const workingMemoryMode = config.workingMemoryMode === "work_item" ? "work_item" : "legacy";
+  const overviewBudget = workingMemoryMode === "work_item" ? 42000 : DEFAULT_CONFIG.takeoverOverviewBudget;
   return {
     takeoverEnabled: config.takeoverEnabled !== false,
-    workingMemoryMode: config.workingMemoryMode === "work_item" ? "work_item" : "legacy",
+    workingMemoryMode,
     takeoverTokenThreshold: Math.max(0, numberOr(config.takeoverTokenThreshold, DEFAULT_CONFIG.takeoverTokenThreshold)),
     takeoverKeepRecentTurns: Math.max(0, numberOr(config.takeoverKeepRecentTurns, DEFAULT_CONFIG.takeoverKeepRecentTurns)),
-    takeoverOverviewBudget: Math.max(1, numberOr(config.takeoverOverviewBudget, DEFAULT_CONFIG.takeoverOverviewBudget)),
+    takeoverOverviewBudget: Math.max(1, numberOr(config.takeoverOverviewBudget, overviewBudget)),
     takeoverOverviewPollMs: Math.max(0, numberOr(config.takeoverOverviewPollMs, DEFAULT_CONFIG.takeoverOverviewPollMs)),
     takeoverOverviewPollMax: Math.max(1, numberOr(config.takeoverOverviewPollMax, DEFAULT_CONFIG.takeoverOverviewPollMax)),
   };
@@ -48,18 +55,6 @@ export function isReadyWorkItemCheckpoint(value) {
     Array.isArray(value.work_items) && value.work_items.every((item) =>
       typeof item?.uri === "string" && item.uri.startsWith("viking://") &&
       Number.isInteger(item.version) && item.version > 0);
-}
-
-// Keep complete payloads: capture previews and flattenContent discard tool
-// metadata/results, and cannot stand in for an uncovered Pi transcript.
-function transcriptEntry(entry) {
-  if (entry?.type === "message") return { id: entry.id, type: entry.type, message: entry.message };
-  if (["custom_message", "branch_summary", "compaction"].includes(entry?.type)) return entry;
-  return null;
-}
-
-function transcriptText(entries) {
-  return entries.map(transcriptEntry).filter(Boolean).map((entry) => JSON.stringify(entry)).join("\n");
 }
 
 function latestCompactionId(entries) {
@@ -368,6 +363,11 @@ export class TakeoverCore {
       // the branch — the server keep_recent_count is a message count, not a
       // user-turn count, and it must exclude system/custom/filtered entries.
       captureCount: io.captureCount || (() => 0),
+      isCapturedEntry: io.isCapturedEntry || ((entry) => entry?.type === "message" &&
+        ["user", "assistant", "tool", "tool_result", "toolResult", "tool_call", "toolCall"].includes(entry.message?.role) &&
+        (io.captureCount?.([entry]) || 0) > 0),
+      getCompactionImports: io.getCompactionImports || (() => []),
+      restoreCompactionImports: io.restoreCompactionImports || (() => {}),
       persistEntry: io.persistEntry || (() => {}),
       getWatermark: io.getWatermark || (() => 0),
       // Messages OpenViking will never receive (4xx / retries exhausted): a
@@ -388,6 +388,7 @@ export class TakeoverCore {
     this.overview = "";
     this.readyCheckpoint = null;
     this.readyCompactionEntryId = "";
+    this.readyCompactionImports = [];
     this.lastReadCheckpoint = null;
     this.pendingTokens = 0;
     this.lastSeenUserTurns = 0;
@@ -431,6 +432,7 @@ export class TakeoverCore {
       archiveUri: this.archiveUri,
       historyUri: this.historyUri,
       readyCheckpoint: this.readyCheckpoint,
+      readyCompactionImports: this.readyCompactionImports,
     };
   }
 
@@ -463,6 +465,8 @@ export class TakeoverCore {
       this.historyUri = typeof data.historyUri === "string" ? data.historyUri : "";
       this.readyCheckpoint = isReadyWorkItemCheckpoint(data.readyCheckpoint) ? data.readyCheckpoint : null;
       this.readyCompactionEntryId = typeof data.readyCompactionEntryId === "string" ? data.readyCompactionEntryId : "";
+      this.readyCompactionImports = validCompactionImports(data.readyCompactionImports);
+      this.io.restoreCompactionImports(validCompactionImports(data.compactionImports));
       if (this.config.workingMemoryMode === "work_item" &&
           (data.workingMemoryMode !== "work_item" || !this.readyCheckpoint ||
            estimateTokens(this.overview) > this.config.takeoverOverviewBudget)) {
@@ -493,7 +497,8 @@ export class TakeoverCore {
     this.lastSeenUserTurns = countUserTurns(list);
 
     if (!this.enabled || !this.overview) return list;
-    const entries = projectContextEntries(currentBranch(branch));
+    const rawBranch = currentBranch(branch);
+    const entries = projectContextEntries(rawBranch);
     if (this.config.workingMemoryMode === "work_item" &&
         latestCompactionId(entries) !== this.readyCompactionEntryId) return list;
     if (this.legacyBoundary) this.adoptLegacyBoundary(list, entries);
@@ -525,11 +530,49 @@ export class TakeoverCore {
     // the retained tail are left where they are, not hoisted in front.
     const preserved = [];
     const capturedRoles = new Set(["user", "assistant", "tool", "tool_result", "toolResult", "tool_call", "toolCall"]);
+    let carry = null;
+    let oldSummary = null;
+    const uncapturedMessages = new Set();
+    if (this.config.workingMemoryMode === "work_item") {
+      if (this.captureGap || !isReadyWorkItemCheckpoint(this.readyCheckpoint)) return list;
+      const through = entries.findIndex((entry) => entry.id === this.coveredThroughEntryId);
+      carry = this.assembleCarry(rawBranch, entries, through + 1, through);
+      if (!carry) return list;
+      const replaced = entries.find((entry) => carry.replacedCompactions.has(entry.id));
+      if (replaced) {
+        oldSummary = list.slice(0, cut).find((message) => message.role === "compactionSummary" &&
+          (message.summary ?? flattenContent(message)) === replaced.summary);
+        if (!oldSummary) return list;
+      }
+      const visibleIds = new Set(entries.slice(0, through + 1).map((entry) => entry.id));
+      for (const original of carry.entries) {
+        if (!visibleIds.has(original.id) || original.type !== "message" || original.message.role === "system") continue;
+        const source = original.message;
+        const matches = list.slice(0, cut).filter((message) => message.role === source.role &&
+          (message === source || (Number.isFinite(source.timestamp) && message.timestamp === source.timestamp) ||
+            JSON.stringify(message) === JSON.stringify(source)));
+        if (!matches.length) return list;
+        for (const message of matches) uncapturedMessages.add(message);
+      }
+    }
     for (let i = 0; i < cut; i++) {
       // Work-item capture excludes Pi custom/branch/compaction context. An
       // overview cannot cover those messages, or any unknown extension role.
-      if (list[i]?.role === "system" ||
+      if (list[i] === oldSummary) continue;
+      if (uncapturedMessages.has(list[i]) || list[i]?.role === "system" ||
           (this.config.workingMemoryMode === "work_item" && !capturedRoles.has(list[i]?.role))) preserved.push(list[i]);
+    }
+    if (carry) {
+      // Visible system/custom/native context is already preserved above. Only
+      // material hidden inside a replaced compaction needs re-inserting.
+      const visible = new Set(entries.slice(0, entries.findIndex((entry) => entry.id === this.coveredThroughEntryId) + 1)
+        .filter((entry) => !carry.replacedCompactions.has(entry.id)).map((entry) => entry.id));
+      const hidden = carry.entries.filter((entry) => !visible.has(entry.id));
+      if (hidden.length) preserved.push({
+        role: "compactionSummary",
+        summary: "Uncheckpointed Pi transcript (verbatim JSONL; historical context):\n" + transcriptText(hidden),
+        tokensBefore: 0, timestamp: firstKeptTs - 1,
+      });
     }
     return [
       ...preserved,
@@ -686,6 +729,17 @@ export class TakeoverCore {
     const delivered = await this.confirmDelivery(snapshot, until);
     if (!delivered) return false;
 
+    if (this.config.workingMemoryMode === "work_item") {
+      // A historical-summary import is appended after ordinary capture. Count
+      // its actual anchor in the retained tail, even when sync just added it.
+      const through = snapshot.findIndex((entry) => entry.id === frozen.coveredThroughEntryId);
+      frozen.keepRecentCount = this.io.captureCount(snapshot.slice(through + 1));
+      frozen.compactionImports = validCompactionImports(this.io.getCompactionImports()).filter((receipt) => {
+        const anchor = snapshot.findIndex((entry) => entry.id === receipt.anchorEntryId);
+        return anchor >= 0 && anchor <= through;
+      });
+    }
+
     const left = this.remaining(until);
     if (left < COMMIT_RESERVE_MS) {
       this.log("takeover: handler budget spent before commit; commit postponed");
@@ -734,6 +788,7 @@ export class TakeoverCore {
       coveredUserTurns: archive.coveredUserTurns,
       frozenTokens: archive.frozenTokens,
       compactionEntryId: archive.compactionEntryId,
+      compactionImports: archive.compactionImports,
     };
     this.persist();
     this.log(`takeover: ${archive.archiveUri} committed, Working Memory not ready; checking on later turns`);
@@ -747,6 +802,7 @@ export class TakeoverCore {
    */
   async confirmDelivery(snapshot, until) {
     const synced = await this.io.syncBranch(snapshot);
+    if (this.config.workingMemoryMode === "work_item") this.persist();
     if ((synced?.permanentFailures || 0) > 0 || this.io.droppedCount() > 0) {
       this.markCaptureGap();
       return false;
@@ -844,6 +900,7 @@ export class TakeoverCore {
       ? this.lastReadCheckpoint?.archiveUri === frozen.archiveUri ? this.lastReadCheckpoint.checkpoint : null
       : null;
     this.readyCompactionEntryId = frozen.compactionEntryId || "";
+    this.readyCompactionImports = validCompactionImports(frozen.compactionImports);
     this.archiveUri = frozen.archiveUri;
     this.historyUri = frozen.historyUri || "";
     this.pendingArchive = null;
@@ -1078,8 +1135,9 @@ export class TakeoverCore {
   }
 
   workItemCompaction(preparation, branch) {
-    if (!isReadyWorkItemCheckpoint(this.readyCheckpoint) || !this.overview) return undefined;
-    const entries = projectContextEntries(currentBranch(branch));
+    if (this.captureGap || !isReadyWorkItemCheckpoint(this.readyCheckpoint) || !this.overview) return undefined;
+    const rawBranch = currentBranch(branch);
+    const entries = projectContextEntries(rawBranch);
     const cut = entries.findIndex((entry) => entry.id === preparation.firstKeptEntryId);
     const through = entries.findIndex((entry) => entry.id === this.coveredThroughEntryId);
     if (cut <= 0 || through < 0 || latestCompactionId(entries) !== this.readyCompactionEntryId) {
@@ -1100,15 +1158,11 @@ export class TakeoverCore {
       this.log("takeover: published hot view exceeds overview budget; using pi compaction");
       return undefined;
     }
-    const uncovered = transcriptText(entries.slice(through + 1, cut));
-    // System and Pi-generated context entries are not captured by OV. Retain
-    // those Pi would discard even if they precede the checkpoint boundary.
-    const uncaptured = transcriptText(entries.slice(0, Math.min(through + 1, cut))
-      .filter((entry) => entry.type !== "message" || entry.message?.role === "system"));
-    const raw = [uncaptured, uncovered].filter(Boolean).join("\n");
-    const summary = `${OVERVIEW_MARKER}\n${this.overview}` +
-      (raw ? `\n\nUncheckpointed Pi transcript (verbatim JSONL; historical context):\n${raw}` : "") +
-      this.recoveryHint();
+    const carry = this.assembleCarry(rawBranch, entries, cut, through);
+    if (!carry) return undefined;
+    const raw = transcriptText(carry.entries);
+    const hint = this.recoveryHint();
+    const summary = renderWorkItemSummary(this.overview, carry.entries, hint);
     const summaryTokens = estimateTokens(summary);
     const keptTokens = estimateTokens(transcriptText(entries.slice(cut)));
     // Include prompt/tools/recall and retained messages, with 10% + 256 tokens
@@ -1126,9 +1180,18 @@ export class TakeoverCore {
       estimatedTokensAfter,
       details: { source: "openviking", mode: "work_item", archiveUri: this.archiveUri,
         checkpointEndingMessageId: this.readyCheckpoint.ending_message_id,
+        continuation: compactionContinuation(this.overview, carry.entries, hint, this.coveredThroughEntryId),
         coverageLagEntries: Math.max(0, entries.length - through - 1),
         uncoveredTokens: estimateTokens(raw), keptTokens },
     } };
+  }
+
+  assembleCarry(branch, entries, cut, through) {
+    return assembleCompactionCarry({
+      branch, entries, cut, through, archiveUri: this.archiveUri,
+      checkpoint: this.readyCheckpoint, isCapturedEntry: this.io.isCapturedEntry,
+      compactionImports: this.readyCompactionImports,
+    });
   }
 
   async shutdown() {
@@ -1185,6 +1248,8 @@ export class TakeoverCore {
       ...(this.config.workingMemoryMode === "work_item" ? {
         workingMemoryMode: "work_item", readyCheckpoint: this.readyCheckpoint,
         readyCompactionEntryId: this.readyCompactionEntryId,
+        readyCompactionImports: this.readyCompactionImports,
+        compactionImports: validCompactionImports(this.io.getCompactionImports()),
         overview: this.overview,
       } : {}),
       pendingTokens: this.pendingTokens,
@@ -1268,8 +1333,16 @@ function restorePendingArchive(value) {
     coveredUserTurns: Math.max(0, Math.floor(Number(value.coveredUserTurns) || 0)),
     frozenTokens: Math.max(0, Math.floor(Number(value.frozenTokens) || 0)),
     compactionEntryId: typeof value.compactionEntryId === "string" ? value.compactionEntryId : "",
+    compactionImports: validCompactionImports(value.compactionImports),
     ...(value.nativeCompaction === true ? { nativeCompaction: true } : {}),
   };
+}
+
+function validCompactionImports(value) {
+  return (Array.isArray(value) ? value : []).filter((item) =>
+    typeof item?.entryId === "string" && item.entryId &&
+    typeof item.anchorEntryId === "string" && item.anchorEntryId &&
+    typeof item.summary === "string" && item.summary);
 }
 
 function errorMessage(error) {

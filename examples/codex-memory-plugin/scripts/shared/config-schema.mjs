@@ -186,7 +186,7 @@ export const KNOBS = [
   { name: "workingMemoryMode", type: "enum", values: ["legacy", "work_item"], default: "legacy", capability: "session" },
   { name: "takeoverTokenThreshold", type: "int", default: 30000, min: 1, max: 1000000, capability: "session" },
   { name: "takeoverKeepRecentTurns", type: "int", default: 3, min: 0, max: 100, capability: "session" },
-  { name: "takeoverOverviewBudget", type: "int", default: 3000, min: 100, max: 50000, capability: "session" },
+  { name: "takeoverOverviewBudget", type: "int", default: 3000, min: 100, max: 50000, env: "OPENVIKING_TAKEOVER_OVERVIEW_BUDGET", capability: "session" },
   { name: "takeoverOverviewPollMs", type: "int", default: 2000, min: 0, max: 60000, capability: "session" },
   { name: "takeoverOverviewPollMax", type: "int", default: 15, min: 1, max: 120, capability: "session" },
 
@@ -383,5 +383,12 @@ export function resolveKnobs({ harness = "", layers = [], env = {} } = {}) {
     settings[knob.name] = value;
   }
 
+  // Pi's work-item view includes up to three hot items and the continuation,
+  // whose server default projection limit is 42k tokens. Keep the legacy and
+  // other harness defaults, and preserve any explicit value (including 3000).
+  if (harnessKey(harness) === "pi" && settings.workingMemoryMode === "work_item" &&
+      !configured.has("takeoverOverviewBudget")) {
+    settings.takeoverOverviewBudget = 42000;
+  }
   return { settings, configured, sources };
 }

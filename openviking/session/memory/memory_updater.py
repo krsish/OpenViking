@@ -1360,10 +1360,16 @@ class MemoryUpdater:
         viking_fs = self._get_viking_fs()
 
         from openviking.session.memory.work_item import (
-            WORK_ITEM_BODY_TOKEN_CAP,
             is_work_item_uri,
             validate_work_item_update,
         )
+        from openviking.session.memory.work_item_receipts import (
+            WORK_ITEM_REPLAY_RECEIPT_FIELD,
+            flush_work_item_receipt,
+            make_work_item_receipt,
+            read_work_item_receipt,
+        )
+        from openviking.session.work_item_budget import get_work_item_budgets
         from openviking.utils.token_estimation import estimate_text_tokens
 
         memory_type = resolved_op.memory_type
@@ -1431,7 +1437,17 @@ class MemoryUpdater:
                 )
                 from openviking.session.memory.work_item import WORK_ITEM_FIELDS
 
+                # A previous writer may have crashed between the canonical
+                # write and its archive receipt. Preserve that proof before
+                # another session can replace the single pending marker.
+                await flush_work_item_receipt(viking_fs, ctx, old_content)
                 source_id = getattr(resolved_op.source, "extraction_id", None)
+                receipt_archive = getattr(resolved_op.source, "archive_uri", None)
+                if source_id and source_id.startswith("wi-replay-") and receipt_archive:
+                    if await read_work_item_receipt(
+                        viking_fs, ctx, receipt_archive, source_id, uri
+                    ):
+                        continue
                 expected_version = (
                     memory_version_from_fields(source_content.extra_fields)
                     if source_content is not None
@@ -1505,6 +1521,19 @@ class MemoryUpdater:
                         metadata[key] = val
 
             metadata["version"] = next_memory_version(old_content)
+            if is_work_item:
+                # This marker and the new state share one atomic file write.
+                # Non-replay writes remove the old marker only after its flush.
+                metadata.pop(WORK_ITEM_REPLAY_RECEIPT_FIELD, None)
+                receipt_archive = getattr(resolved_op.source, "archive_uri", None)
+                if (
+                    source_extraction_id
+                    and source_extraction_id.startswith("wi-replay-")
+                    and receipt_archive
+                ):
+                    metadata[WORK_ITEM_REPLAY_RECEIPT_FIELD] = make_work_item_receipt(
+                        ctx, receipt_archive, source_extraction_id, uri, metadata["version"]
+                    )
 
             # Handle links/backlinks fields: merge with existing
             incoming_links_by_uri = getattr(resolved_op, "_incoming_links_by_uri", {})
@@ -1562,7 +1591,7 @@ class MemoryUpdater:
             if (
                 is_work_item
                 and estimate_text_tokens(MemoryFileUtils.read(new_full_content, uri=uri).content)
-                > WORK_ITEM_BODY_TOKEN_CAP
+                > get_work_item_budgets().work_item_token_budget
             ):
                 raise ValueError("work_item rendered body exceeds its token cap")
             await viking_fs.write_file(
@@ -1571,6 +1600,8 @@ class MemoryUpdater:
                 ctx=ctx,
                 lease_ref=lease_ref,
             )
+            if is_work_item:
+                await flush_work_item_receipt(viking_fs, ctx, mf)
 
     def _distribute_links_to_operations(self, operations: ResolvedOperations) -> None:
         """Distribute resolved_links to corresponding upsert operations by URI.

@@ -87,7 +87,7 @@ class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
         activation_hint = (
             " Include work_item_activations when the user resumes matching already-read work "
             "even if no fields change. Include continuation_coverage summaries or discard "
-            "reasons for remaining conversation coverage even when no memory fields change. "
+            "reasons for selected continuation even when no memory fields change. "
             if "work_item_activations" in context.operations_model.model_fields
             else ""
         )

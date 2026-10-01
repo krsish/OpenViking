@@ -107,7 +107,8 @@ def replay_case(monkeypatch):
     plans = []
 
     async def save(plan):
-        assert not files, "plan must be durable before the first canonical write"
+        if not plans:
+            assert not files, "plan must be durable before the first canonical write"
         plans.append(json.loads(json.dumps(plan)))
 
     return SimpleNamespace(
@@ -288,9 +289,11 @@ async def test_reported_partial_failure_keeps_plan_pending_until_replayed(replay
     case.updater._viking_fs.write_file = fail_second_once
     with pytest.raises(OSError, match="second item unavailable"):
         await extract(case, save_work_item_replay=case.save)
-    assert len(case.files) == len(case.plans) == 1
+    assert len(case.files) == 1
+    assert case.plans[0]["completed_uris"] == []
+    assert case.plans[-1]["completed_uris"] == [case.resolved.upsert_operations[0].uris[0]]
 
-    result = await extract(case, work_item_replay=case.plans[0])
+    result = await extract(case, work_item_replay=case.plans[-1])
     case.compressor._get_or_create_react.assert_called_once()
     assert len(case.files) == len(case.writes) == 2
     assert all(
@@ -442,6 +445,149 @@ async def test_existing_item_update_replay_keeps_the_successful_version(replay_c
     assert canonical.extra_fields["current_state"] == "Implemented"
     assert len(case.writes) == 2
     assert result.work_items[0]["version"] == 2
+
+
+@pytest.mark.asyncio
+async def test_inherited_replay_recovers_origin_receipt_after_another_session_updates(replay_case):
+    from openviking.session.memory.dataclass import MemoryOperationSource
+    from openviking.session.memory.work_item_receipts import work_item_receipt_uri
+
+    case = replay_case
+    origin_archive = "viking://user/alice/sessions/s/history/archive_001"
+    next_archive = "viking://user/alice/sessions/s/history/archive_002"
+    first, second = case.resolved.upsert_operations
+    first_uri, second_uri = first.uris[0], second.uris[0]
+    original_write = case.updater._viking_fs.write_file
+
+    async def crash_after_canonical_write(uri, content, **kwargs):
+        await original_write(uri, content, **kwargs)
+        if uri == first_uri:
+            raise RuntimeError("crash before archive receipt and progress save")
+
+    case.updater._viking_fs.write_file = crash_after_canonical_write
+    with pytest.raises(RuntimeError, match="crash before archive receipt"):
+        await extract(case, archive_uri=origin_archive, save_work_item_replay=case.save)
+    original_plan = case.plans[0]
+    assert len(case.plans) == 1
+    assert original_plan["completed_uris"] == []
+    assert original_plan["receipt_archive_uri"] == origin_archive
+    receipt_uri = work_item_receipt_uri(
+        case.ctx, origin_archive, original_plan["extraction_id"], first_uri
+    )
+    assert receipt_uri not in case.files
+    case.updater._viking_fs.write_file = original_write
+
+    # A real later writer must preserve the pending marker before replacing A.
+    another_update = first.model_copy(deep=True)
+    another_update.old_memory_file_content = MemoryFileUtils.read(
+        case.files[first_uri], uri=first_uri
+    )
+    another_update.memory_fields["current_state"] = "Another session's newer result"
+    another_update.source = MemoryOperationSource(
+        extraction_id="another-session-update", session_id="other"
+    )
+    await case.updater._apply_upsert(another_update, case.ctx, ExtractContext(case.messages))
+    receipt = json.loads(case.files[receipt_uri])
+    assert receipt == {
+        "archive_uri": origin_archive,
+        "extraction_id": original_plan["extraction_id"],
+        "uri": first_uri,
+        "version": 1,
+    }
+    preserved_first = case.files[first_uri]
+    assert MemoryFileUtils.read(preserved_first).extra_fields["version"] == 2
+    assert "work_item_replay_receipt" not in MemoryFileUtils.read(preserved_first).extra_fields
+    assert case.writes.index(receipt_uri) < len(case.writes) - 1
+    assert case.writes[-1] == first_uri
+
+    use_real_apply(case)
+    case.submit.reset_mock()
+    writes_before_retry = len(case.writes)
+    result = await extract(
+        case,
+        archive_uri=next_archive,
+        work_item_replay=original_plan,
+        save_work_item_replay=case.save,
+    )
+
+    case.compressor._get_or_create_react.assert_called_once()
+    case.submit.assert_awaited_once()
+    request = case.submit.await_args.args[0]
+    assert [operation.uris for operation in request.operations.upsert_operations] == [[second_uri]]
+    assert request.operations.upsert_operations[0].source.archive_uri == origin_archive
+    assert case.files[first_uri] == preserved_first
+    assert [uri for uri in case.writes[writes_before_retry:] if uri in {first_uri, second_uri}] == [
+        second_uri
+    ]
+    assert {item["uri"]: item["version"] for item in result.work_items} == {
+        first_uri: 2,
+        second_uri: 1,
+    }
+    assert {item["uri"]: item["source_message_ids"] for item in result.work_item_coverage} == {
+        first_uri: ["m1"],
+        second_uri: ["m2"],
+    }
+    assert case.plans[-1]["receipt_archive_uri"] == origin_archive
+    assert set(case.plans[-1]["completed_uris"]) == {first_uri, second_uri}
+
+
+@pytest.mark.asyncio
+async def test_completed_replay_returns_bindings_and_coverage_without_submitting(replay_case):
+    case = replay_case
+    use_real_apply(case)
+    first = await extract(case, save_work_item_replay=case.save)
+    completed_plan = case.plans[-1]
+    assert set(completed_plan["completed_uris"]) == {
+        operation.uris[0] for operation in case.resolved.upsert_operations
+    }
+    files_before = dict(case.files)
+    writes_before = list(case.writes)
+    case.submit.reset_mock()
+    case.compressor._get_or_create_react.reset_mock()
+
+    replayed = await extract(case, work_item_replay=completed_plan, save_work_item_replay=case.save)
+
+    case.submit.assert_not_awaited()
+    case.compressor._get_or_create_react.assert_not_called()
+    assert case.files == files_before
+    assert case.writes == writes_before
+    assert replayed.work_items == first.work_items
+    assert replayed.work_item_coverage == first.work_item_coverage
+    assert len(replayed.work_items) == len(replayed.work_item_coverage) == 2
+
+
+@pytest.mark.asyncio
+async def test_legacy_replay_discovers_stale_snapshot_without_saved_conflict_flags(replay_case):
+    case = replay_case
+    operation = case.resolved.upsert_operations[1]
+    uri = operation.uris[0]
+    await case.updater._apply_upsert(operation, case.ctx)
+    operation.old_memory_file_content = MemoryFileUtils.read(case.files[uri], uri=uri)
+    operation.memory_fields["current_state"] = "First session's planned update"
+    case.resolved.upsert_operations = [operation]
+    case.submit.side_effect = RuntimeError("crashed before submitting any write")
+    save = AsyncMock()
+    with pytest.raises(RuntimeError, match="before submitting"):
+        await extract(case, save_work_item_replay=save)
+    old_plan = json.loads(json.dumps(save.await_args.args[0]))
+    for field in ("revision", "completed_uris", "conflict_uris", "receipt_archive_uri"):
+        old_plan.pop(field, None)
+    _advance_from_another_session(case, uri, "Another session's newer result")
+    seen = _refresh_only_conflict(case, uri)
+    use_real_apply(case)
+    case.submit.reset_mock()
+    case.writes.clear()
+
+    result = await extract(case, work_item_replay=old_plan, save_work_item_replay=save)
+
+    assert len(seen) == 1
+    assert seen[0].old_memory_file_content.extra_fields["version"] == 2
+    case.compressor._get_or_create_react.assert_called_once()
+    case.submit.assert_awaited_once()
+    assert case.writes == [uri]
+    assert MemoryFileUtils.read(case.files[uri]).extra_fields["version"] == 3
+    assert result.work_items == [{"uri": uri, "version": 3}]
+    assert result.work_item_coverage == [{"uri": uri, "source_message_ids": ["m2"]}]
 
 
 @pytest.mark.asyncio
@@ -626,3 +772,351 @@ async def test_resolver_freezes_partial_chunk_evidence_without_claiming_full_cov
     assert ResolvedOperation.model_validate(operation.model_dump()).source_evidence_message_ids == [
         "m1"
     ]
+
+
+def _advance_from_another_session(case, uri, text):
+    canonical = MemoryFileUtils.read(case.files[uri], uri=uri)
+    canonical.extra_fields.update(
+        version=canonical.extra_fields["version"] + 1,
+        source_extraction_id="another-session",
+        current_state=text,
+        constraints="Approval is required before deploying.",
+    )
+    case.files[uri] = MemoryFileUtils.write(canonical)
+
+
+async def _prepare_update_conflict(case):
+    """The real updater commits A, then rejects B's stale canonical snapshot."""
+    use_real_apply(case)
+    for operation in case.resolved.upsert_operations:
+        await case.updater._apply_upsert(operation, case.ctx)
+        operation.old_memory_file_content = MemoryFileUtils.read(
+            case.files[operation.uris[0]], uri=operation.uris[0]
+        )
+        operation.memory_fields["current_state"] = "First session's planned update"
+    case.writes.clear()
+    first_uri, conflict_uri = (operation.uris[0] for operation in case.resolved.upsert_operations)
+    real_submit = case.submit.side_effect
+    submitted = []
+
+    async def submit(request):
+        submitted.append([operation.uris[0] for operation in request.operations.upsert_operations])
+        if len(submitted) == 1:
+            _advance_from_another_session(case, conflict_uri, "Second session's newer result")
+        return await real_submit(request)
+
+    saved = []
+    saves_at_writes = []
+
+    async def save(plan):
+        saved.append(json.loads(json.dumps(plan)))
+        saves_at_writes.append(list(case.writes))
+
+    case.submit.side_effect = submit
+    return SimpleNamespace(
+        first_uri=first_uri,
+        conflict_uri=conflict_uri,
+        submitted=submitted,
+        saved=saved,
+        saves_at_writes=saves_at_writes,
+        save=save,
+        real_submit=real_submit,
+    )
+
+
+def _refresh_only_conflict(case, conflict_uri, *, ranges=None):
+    """A model response based on the latest file, retaining its new constraint."""
+    seen = []
+
+    def orchestrator(**kwargs):
+        provider = kwargs["context_provider"]
+
+        async def run():
+            await provider.read_file(conflict_uri)
+            latest = MemoryFileUtils.read(case.files[conflict_uri], uri=conflict_uri)
+            operation = next(
+                value for value in case.resolved.upsert_operations if value.uris == [conflict_uri]
+            ).model_copy(deep=True)
+            operation.old_memory_file_content = latest
+            operation.memory_fields.update(
+                current_state=latest.extra_fields["current_state"]
+                + "; first-session request reconciled",
+                constraints=latest.extra_fields["constraints"],
+            )
+            # The retry exposes only B's original evidence, renumbered from zero.
+            operation.memory_fields["ranges"] = "0" if ranges is None else ranges
+            seen.append(operation.model_copy(deep=True))
+            return ResolvedOperations(
+                upsert_operations=[operation], delete_file_contents=[], errors=[]
+            ), []
+
+        return SimpleNamespace(run=run)
+
+    case.compressor._get_or_create_react = Mock(side_effect=orchestrator)
+    return seen
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_item_updated_elsewhere", [False, True])
+async def test_conflict_refresh_retries_only_failed_item_without_rewriting_success(
+    replay_case, first_item_updated_elsewhere
+):
+    case = replay_case
+    case.resolved.continuation_coverage = [
+        {
+            "source_message_ids": ["m1"],
+            "summary": "The deployment gate is still pending.",
+            "reason": "",
+        }
+    ]
+    conflict = await _prepare_update_conflict(case)
+    with pytest.raises(ConflictError):
+        await extract(case, save_work_item_replay=conflict.save)
+    assert case.writes == [conflict.first_uri]
+    assert conflict.saved[-1]["completed_uris"] == [conflict.first_uri]
+    assert conflict.saved[-1]["conflict_uris"] == [conflict.conflict_uri]
+    if first_item_updated_elsewhere:
+        _advance_from_another_session(case, conflict.first_uri, "A was independently completed")
+    first_canonical = case.files[conflict.first_uri]
+    failed_plan = json.loads(json.dumps(conflict.saved[-1]))
+    refreshed = _refresh_only_conflict(case, conflict.conflict_uri)
+
+    result = await extract(case, work_item_replay=failed_plan, save_work_item_replay=conflict.save)
+
+    assert len(refreshed) == 1
+    case.compressor._get_or_create_react.assert_called_once()
+    assert conflict.submitted[-1] == [conflict.conflict_uri]
+    assert case.files[conflict.first_uri] == first_canonical
+    assert case.writes == [conflict.first_uri, conflict.conflict_uri]
+    current = MemoryFileUtils.read(case.files[conflict.conflict_uri])
+    assert current.extra_fields["version"] == 3
+    assert "Second session's newer result" in current.extra_fields["current_state"]
+    assert current.extra_fields["constraints"] == "Approval is required before deploying."
+    revision_saves = [
+        (plan, writes)
+        for plan, writes in zip(conflict.saved, conflict.saves_at_writes, strict=True)
+        if plan.get("revision", 0) > failed_plan.get("revision", 0)
+        and any(
+            operation["uris"] == [conflict.conflict_uri]
+            and operation.get("old_memory_file_content", {}).get("extra_fields", {}).get("version")
+            == 2
+            for operation in plan["operations"]["upsert_operations"]
+        )
+    ]
+    assert revision_saves, "the reconciled decision must be saved with a newer revision"
+    assert revision_saves[0][1] == [conflict.first_uri], "save revision before writing B"
+    assert {item["uri"] for item in result.work_items} == {
+        conflict.first_uri,
+        conflict.conflict_uri,
+    }
+    assert {
+        identity for row in result.work_item_coverage for identity in row["source_message_ids"]
+    } == {"m1", "m2"}
+    assert result.continuation_coverage == case.resolved.continuation_coverage
+
+
+@pytest.mark.asyncio
+async def test_conflict_revision_save_failure_prevents_any_repaired_write(replay_case):
+    case = replay_case
+    conflict = await _prepare_update_conflict(case)
+    with pytest.raises(ConflictError):
+        await extract(case, save_work_item_replay=conflict.save)
+    _refresh_only_conflict(case, conflict.conflict_uri)
+    before = dict(case.files)
+    submitted = case.submit.await_count
+    with pytest.raises(OSError, match="revision persistence unavailable"):
+        await extract(
+            case,
+            work_item_replay=conflict.saved[-1],
+            save_work_item_replay=AsyncMock(
+                side_effect=OSError("revision persistence unavailable")
+            ),
+        )
+    assert case.files == before
+    assert case.submit.await_count == submitted
+
+
+@pytest.mark.asyncio
+async def test_repeated_competing_updates_have_one_bounded_refresh_per_retry(replay_case):
+    case = replay_case
+    conflict = await _prepare_update_conflict(case)
+    with pytest.raises(ConflictError):
+        await extract(case, save_work_item_replay=conflict.save)
+    refreshed = _refresh_only_conflict(case, conflict.conflict_uri)
+
+    async def competing_submit(request):
+        assert [operation.uris[0] for operation in request.operations.upsert_operations] == [
+            conflict.conflict_uri
+        ]
+        _advance_from_another_session(case, conflict.conflict_uri, "Concurrent progress continues")
+        return await conflict.real_submit(request)
+
+    case.submit.side_effect = competing_submit
+    for attempt in range(3):
+        before_calls = case.submit.await_count
+        before_revision = conflict.saved[-1].get("revision", 0)
+        with pytest.raises(ConflictError):
+            await extract(
+                case,
+                work_item_replay=conflict.saved[-1],
+                save_work_item_replay=conflict.save,
+            )
+        assert len(refreshed) == attempt + 1
+        assert case.submit.await_count == before_calls + 1
+        assert conflict.saved[-1].get("revision", 0) > before_revision
+        assert conflict.saved[-1]["conflict_uris"] == [conflict.conflict_uri]
+        assert conflict.saved[-1]["completed_uris"] == [conflict.first_uri]
+    assert case.writes == [conflict.first_uri]
+
+
+@pytest.mark.asyncio
+async def test_conflicted_create_reuses_its_original_identity_when_reconciled(replay_case):
+    case = replay_case
+    use_real_apply(case)
+    conflict_uri = case.resolved.upsert_operations[1].uris[0]
+    real_submit = case.submit.side_effect
+    saved = []
+    initial = True
+
+    async def submit(request):
+        nonlocal initial
+        if initial:
+            initial = False
+            # Another session creates the same stable task identity first.
+            await case.updater._apply_upsert(case.resolved.upsert_operations[1], case.ctx)
+            canonical = MemoryFileUtils.read(case.files[conflict_uri], uri=conflict_uri)
+            canonical.extra_fields.update(
+                source_extraction_id="another-session",
+                current_state="Already created by another session",
+                constraints="Approval is required before deploying.",
+            )
+            case.files[conflict_uri] = MemoryFileUtils.write(canonical)
+        return await real_submit(request)
+
+    async def save(plan):
+        saved.append(json.loads(json.dumps(plan)))
+
+    case.submit.side_effect = submit
+    with pytest.raises(ConflictError, match="already exists"):
+        await extract(case, save_work_item_replay=save)
+    expected_uris = {operation.uris[0] for operation in case.resolved.upsert_operations}
+    _refresh_only_conflict(case, conflict_uri)
+    await extract(case, work_item_replay=saved[-1], save_work_item_replay=save)
+    assert set(case.files) == expected_uris
+    assert MemoryFileUtils.read(case.files[conflict_uri]).extra_fields["version"] == 2
+    assert {
+        uri
+        for operation in saved[-1]["operations"]["upsert_operations"]
+        for uri in operation["uris"]
+    } == expected_uris
+
+
+@pytest.mark.asyncio
+async def test_removed_create_collision_clears_stale_conflict_without_reextracting(replay_case):
+    case = replay_case
+    use_real_apply(case)
+    first, conflicting = case.resolved.upsert_operations
+    first_uri, conflict_uri = first.uris[0], conflicting.uris[0]
+    await case.updater._apply_upsert(conflicting, case.ctx)
+    save = AsyncMock()
+    with pytest.raises(ConflictError, match="already exists"):
+        await extract(case, save_work_item_replay=save)
+    failed_plan = json.loads(json.dumps(save.await_args.args[0]))
+    assert failed_plan["completed_uris"] == [first_uri]
+    assert failed_plan["conflict_uris"] == [conflict_uri]
+
+    # Removing the competing file makes the frozen create valid again.
+    del case.files[conflict_uri]
+    case.writes.clear()
+    case.submit.reset_mock()
+    case.compressor._get_or_create_react.reset_mock()
+    result = await extract(case, work_item_replay=failed_plan, save_work_item_replay=save)
+
+    case.compressor._get_or_create_react.assert_not_called()
+    case.submit.assert_awaited_once()
+    request = case.submit.await_args.args[0]
+    assert [operation.uris for operation in request.operations.upsert_operations] == [
+        [conflict_uri]
+    ]
+    assert case.writes == [conflict_uri]
+    assert MemoryFileUtils.read(case.files[conflict_uri]).extra_fields["version"] == 1
+    assert save.await_args.args[0]["conflict_uris"] == []
+    assert set(save.await_args.args[0]["completed_uris"]) == {first_uri, conflict_uri}
+    assert len(result.work_items) == len(result.work_item_coverage) == 2
+
+
+@pytest.mark.asyncio
+async def test_conflict_refresh_keeps_frozen_source_ids_when_caption_positions_change(
+    replay_case, monkeypatch
+):
+    case = replay_case
+    case.state.partial = {"m2"}
+    conflict = await _prepare_update_conflict(case)
+    with pytest.raises(ConflictError):
+        await extract(case, save_work_item_replay=conflict.save)
+
+    async def changed_caption_layout(provider):
+        provider.messages = case.messages[1:]
+        provider._extract_context = None
+
+    monkeypatch.setattr(
+        "openviking.session.compressor_v3.SessionExtractContextProvider.prepare_extraction_messages",
+        changed_caption_layout,
+    )
+    _refresh_only_conflict(case, conflict.conflict_uri, ranges="0")
+    result = await extract(
+        case, work_item_replay=conflict.saved[-1], save_work_item_replay=conflict.save
+    )
+    assert {row["uri"]: row["source_message_ids"] for row in result.work_item_coverage} == {
+        conflict.first_uri: ["m1"],
+        conflict.conflict_uri: ["m2"],
+    }
+    assert conflict.saved[-1]["partial_tool_message_ids"] == ["m2"]
+    saved_operations = {
+        operation["uris"][0]: operation
+        for operation in conflict.saved[-1]["operations"]["upsert_operations"]
+    }
+    assert saved_operations[conflict.first_uri]["source_evidence_message_ids"] == ["m1"]
+    assert saved_operations[conflict.conflict_uri]["source_evidence_message_ids"] == ["m2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid", ["new_uri", "missing_snapshot", "extra_continuation"])
+async def test_conflict_refresh_rejects_decisions_outside_the_failed_update(replay_case, invalid):
+    case = replay_case
+    conflict = await _prepare_update_conflict(case)
+    with pytest.raises(ConflictError):
+        await extract(case, save_work_item_replay=conflict.save)
+    repaired = case.resolved.upsert_operations[1].model_copy(deep=True)
+    repaired.old_memory_file_content = MemoryFileUtils.read(
+        case.files[conflict.conflict_uri], uri=conflict.conflict_uri
+    )
+    operations = ResolvedOperations(
+        upsert_operations=[repaired], delete_file_contents=[], errors=[]
+    )
+    if invalid == "new_uri":
+        identity = new_work_item_id(ExtractContext(case.messages), "1", 9, "session")
+        repaired.uris = [f"viking://user/alice/memories/work_item/{identity}.md"]
+        repaired.memory_fields["work_item_id"] = identity
+        repaired.old_memory_file_content = None
+    elif invalid == "missing_snapshot":
+        repaired.old_memory_file_content = None
+    else:
+        operations.continuation_coverage = [
+            {
+                "source_message_ids": ["m1"],
+                "summary": "",
+                "reason": "Drop another task's constraint",
+            }
+        ]
+    case.compressor._get_or_create_react = Mock(
+        return_value=SimpleNamespace(run=AsyncMock(return_value=(operations, [])))
+    )
+    before = dict(case.files)
+    submissions = case.submit.await_count
+    with pytest.raises((ValueError, ConflictError)):
+        await extract(
+            case, work_item_replay=conflict.saved[-1], save_work_item_replay=conflict.save
+        )
+    assert case.files == before
+    assert case.submit.await_count == submissions

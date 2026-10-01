@@ -291,3 +291,34 @@ test("ready checkpoint and budget accounting survive a restart", async () => {
   assert.ok(result);
   assert.ok(result.compaction.estimatedTokensAfter > estimateTokens(result.compaction.summary));
 });
+
+test("default work-item budget accepts a complete large v2 continuation without changing checkpoint readiness", async () => {
+  const overview = "x".repeat(120000); // 30k estimated tokens, above the former 3k default.
+  const ready = { ...checkpoint, continuation_version: 2 };
+  const { core } = makeCore({
+    config: { takeoverOverviewBudget: undefined },
+    readCheckpoint: () => ({ overview, checkpoint: ready }),
+  });
+  restoreReady(core);
+  const result = await core.handleBeforeCompact(prep({ contextWindow: 128000 }), branch());
+  assert.ok(result);
+  assert.ok(result.compaction.summary.includes(overview), "the published continuation is retained in full");
+  assert.equal(core.state.readyCheckpoint.continuation_version, 2);
+  assert.equal(core.state.readyCheckpoint.version, 1);
+});
+
+test("larger work-item default still honors explicit budgets and the complete model context limit", async () => {
+  for (const { budget, length, contextWindow } of [
+    { budget: 3000, length: 16000, contextWindow: 128000 },
+    { budget: undefined, length: 168004, contextWindow: 128000 },
+    { budget: undefined, length: 120000, contextWindow: 16000 },
+  ]) {
+    const { core } = makeCore({
+      config: { takeoverOverviewBudget: budget },
+      readCheckpoint: () => ({ overview: "x".repeat(length), checkpoint: { ...checkpoint, continuation_version: 2 } }),
+    });
+    restoreReady(core);
+    assert.equal(await core.handleBeforeCompact(prep({ contextWindow }), branch()), undefined,
+      `budget=${budget ?? "default"}, estimated view=${length / 4}, model context=${contextWindow}`);
+  }
+});

@@ -32,10 +32,12 @@ from openviking.session.memory.utils.line_numbers import (
     every_line_has_line_numbers,
     strip_line_numbers,
 )
+from openviking.session.work_item_budget import continuation_selection_instruction
 
 _PYTHON_FENCE_RE = re.compile(r"```python[ \t]*\r?\n(?P<code>[\s\S]*?)```", re.IGNORECASE)
 _PYTHON_FENCE_START_RE = re.compile(r"```python[ \t]*\r?\n", re.IGNORECASE)
 _HIDDEN_MEMORY_FIELDS = {
+    "work_item_replay_receipt",
     "source_extraction_id",
     "source_extraction_ids",
     "last_update_trace_id",
@@ -180,14 +182,7 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             lines.append(
                 '- sdk.continuation(ranges="0-3", summary="""Remaining continuation state""") '
                 'or sdk.continuation(ranges="4", reason="""No remaining continuation because ..."""): '
-                "account for messages not fully covered by a work_item. Supply exactly one of "
-                "summary or reason. Summaries must retain unresolved requests, constraints, "
-                "commitments and necessary references; keep all summaries together below 600 "
-                "estimated tokens. Use reason only for content with nothing left to continue, "
-                "such as greetings or fully answered questions. Another memory's existence alone "
-                "does not justify discarding continuation. Partial tool previews may be classified; "
-                "preserve pending verification and references when outcomes are unclear, without "
-                "inventing unseen results. Missing classifications keep original messages."
+                + continuation_selection_instruction()
             )
             lines.append(
                 '- existing_work_item.activate(ranges="<current user message indices>"): '
@@ -321,7 +316,7 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
         activation_hint = (
             " Include .activate(ranges=...) when the user resumes a matching existing work_item "
             "even if no fields change. Include sdk.continuation(ranges=..., summary=...) "
-            "or sdk.continuation(ranges=..., reason=...) for remaining conversation coverage, "
+            "or sdk.continuation(ranges=..., reason=...) for selected continuation, "
             "even when no memory fields change."
             if any(schema.memory_type == "work_item" for schema in context.schemas)
             else ""

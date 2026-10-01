@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { HARNESS_KEYS, KNOBS } from "./lib/config-schema.mjs";
+import { HARNESS_KEYS, KNOBS, resolveKnobs } from "./lib/config-schema.mjs";
 import { buildContextSearchBody } from "./lib/recall-core.mjs";
 import { buildPluginConfig } from "./lib/plugin-config.mjs";
 import { loadAgentHookConfig } from "./lib/agent-hook-runtime.mjs";
@@ -146,6 +146,24 @@ test("the table covers every harness that has a shared loader", () => {
     assert.ok(covered.delete(key), `${key} has no entry in this file`);
   }
   assert.deepEqual([...covered], [], "an entry names a harness the schema does not");
+});
+
+test("only Pi work-item mode receives the larger default overview budget", () => {
+  for (const harness of Object.values(HARNESS_KEYS)) {
+    for (const workingMemoryMode of ["legacy", "work_item"]) {
+      const { settings, configured } = resolveKnobs({ harness,
+        layers: [{ data: { workingMemoryMode } }] });
+      assert.equal(settings.takeoverOverviewBudget,
+        harness === "pi" && workingMemoryMode === "work_item" ? 42000 : 3000,
+        `${harness}/${workingMemoryMode}`);
+      assert.equal(configured.has("takeoverOverviewBudget"), false);
+    }
+  }
+  for (const takeoverOverviewBudget of [3000, 24000, 42000]) {
+    const { settings } = resolveKnobs({ harness: "pi",
+      layers: [{ data: { workingMemoryMode: "work_item", takeoverOverviewBudget } }] });
+    assert.equal(settings.takeoverOverviewBudget, takeoverOverviewBudget);
+  }
 });
 
 for (const [key, entry] of Object.entries(LOADERS)) {

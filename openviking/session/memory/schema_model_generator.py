@@ -23,6 +23,10 @@ from openviking.session.memory.memory_isolation_handler import RoleScope
 from openviking.session.memory.merge_op import MergeOp, MergeOpFactory
 from openviking.session.memory.merge_op.base import FieldType, get_python_type_for_field
 from openviking.session.memory.utils.description_template import render_description_template
+from openviking.session.work_item_budget import (
+    continuation_selection_instruction,
+    work_item_budget_instruction,
+)
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
@@ -316,6 +320,11 @@ class SchemaModelGenerator:
                     description=(
                         f"{mt.memory_type} memories: {self._render_description(mt.description)} "
                         "(top-level field, do not nest inside other arrays)"
+                        + (
+                            " " + work_item_budget_instruction()
+                            if mt.memory_type == "work_item"
+                            else ""
+                        )
                     ),
                 ),
             )
@@ -325,18 +334,7 @@ class SchemaModelGenerator:
                 List[ContinuationCoverage],
                 Field(
                     default_factory=list,
-                    description=(
-                        "Account for messages not fully covered by a work_item. Supply ranges and "
-                        "exactly one of summary or reason. Summary preserves all remaining user "
-                        "constraints, questions, commitments and necessary references; keep all "
-                        "summaries together below 600 estimated tokens. Reason explicitly explains "
-                        "why nothing remains to continue (e.g. a greeting or an answered question). "
-                        "Storage in another memory alone is not permission to discard unresolved "
-                        "information. Partial tool previews may be classified; preserve pending "
-                        "verification and references when outcomes are unclear, without inventing "
-                        "unseen results. "
-                        "Missing classification retains original messages."
-                    ),
+                    description=continuation_selection_instruction(),
                 ),
             )
             field_definitions["work_item_activations"] = (
@@ -484,6 +482,8 @@ class SchemaPromptGenerator:
         for mt in self.schemas:
             lines.append(f"\n### {mt.memory_type}")
             lines.append(self._render_description(mt.description))
+            if mt.memory_type == "work_item":
+                lines.append(work_item_budget_instruction())
 
             # Add URI format information
             if mt.directory or mt.filename_template:

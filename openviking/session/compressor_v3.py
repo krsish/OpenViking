@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, List, Optional
@@ -83,6 +84,8 @@ from openviking.session.train import (
     get_streaming_policy_trainer,
     make_streaming_policy_trainer_key,
 )
+from openviking.session.work_item_conflicts import reconcile_work_item_conflicts
+from openviking.session.work_item_replay_state import WorkItemReplayState
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import get_current_telemetry, tracer
 from openviking_cli.utils import get_logger
@@ -854,16 +857,40 @@ class SessionCompressorV3:
         )
         frozen = None
         frozen_source_coverage = None
+        replay_state = None
         if work_item_replay is not None:
             extraction_id = work_item_replay["extraction_id"]
-            frozen = ResolvedOperations.model_validate(work_item_replay["operations"])
+            replay_state = WorkItemReplayState(work_item_replay, save_work_item_replay)
+            await replay_state.inspect(viking_fs, ctx)
+            frozen = replay_state.operations
+            if replay_state.conflicts:
+                repaired = await reconcile_work_item_conflicts(
+                    compressor=self,
+                    frozen=frozen,
+                    conflict_uris=replay_state.conflicts,
+                    messages=messages,
+                    ctx=ctx,
+                    registry=registry,
+                    viking_fs=viking_fs,
+                    vlm_config=vlm_config,
+                    session_id=session_id,
+                    frozen_source_coverage=work_item_replay.get("source_coverage", []),
+                )
+                replacements = {op.uris[0]: op for op in repaired.upsert_operations}
+                frozen.upsert_operations = [
+                    replacements.get(op.uris[0], op) for op in frozen.upsert_operations
+                ]
+                replay_state.conflicts.clear()
+                # Exactly one reconciliation per attempt, persisted before CAS.
+                # A concurrent edit during this attempt becomes next retry's work.
+                await replay_state.save()
             # Old plans without frozen attribution cannot safely reinterpret
             # their ranges after extraction-only captions/chunks have changed.
             frozen_source_coverage = work_item_replay.get("source_coverage", [])
             operations = operations or ResolvedOperations(
                 upsert_operations=[], delete_file_contents=[], errors=[]
             )
-            operations.upsert_operations.extend(frozen.upsert_operations)
+            operations.upsert_operations.extend(replay_state.pending_operations)
             operations.work_item_activations = frozen.work_item_activations
             operations.continuation_coverage = frozen.continuation_coverage
             partial_tool_message_ids.update(work_item_replay.get("partial_tool_message_ids", []))
@@ -895,18 +922,41 @@ class SessionCompressorV3:
             frozen_source_coverage = _freeze_work_item_coverage(
                 extract_context, frozen.upsert_operations
             )
-            # Save before any canonical write. A failed metadata write leaves
-            # canonical items untouched; retries reuse URI and source identity.
-            await save_work_item_replay(
+            replay_state = WorkItemReplayState(
                 {
                     "version": 1,
+                    "revision": 0,
                     "extraction_id": extraction_id,
                     "message_ids": [message.id for message in messages],
                     "operations": frozen.model_dump(mode="json"),
                     "partial_tool_message_ids": sorted(partial_tool_message_ids),
                     "source_coverage": frozen_source_coverage,
-                }
+                    "receipt_archive_uri": archive_uri,
+                    "completed_uris": [],
+                    "conflict_uris": [],
+                },
+                save_work_item_replay,
             )
+            frozen = replay_state.operations
+            # Save before any canonical write. A failed metadata write leaves
+            # canonical items untouched; retries reuse URI and source identity.
+            await save_work_item_replay(deepcopy(replay_state.plan))
+        if replay_state is not None:
+            # Receipts belong to the archive that originally froze this batch,
+            # even when a later archive inherits and finishes it.
+            for op in operations.upsert_operations:
+                if op.memory_type == "work_item":
+                    op.source = MemoryOperationSource(
+                        extraction_id=extraction_id,
+                        session_id=session_id,
+                        archive_uri=replay_state.archive_uri,
+                    )
+            for op in frozen.upsert_operations:
+                op.source = MemoryOperationSource(
+                    extraction_id=extraction_id,
+                    session_id=session_id,
+                    archive_uri=replay_state.archive_uri,
+                )
         activations = getattr(operations, "work_item_activations", []) or []
         if operations is None or not (
             operations.upsert_operations
@@ -915,16 +965,19 @@ class SessionCompressorV3:
             or operations.errors
         ):
             tracer.info("[v3_patch_merge] No memory writes generated")
-            work_items, _ = await _work_item_extraction_metadata(
+            work_items, coverage = await _work_item_extraction_metadata(
                 context_provider=context_provider,
-                operations=None,
+                operations=frozen,
                 result=None,
                 viking_fs=viking_fs,
                 ctx=ctx,
                 activations=activations,
+                frozen_source_coverage=frozen_source_coverage,
+                completed_uris=replay_state.completed if replay_state else None,
             )
             return _V3ExtractionResult(
                 work_items=work_items,
+                work_item_coverage=coverage,
                 work_item_activations=_work_item_activation_receipts(activations, work_items),
                 continuation_coverage=getattr(operations, "continuation_coverage", []),
             )
@@ -958,7 +1011,7 @@ class SessionCompressorV3:
                 metadata={
                     "source_extraction_id": extraction_id,
                     "session_id": session_id,
-                    "archive_uri": archive_uri,
+                    "archive_uri": replay_state.archive_uri if replay_state else archive_uri,
                     "trace_id": tracer.get_trace_id(),
                     "extracted_at": extracted_at,
                 },
@@ -969,6 +1022,7 @@ class SessionCompressorV3:
         patch_operations = update_result.operations
         _report_extraction_telemetry(result, patch_operations)
         if frozen is not None:
+            await replay_state.record_result(result)
             expected_uris = {uri for op in frozen.upsert_operations for uri in op.uris}
             successful_uris = set(
                 getattr(result, "written_uris", []) + getattr(result, "edited_uris", [])
@@ -980,7 +1034,7 @@ class SessionCompressorV3:
                 # apply_operations reports per-item failures instead of raising.
                 # Keep the saved plan pending until every planned item succeeds.
                 raise failed[0][1]
-            missing_uris = expected_uris - successful_uris
+            missing_uris = expected_uris - successful_uris - replay_state.completed
             if missing_uris:
                 raise RuntimeError(
                     "Incomplete work_item replay writes: " + ", ".join(sorted(missing_uris))
@@ -1005,12 +1059,13 @@ class SessionCompressorV3:
         )
         work_items, work_item_coverage = await _work_item_extraction_metadata(
             context_provider=context_provider,
-            operations=patch_operations,
+            operations=frozen if frozen is not None else patch_operations,
             result=result,
             viking_fs=viking_fs,
             ctx=ctx,
             activations=activations,
             frozen_source_coverage=frozen_source_coverage,
+            completed_uris=replay_state.completed if replay_state else None,
         )
         return _V3ExtractionResult(
             contexts=contexts,
@@ -2381,6 +2436,7 @@ async def _work_item_extraction_metadata(
     ctx: RequestContext,
     activations: Optional[list[dict[str, Any]]] = None,
     frozen_source_coverage: Optional[list[dict[str, Any]]] = None,
+    completed_uris: Optional[set[str]] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Return bindings and source attribution, never infer coverage from a read."""
     from openviking.session.memory.utils.memory_file_utils import memory_version_from_fields
@@ -2389,6 +2445,9 @@ async def _work_item_extraction_metadata(
     written = set(getattr(result, "written_uris", []) or []) | set(
         getattr(result, "edited_uris", []) or []
     )
+    # Durable acknowledgement survives another session replacing the current
+    # source_extraction_id. Binding versions still come from the latest file.
+    written.update(completed_uris or [])
     work_ops = [
         op
         for op in getattr(operations, "upsert_operations", []) or []
@@ -2419,7 +2478,7 @@ async def _work_item_extraction_metadata(
             if uri not in op.uris or uri not in written:
                 continue
             extraction_id = getattr(getattr(op, "source", None), "extraction_id", None)
-            if (
+            if uri not in (completed_uris or set()) and (
                 not extraction_id
                 or canonical.extra_fields.get("source_extraction_id") != extraction_id
             ):

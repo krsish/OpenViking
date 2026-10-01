@@ -8,6 +8,21 @@ export interface TakeoverMessage {
   [key: string]: any;
 }
 
+/** Stored historical summary; only a published checkpoint makes it replaceable. */
+export interface CompactionImportReceipt {
+  entryId: string;
+  anchorEntryId: string;
+  summary: string;
+}
+
+export interface CompactionContinuation {
+  version: 1;
+  overview: string;
+  recoveryHint: string;
+  coveredThroughEntryId: string;
+  entries: any[];
+}
+
 /**
  * A commit that archived but whose Working Memory was not ready in time. While
  * one is set, no second takeover commit runs — later turns re-check this same
@@ -23,12 +38,15 @@ export interface PendingArchive {
   frozenTokens: number;
   nativeCompaction?: boolean;
   compactionEntryId?: string;
+  compactionImports?: CompactionImportReceipt[];
 }
 
 export interface WorkItemCheckpoint {
   mode: "work_item";
   version: 1;
   compact_ready: true;
+  /** Optional server continuation format; checkpoint readiness stays version 1. */
+  continuation_version?: number;
   archive_id?: string;
   starting_message_id: string;
   ending_message_id: string;
@@ -57,6 +75,8 @@ export interface TakeoverPersistedState {
   workingMemoryMode?: "legacy" | "work_item";
   readyCheckpoint?: WorkItemCheckpoint | null;
   readyCompactionEntryId?: string;
+  readyCompactionImports?: CompactionImportReceipt[];
+  compactionImports?: CompactionImportReceipt[];
 }
 
 export interface TakeoverConfig {
@@ -90,6 +110,9 @@ export interface TakeoverIo {
   archiveState?: (archiveUri: string) => Promise<"completed" | "failed" | "pending" | null> | string | null;
   /** Exact server keep_recent_count for a retained tail (message count). */
   captureCount?: (branchSlice: any[]) => number;
+  isCapturedEntry?: (entry: any) => boolean;
+  getCompactionImports?: () => CompactionImportReceipt[];
+  restoreCompactionImports?: (receipts: CompactionImportReceipt[]) => void;
   persistEntry?: (customType: string, data: TakeoverPersistedState) => void;
   getWatermark?: () => number;
   /** Messages OpenViking will never receive; a capture gap when > 0. */

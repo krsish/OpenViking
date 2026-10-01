@@ -31,6 +31,7 @@ from openviking.session.memory.work_item import covered_source_message_ids, new_
 from openviking.storage.content_write import ContentWriteCoordinator
 from openviking_cli.exceptions import ConflictError, InvalidArgumentError
 from openviking_cli.session.user_id import UserIdentifier
+from openviking_cli.utils.config.memory_config import MemoryConfig
 
 URI = "viking://user/alice/memories/work_item/wi-one.md"
 
@@ -588,6 +589,73 @@ async def test_custom_template_cannot_bypass_body_cap(registry, ctx):
     with pytest.raises(ValueError, match="rendered body"):
         await updater._apply_upsert(op(), ctx)
     assert not fs.values
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("budget,repetitions", [(10000, 3500), (18000, 8000)])
+async def test_configured_work_item_budget_replaces_old_field_and_body_limits(
+    registry, ctx, monkeypatch, budget, repetitions
+):
+    config = SimpleNamespace(memory=MemoryConfig(work_item_token_budget=budget))
+    monkeypatch.setattr("openviking.session.work_item_budget.get_openviking_config", lambda: config)
+    updater, fs = setup_updater(registry)
+    state = "state " * repetitions
+    await updater._apply_upsert(op(current_state=state), ctx)
+    assert fs.parsed().extra_fields["current_state"] == state.strip()
+    before = fs.values[URI]
+    config.memory.work_item_token_budget = 100
+    with pytest.raises(ValueError, match="exceeds 100 estimated tokens"):
+        await updater._apply_upsert(op(fs.parsed(), next_action="Review"), ctx)
+    assert fs.values[URI] == before
+
+
+@pytest.mark.asyncio
+async def test_custom_body_obeys_configured_budget_without_writing(registry, ctx, monkeypatch):
+    monkeypatch.setattr(
+        "openviking.session.work_item_budget.get_openviking_config",
+        lambda: SimpleNamespace(memory=MemoryConfig(work_item_token_budget=1000)),
+    )
+    updater, fs = setup_updater(registry)
+    registry.get("work_item").content_template = "{{ current_state }}{{ current_state }}"
+    with pytest.raises(ValueError, match="rendered body"):
+        await updater._apply_upsert(op(current_state="x" * 2500), ctx)
+    assert not fs.values
+
+
+def test_extraction_contracts_use_configured_budgets_and_preserve_existing_continuation(
+    registry, monkeypatch
+):
+    from openviking.session.memory.extraction_output_protocol.base import ExtractionOutputContext
+    from openviking.session.memory.extraction_output_protocol.json_protocol import (
+        JsonExtractionOutputProtocol,
+    )
+    from openviking.session.memory.extraction_output_protocol.python_protocol import (
+        PythonExtractionOutputProtocol,
+    )
+
+    monkeypatch.setattr(
+        "openviking.session.work_item_budget.get_openviking_config",
+        lambda: SimpleNamespace(
+            memory=MemoryConfig(work_item_token_budget=12345, continuation_token_budget=6789)
+        ),
+    )
+    model = SchemaModelGenerator(registry).create_structured_operations_model()
+    context = ExtractionOutputContext(
+        operations_model=model,
+        schemas=tuple(registry.list_all()),
+        page_id_map=ExtractContext([]).page_id_map,
+        read_file_contents={},
+        link_enabled=False,
+    )
+    for protocol in (JsonExtractionOutputProtocol(), PythonExtractionOutputProtocol()):
+        contract = protocol.render_contract(context)
+        assert "12345 estimated tokens" in contract
+        assert "6789 estimated tokens" in contract
+        assert "archive_only" in contract
+        assert "Previous continuation remains active by default" in contract
+        assert "Missing classifications keep original messages" not in contract
+        assert "below 600" not in contract
+        assert "within 1200" not in contract
 
 
 @pytest.mark.asyncio

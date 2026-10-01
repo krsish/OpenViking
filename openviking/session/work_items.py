@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Bounded work-item projections and their archive publication record.
 
-The mutable Markdown memory is canonical. A checkpoint records the versions
-used for its projection and retains unclassified messages verbatim. No model
-call, semantic merge, or character truncation is performed here.
+The mutable Markdown memory is canonical. Original messages stay in archives;
+only selected continuation state is projected. No model call or character
+truncation is performed here.
 """
 
+import hashlib
 import json
 from typing import Any
 
@@ -16,14 +17,16 @@ from openviking.session.memory.utils.memory_file_utils import (
     memory_version_from_fields,
 )
 from openviking.session.memory.work_item import WORK_ITEM_FIELDS, WORK_ITEM_TERMINAL_STATUSES
+from openviking.session.work_item_budget import get_work_item_budgets
 from openviking.utils.token_estimation import estimate_text_tokens
 
 WORK_ITEM_MODE = "work_item"
-PROJECTION_TOKEN_BUDGET = 3000
-RESIDUAL_TOKEN_BUDGET = 1000
+PROJECTION_TOKEN_BUDGET = 42000
+RESIDUAL_TOKEN_BUDGET = 10000
 MAX_ACTIVE_WORK_ITEMS = 3
 DETAILS_HINT = (
-    "Details: recall the work_item URI or use archive_search for the original transcript."
+    "Details: recall the work_item URI; list the session history and read an archive's "
+    "messages.jsonl (and referenced tool results) for original evidence."
 )
 
 
@@ -39,9 +42,42 @@ def ready_checkpoint(done: dict[str, Any], archive_id: str) -> bool:
 def residual_text(messages: list[dict[str, Any]]) -> str:
     if not messages:
         return ""
-    return "## Continuation (summaries and unassigned original messages)\n" + "\n".join(
-        json.dumps(message, ensure_ascii=False) for message in messages
-    )
+    parts = []
+    for message in messages:
+        if message.get("message_kind") != "checkpoint":
+            parts.append(json.dumps(message, ensure_ascii=False))
+            continue
+        content = Message.from_dict(message).content
+        source = message.get("source_checkpoint_uri")
+        if source and source not in content:
+            content += f"\nSource coverage: {source}"
+        parts.append(content)
+    return "## Continuation\n" + "\n\n".join(parts)
+
+
+def continuation_message(
+    summary: str, archive_uri: str, source_ids: list[str], created_at: str | None
+) -> dict[str, Any]:
+    """Derived state has its own identity, separate from archived user evidence."""
+    identity = hashlib.sha256(
+        json.dumps([archive_uri, source_ids, summary], ensure_ascii=False).encode()
+    ).hexdigest()[:24]
+    result = Message(
+        id=f"wi-continuation-{identity}",
+        role="assistant",
+        message_kind="checkpoint",
+        source_message_ids=list(dict.fromkeys(source_ids)),
+        parts=[
+            TextPart(
+                "Previous continuation summary (background, not new user evidence):\n"
+                + summary
+                + f"\nSource coverage: {archive_uri}/.done"
+            )
+        ],
+        created_at=created_at,
+    ).to_dict()
+    result["source_checkpoint_uri"] = f"{archive_uri}/.done"
+    return result
 
 
 def render_item(item: dict[str, Any]) -> str:
@@ -56,16 +92,23 @@ def render_item(item: dict[str, Any]) -> str:
 def build_projection(
     items: list[dict[str, Any]],
     residual: list[dict[str, Any]],
-    token_budget: int = PROJECTION_TOKEN_BUDGET,
+    token_budget: int | None = None,
+    *,
+    residual_token_budget: int | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Pack whole item blocks in priority order; never truncate constraints."""
+    budgets = get_work_item_budgets()
+    if token_budget is None:
+        token_budget = budgets.projection_token_budget
+    if residual_token_budget is None:
+        residual_token_budget = budgets.continuation_token_budget
     remaining = residual_text(residual)
     residual_tokens = estimate_text_tokens(remaining)
-    if residual_tokens > RESIDUAL_TOKEN_BUDGET:
+    if residual_tokens > residual_token_budget:
         identities = [message.get("id") for message in residual]
         raise ValueError(
             "work_item checkpoint residual exceeds its token budget: "
-            f"residual_tokens={residual_tokens}, budget={RESIDUAL_TOKEN_BUDGET}, "
+            f"residual_tokens={residual_tokens}, budget={residual_token_budget}, "
             f"message_ids={identities}"
         )
     parts = ["# Working memory", remaining, DETAILS_HINT]
@@ -101,12 +144,19 @@ def coverage_report(
     operations: list[dict[str, Any]],
     archive_uri: str,
     continuation_coverage: list[dict[str, Any]] | None = None,
+    *,
+    previous_residual: list[dict[str, Any]] | None = None,
+    source_archives: dict[str, str] | None = None,
+    previous_checkpoint_uri: str = "",
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Give every source message a destination, retaining unexplained text.
+    """Record hot-state attribution after successful extraction.
 
-    Model-provided source ranges are an extraction attribution, not a semantic
-    proof. Missing attribution is never interpreted as permission to drop text.
+    Unselected new originals remain archive-only. Previously selected state is
+    kept unless explicitly summarized, resolved, or moved into a work item.
+    The session owner, not this pure function, verifies extraction completion.
     """
+    previous = {value["id"]: value for value in previous_residual or []}
+    source_archives = source_archives or {}
     destinations: dict[str, list[str]] = {}
     for operation in operations:
         for message_id in operation.get("source_message_ids", []):
@@ -119,36 +169,66 @@ def coverage_report(
     emitted_summaries: set[int] = set()
     for message in messages:
         uris = list(dict.fromkeys(destinations.get(message.id, [])))
-        row = {"message_id": message.id}
+        row = {
+            "message_id": message.id,
+            "archive_uri": f"{source_archives.get(message.id, archive_uri)}/messages.jsonl",
+        }
+        if message.message_kind == "checkpoint":
+            row.pop("archive_uri")
+            row["source_message_ids"] = message.source_message_ids or []
+        if message.id in previous:
+            source_checkpoint = (
+                previous[message.id].get("source_checkpoint_uri") or previous_checkpoint_uri
+            )
+            if source_checkpoint:
+                row["source_checkpoint_uri"] = source_checkpoint
         if uris:
             row["work_item_uris"] = uris
         if message.id in classifications:
             entry = classifications[message.id]
             if entry.get("summary"):
-                # Preserve source identity/time but mark derived text as assistant
-                # context: a previous summary must never authorize reopening work.
                 if id(entry) not in emitted_summaries:
-                    summary = Message(
-                        id=message.id,
-                        role="assistant",
-                        parts=[
-                            TextPart(
-                                "Previous continuation summary (background, not new user evidence):\n"
-                                + entry["summary"]
-                                + f"\nSource coverage: {archive_uri}/.done"
-                            )
-                        ],
-                        created_at=message.created_at,
+                    residual.append(
+                        continuation_message(
+                            entry["summary"],
+                            archive_uri,
+                            entry["source_message_ids"],
+                            message.created_at,
+                        )
                     )
-                    residual.append(summary.to_dict())
                     emitted_summaries.add(id(entry))
-                row.update(residual_uri=f"{archive_uri}/.done", summary=entry["summary"])
+                row.update(
+                    disposition="continuation",
+                    residual_uri=f"{archive_uri}/.done",
+                    summary=entry["summary"],
+                )
             else:
+                row["disposition"] = "archive_only" if not uris else "work_item"
                 row["explicitly_dropped"] = entry["reason"]
         elif not uris:
-            residual.append(message.to_dict())
-            row["residual_uri"] = f"{archive_uri}/.done"
+            if message.id in previous:
+                residual.append(previous[message.id])
+                row.update(disposition="continuation", residual_uri=f"{archive_uri}/.done")
+            else:
+                row["disposition"] = "archive_only"
+        else:
+            row["disposition"] = "work_item"
         report.append(row)
+    # Callers may pass only the new transcript; omission cannot resolve old state.
+    seen = {message.id for message in messages}
+    for identity, value in previous.items():
+        if identity in seen:
+            continue
+        residual.append(value)
+        report.append(
+            {
+                "message_id": identity,
+                "disposition": "continuation",
+                "residual_uri": f"{archive_uri}/.done",
+                "source_checkpoint_uri": value.get("source_checkpoint_uri")
+                or previous_checkpoint_uri,
+            }
+        )
     return residual, report
 
 

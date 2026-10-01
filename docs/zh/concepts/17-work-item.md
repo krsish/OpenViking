@@ -27,15 +27,28 @@ Work-item 模式只在 working memory 中保留继续当前工作所需的有限
 
 会话投影选择近期工作，不自动激活该用户的所有未完成项。从 A 切到 B 后再要求继续 A，可以通过既有检索找回 A 并重新绑定。同一次提取最多读取三个语义候选，再明确选择与请求匹配的非终态项进行激活。单独激活不修改权威状态、不增加版本，也不声明消息已覆盖；其他检索命中不会自动激活。context 和 archive 读取按活跃 URI 重读权威状态，用模板生成视图，不调用 LLM。因此，另一个 session 已完成的工作不会继续注入旧的 next action。
 
-V1 使用 OpenViking 的 token 估算器，当前限制为：
+V1 使用 OpenViking 的 token 估算器，默认限制为：
 
 | 内容 | 上限 |
 | --- | --- |
-| 单个 work item 全部短字段之和 | 1,200 估算 tokens |
-| 权威 Markdown 渲染正文 | 4,000 估算 tokens |
-| WM 投影，含 residual 和恢复提示 | 3,000 估算 tokens |
+| 单个 work item 全部短字段之和、权威 Markdown 渲染正文 | 各 10,000 估算 tokens |
+| WM 投影，含 continuation 和恢复提示 | 42,000 估算 tokens |
 | 单次投影的活跃项 | 最多 3 项 |
-| 续接摘要与未归属原消息的 residual | 1,000 估算 tokens |
+| 完整 continuation，含上一轮续接状态和格式开销 | 10,000 估算 tokens |
+
+这三个预算在服务端 `memory` 配置中设置，与会话 policy 分开：
+
+```json
+{
+  "memory": {
+    "work_item_token_budget": 10000,
+    "continuation_token_budget": 10000,
+    "work_item_projection_token_budget": 42000
+  }
+}
+```
+
+默认总预算可容纳三个达到上限的 work item、一份完整 continuation 和格式开销。这些是容量上限，不是要求模型写满的目标。来源 ID 和逐消息归宿保存在 archive 覆盖账本中，不将整个账本渲染进 working memory。
 
 投影按完整 work-item 块选择，不通过按字符截断约束来凑预算。调用方的 context 预算还必须容纳未覆盖的原文尾部。超限更新会失败，保留此前的权威正文。
 
@@ -43,11 +56,19 @@ V1 使用 OpenViking 的 token 估算器，当前限制为：
 
 后台 commit 分别运行普通 memory 和 work-item 两路独立的 LLM 提取，使用各自的 schema、prompt 和召回范围，并行处理后复用现有更新链路。普通 memory 不注入 work-item 规则或工具证据。每路仍可按现有 ExtractLoop 执行读取或格式修复，因此不保证恰好两次底层模型请求。
 
-每条源消息可以归属于成功更新的 work item、保留为有界续接摘要，或明确记录无需续接的原因；没有明确归宿时仍保留原文。同一消息里的任务状态和额外会话约束可以同时保留。摘要通过 work-item 提取输出（Python 的 `sdk.continuation` 或 JSON 的 `continuation_coverage`），不新增总结调用；下轮作为 assistant 背景携带，不能作为重新开启终态任务的新用户证据。原始 transcript 不修改，完整来源保存在覆盖账本中。
+提取成功后，没有被选入 work-item 状态或 continuation 的新原消息记为 `archive_only`。完整内容仍保存在 `messages.jsonl` 及其引用的工具结果存储中，不再复制进热视图。同一消息里的任务状态和额外会话约束可以同时保留。此前已经选中的 continuation 默认保留：后续输出省略它，不代表它已经解决。提取器必须明确更新、合并、解除或将其转入 work item，旧续接状态才能退出。
 
-多个成功写入的 work item 分担同一原消息的不同片段时，会合并其 ranges 后判断整条消息是否覆盖；失败写入不贡献覆盖。工具 input/output 每个字段最多保留前 2,000 字符，并附截断提示；整块工具证据最多 16,000 估算 tokens，优先近期结果。partial 表示预览不完整，不剥夺消息归属和续接分类资格。状态更新可以使用可见证据，但不能虚构未见结果或将工具结束等同于任务完成；结果不明确时保留待验证事项及引用。模型提供的 source ranges 和分类是归属声明，账本**不是所有续接事实均已保留的形式证明**。缺少归属不能被解释为允许丢弃消息；residual 超限时不发布 checkpoint，并在 archive metadata 保留实际 token 数、预算与逐消息归宿供排查。
+常规续接摘要来自 work-item 提取输出（Python 的 `sdk.continuation` 或 JSON 的 `continuation_coverage`），不额外调用总结模型。摘要使用独立的 checkpoint ID，携带来源引用，作为 assistant 背景传递，不能成为重新开启终态任务的新用户证据。明确成功的空提取结果可以让新消息仅归档；异常、无返回或根本未执行提取时，不能仅因原文已保存就推进 checkpoint。
 
-Archive 在应用前将已分配 ID 的 work-item 操作保存在现有 metadata，部分写入后重试复用同一计划及来源，不因模型重排或重新分批生成新 ID；已应用的同版本操作不会重复写入，其他 session 的更新仍受版本检查保护。全部计划操作成功后才记录该批完成。生成有界投影后，最后通过临时文件加 rename 发布 `.done`。只有 overview 文件不代表 checkpoint 就绪。未完成项移出热视图前，要逐项确认其向量记录覆盖所需的权威版本；终态项仍异步索引，但不阻塞发布。这不是等待全局 embedding 队列的屏障，仍在热视图内的项不必等待无关索引。保存原文与可通过向量检索找回是两个不同条件。
+多个成功写入的 work item 分担同一原消息的不同片段时，会合并其 ranges 后判断整条消息是否覆盖；失败写入不贡献覆盖。工具 input/output 每个字段最多保留前 2,000 字符，并附截断提示；整块工具证据最多 16,000 估算 tokens，优先近期结果。partial 表示预览不完整，不剥夺消息归属和续接分类资格。状态更新可以使用可见证据，但不能虚构未见结果或将工具结束等同于任务完成；结果不明确时保留待验证事项及引用。模型提供的 source ranges 和分类是归属声明，账本**不是所有续接事实均已保留的形式证明**。archive_only 内容可从存储追回，但模型仍可能漏选应进入热视图的新信息；存储层保留原文不等于热记忆没有遗漏。
+
+Archive 在应用前将已分配 ID 的 work-item 操作保存在现有 metadata，部分写入后重试保留原 ID、消息批次和来源。每项成功写入有独立回执；即使进程在记录批次进度前中断，或其他 session 随后更新该项，也不会重复应用已成功的操作。权威文件只携带一个待落盘回执，历史回执保存在原 archive 的 `work-item-receipts/` 下，避免权威状态随重试无限增长。
+
+遇到版本冲突时，下一次后台重试只读取冲突项的最新权威状态，并结合原始证据重新提取这些项的更新；已成功项、原有续接分类和任务身份保持不变。修订后的计划必须先持久化，才能再次尝试版本检查和写入；后续 archive 继承最高修订版本。每次处理最多执行一轮冲突重提取，再次冲突则保留进度等待下次重试。全部计划操作成功后才记录该批完成。模型、存储持续不可用或冲突持续发生时仍会失败，不会强行覆盖最新状态或发布不完整 checkpoint。
+
+提取完成与 checkpoint 就绪分开记录。完整 continuation 超预算，或旧 checkpoint 仍携带旧格式原文 residual 时，单独的后台 repair 阶段负责压缩续接内容。这个异常恢复路径会调用 LLM；正常投影、context 读取、archive 读取和 Pi compact hook 不调用 LLM。Repair 重试复用已完成的权威状态写入，不重新执行这些写入，也不因冻结的旧提取结果而反复使用同一份超大 continuation。成功的 repair 结果会持久化，后续发布失败时可以复用；repair 失败或结果仍超预算时不发布 checkpoint，保留进度和诊断信息供下次重试。
+
+生成有界投影后，最后通过临时文件加 rename 发布 `.done`。只有 overview 文件不代表 checkpoint 就绪。未完成项移出热视图前，要逐项确认其向量记录覆盖所需的权威版本；终态项仍异步索引，但不阻塞发布。这不是等待全局 embedding 队列的屏障，仍在热视图内的项不必等待无关索引。保存原文与可通过向量检索找回是两个不同条件。
 
 最后一个就绪 checkpoint 之后的 pending、failed archive 都保留为原文续接。若权威状态刷新后无法生成合法视图，服务端不返回可用 checkpoint，并保留原历史供回退。请求预算不足时返回 `budget_insufficient`，不返回可推进的 checkpoint 边界；调用方必须保留自己的 transcript，或增大预算。
 
@@ -60,4 +81,4 @@ Pi 请求 compact 时采用两级回退：
 
 Hook 对缓存 checkpoint 只刷新一次，不新增 LLM 调用或等待索引、就绪状态；迟到的 checkpoint 不能覆盖已经完成的新 Pi compact。
 
-V1 暂不提供专门的主动 work-item 写入 API、依赖图、legacy 自动迁移或完美语义匹配保证。通用正文 write 不能绕过 work-item 校验。冷项通过现有 recall 按需恢复，archive 保留原始证据，供 `archive_search` 和原文读取使用。
+V1 暂不提供专门的主动 work-item 写入 API、依赖图、legacy 自动迁移或完美语义匹配保证。通用正文 write 不能绕过 work-item 校验。冷项通过现有 recall 按需恢复；原始证据可通过列举 session history，找到对应 archive，再分段读取 `messages.jsonl` 及其引用的工具结果恢复。

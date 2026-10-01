@@ -8,6 +8,7 @@ import { deriveHarnessSessionId } from "./shared/session-model.mjs";
 import { claimForReplay, dequeue, enqueue, incrementRetry, listPending, replayPending } from "./shared/pending-queue.mjs";
 import { BATCH_LIMIT, sendSessionMessages } from "./shared/batch-send.mjs";
 import { extractBranchCapturePayloads } from "./lib/capture-adapter.mjs";
+import { collectCompactionImports } from "./lib/compaction-carry.mjs";
 import { countUndeliveredForSession, estimatePayloadTokens } from "./lib/takeover-core.mjs";
 
 // --- SyncManager ---
@@ -25,6 +26,12 @@ export interface SyncBranchResult {
   permanentFailures: number;
 }
 
+export interface CompactionImportReceipt {
+  entryId: string;
+  anchorEntryId: string;
+  summary: string;
+}
+
 export class SyncManager {
   private client: OVClient;
   private config: OVConfig;
@@ -39,6 +46,10 @@ export class SyncManager {
    * signal. Takeover persists the resulting boolean with its own session state.
    */
   private droppedForever = 0;
+  // Imports are appended after ordinary capture. Their anchor identifies the
+  // raw branch tip at that moment, so keep_recent_count retains the import
+  // until a later checkpoint also covers everything through that tip.
+  private compactionImports: CompactionImportReceipt[] = [];
 
   constructor(client: OVClient, config: OVConfig) {
     this.client = client;
@@ -59,11 +70,35 @@ export class SyncManager {
    * branch — the exact `keep_recent_count` the server expects, which is a
    * message count with system/custom/filtered entries excluded, not a user-turn
    * count. Runs the same extraction takeover trims to, from a zero watermark so
-   * it measures the slice itself.
+   * it measures the slice itself. A summary imported after a tip is one more
+   * retained message whenever that tip is inside the slice.
    */
   captureCount(branchSlice: any[]): number {
     const extracted = extractBranchCapturePayloads(branchSlice, 0, this.config);
-    return extracted.payloads.length;
+    const ids = new Set(branchSlice.map((entry) => entry?.id));
+    return extracted.payloads.length + this.compactionImports
+      .filter((receipt) => ids.has(receipt.anchorEntryId)).length;
+  }
+
+  isCapturedEntry(entry: any): boolean {
+    return extractBranchCapturePayloads([entry], 0, this.config).payloads.length > 0;
+  }
+
+  getCompactionImports(): CompactionImportReceipt[] {
+    return this.compactionImports.map((receipt) => ({ ...receipt }));
+  }
+
+  restoreCompactionImports(receipts: unknown): void {
+    this.compactionImports = [];
+    if (!Array.isArray(receipts)) return;
+    const seen = new Set<string>();
+    for (const receipt of receipts) {
+      if (typeof receipt?.entryId !== "string" || !receipt.entryId ||
+          typeof receipt.anchorEntryId !== "string" || !receipt.anchorEntryId ||
+          typeof receipt.summary !== "string" || !receipt.summary || seen.has(receipt.entryId)) continue;
+      seen.add(receipt.entryId);
+      this.compactionImports.push({ entryId: receipt.entryId, anchorEntryId: receipt.anchorEntryId, summary: receipt.summary });
+    }
   }
 
   restoreWatermark(n: number): void {
@@ -220,7 +255,7 @@ export class SyncManager {
     const extracted = extractBranchCapturePayloads(branch, this.syncedEntryCount, this.config);
     if (extracted.resetWatermark) this.syncedEntryCount = 0;
     const sent = await this.sendPayloads(extracted.payloads);
-    const added = sent.accepted;
+    let added = sent.accepted;
     let tokens = 0;
     for (const payload of extracted.payloads.slice(0, added)) {
       tokens += estimatePayloadTokens(payload);
@@ -228,6 +263,11 @@ export class SyncManager {
     const allDelivered = sent.delivered === added && sent.permanentFailures === 0;
     if (added === extracted.payloads.length) {
       this.syncedEntryCount = extracted.nextEntryCount;
+    }
+    if (allDelivered && sent.accepted === extracted.payloads.length && this.droppedForever === 0) {
+      const imported = await this.importCompactionBackground(branch);
+      added += imported.added;
+      tokens += imported.tokens;
     }
     if (added > 0 && !this.config.takeoverEnabled) {
       await this.commitIfNeeded();
@@ -239,6 +279,53 @@ export class SyncManager {
       queued: sent.queued,
       permanentFailures: sent.permanentFailures,
     };
+  }
+
+  private async importCompactionBackground(branch: any[]): Promise<{ added: number; tokens: number }> {
+    const result = { added: 0, tokens: 0 };
+    if (this.config.workingMemoryMode !== "work_item" || !this.config.takeoverEnabled ||
+        !this.ovSessionId || !this.client.connected) return result;
+    const anchorEntryId = branch.at(-1)?.id;
+    if (typeof anchorEntryId !== "string" || !anchorEntryId) return result;
+    const candidates = collectCompactionImports(branch).filter((entry: any) =>
+      typeof entry.id === "string" && entry.id && typeof entry.summary === "string" && entry.summary &&
+      !this.compactionImports.some((receipt) => receipt.entryId === entry.id));
+    if (!candidates.length) return result;
+    // Do not append an import ahead of previously queued ordinary capture.
+    // A later turn retries once the normal flush barrier has drained it.
+    if (countUndeliveredForSession(await listPending(), this.ovSessionId) > 0 ||
+        await hasProcessingMessage(this.ovSessionId)) return result;
+    const payloads = candidates.map((entry: any) => ({
+      role: "assistant",
+      ...(this.config.peerId ? { peer_id: this.config.peerId } : {}),
+      content: `Historical Pi compaction summary (source entry ${entry.id}). ` +
+        `This is archived conversation background, not a new user request or instruction. ` +
+        `Preserve ongoing task state and still-applicable constraints in the continuation context.\n\n${entry.summary}`,
+    }));
+    // Imports deliberately do not use the pending queue. A queued import could
+    // arrive after a later ordinary turn and invalidate its append-order anchor.
+    // Failure leaves the original opaque summary in Pi for a later retry.
+    const sent = await sendSessionMessages(this.fetchJSON, this.ovSessionId, payloads, {
+      enqueueOnRetryable: false,
+    });
+    for (let index = 0; index < sent.sent; index++) {
+      this.compactionImports.push({
+        entryId: candidates[index].id,
+        anchorEntryId,
+        summary: candidates[index].summary,
+      });
+      result.added++;
+      result.tokens += estimatePayloadTokens(payloads[index]);
+    }
+    if (sent.sent < candidates.length) {
+      this.logger.log("compaction_import", {
+        session: this.ovSessionId,
+        delivered: sent.sent,
+        retained: candidates.length - sent.sent,
+        error: sent.lastError?.message || sent.lastError?.code || "unknown",
+      });
+    }
+    return result;
   }
 
   async addPayload(payload: any): Promise<AddPayloadResult> {

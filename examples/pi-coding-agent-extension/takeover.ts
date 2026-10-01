@@ -27,8 +27,11 @@ export function createTakeoverManager(opts: {
       // Whether a still-unsummarized archive can get its summary at all.
       archiveState: (archiveUri: string) => client.getArchiveState(archiveUri),
       // The exact server keep_recent_count for the retained tail (message count,
-      // not user-turn count): system, custom and filtered entries excluded.
+      // not user-turn count), including summary imports appended inside it.
       captureCount: (branchSlice: any[]) => sync.captureCount(branchSlice),
+      isCapturedEntry: (entry: any) => sync.isCapturedEntry(entry),
+      getCompactionImports: () => sync.getCompactionImports(),
+      restoreCompactionImports: (receipts: unknown) => sync.restoreCompactionImports(receipts),
       persistEntry: (customType: string, data: any) => {
         if (typeof pi?.appendEntry === "function") {
           pi.appendEntry(customType, data);

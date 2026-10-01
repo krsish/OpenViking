@@ -213,7 +213,7 @@ filtered or truncated the original Pi transcript.
 | `workingMemoryMode`      | `"legacy"` | Opt in with `"work_item"` for published work-item checkpoints; selected when a new OV session is created |
 | `takeoverTokenThreshold` | `30000`    | Synced-token pressure that triggers commit and boundary advance           |
 | `takeoverKeepRecentTurns`| `3`        | Recent user turns retained in full fidelity                              |
-| `takeoverOverviewBudget` | `3000`     | Token budget for the injected archive overview                           |
+| `takeoverOverviewBudget` | `3000` (`legacy`), `42000` (`work_item`) | Maximum estimated tokens in the published overview. Env: `OPENVIKING_TAKEOVER_OVERVIEW_BUDGET` |
 | `takeoverOverviewPollMs` | `2000`     | Delay between overview reads while answering pi's compaction             |
 | `takeoverOverviewPollMax`| `15`       | Max overview reads for pi's compaction; capped by the 25s handler budget |
 
@@ -222,6 +222,53 @@ threshold and pending-archive checks to prepare checkpoints in the background.
 It reads the archive API and requires a matching archive ID and a version-1
 `checkpoint` with `compact_ready: true`; an `.overview.md` file alone is never
 enough. The polling settings above apply only to legacy mode.
+
+Work-item checkpoints can carry `continuation_version: 2` while the checkpoint
+format itself remains version 1. The server retains original messages in the
+archive and puts the selected task state and continuation into the current
+working-memory view. Messages routed as `archive_only` remain available through
+the archive without requiring their full text in every subsequent overview.
+
+The server's budgets are configured in `ov.conf`, under `memory`:
+
+```json
+{
+  "memory": {
+    "work_item_token_budget": 10000,
+    "continuation_token_budget": 10000,
+    "work_item_projection_token_budget": 42000
+  }
+}
+```
+
+`work_item_token_budget` limits one canonical task state and its rendered body;
+`continuation_token_budget` limits the complete continuation block;
+`work_item_projection_token_budget` limits the entire published working-memory
+view. The 42000-token default accommodates up to three 10000-token work items,
+a 10000-token continuation, and formatting. These are estimated-token ceilings,
+not target sizes that the server fills on every turn.
+
+Pi's default `takeoverOverviewBudget` is 42000 only in `work_item` mode. Set an
+explicit client limit in `ovcli.conf` when coordinating it with the server:
+
+```json
+{
+  "plugin": {
+    "pi": {
+      "workingMemoryMode": "work_item",
+      "takeoverOverviewBudget": 42000
+    }
+  }
+}
+```
+
+Alternatively, `OPENVIKING_TAKEOVER_OVERVIEW_BUDGET=42000` overrides the file.
+An existing explicit value, including `3000` from the earlier example, continues
+to apply after enabling work-item mode; remove it to use the mode's default or
+raise it to match the server's view budget. Legacy mode still defaults to 3000.
+This limit only admits the overview: the compaction hook also checks the whole
+request against the model's context window and falls back to Pi compaction if
+the overview plus retained context and output reserve cannot fit.
 
 At Pi's compaction hook, a pending checkpoint can fall back to the previous
 ready checkpoint plus the complete Pi transcript between its coverage boundary

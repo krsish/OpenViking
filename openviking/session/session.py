@@ -6,6 +6,7 @@ Session as Context: Sessions integrated into L0/L1/L2 system.
 """
 
 import asyncio
+import hashlib
 import inspect
 import json
 import re
@@ -57,6 +58,7 @@ from openviking.session.retention import (
     plan_retention,
 )
 from openviking.session.tool_output_externalizer import ToolOutputExternalizer
+from openviking.session.work_item_replay import merge_work_item_replays
 from openviking.session.working_memory import (
     WM_CREATE_WITH_CHECKPOINTS_TOOL,
     WM_SEVEN_SECTIONS,
@@ -2170,6 +2172,10 @@ class Session:
                         fn: Callable[[], Awaitable[Any]],
                     ) -> Any:
                         result = await _run_retryable_phase2_step(operation_name, fn)
+                        if work_item_mode and not isinstance(result, dict):
+                            raise ValueError(
+                                "work_item extraction did not return a completed result"
+                            )
                         if work_item_mode and isinstance(result, dict):
                             meta = await self._archives.read_meta(archive_uri)
                             await self._merge_archive_meta(
@@ -2260,10 +2266,13 @@ class Session:
                                         else batch_messages
                                     )
                                     source_ids = [message.id for message in source_messages]
+                                    current_plans = merge_work_item_replays(
+                                        current_meta.get("work_item_replays", [])
+                                    )
                                     replay = next(
                                         (
                                             plan
-                                            for plan in current_meta.get("work_item_replays", [])
+                                            for plan in current_plans
                                             if plan["message_ids"] == source_ids
                                         ),
                                         None,
@@ -2272,9 +2281,10 @@ class Session:
                                     async def save_replay(plan: Dict[str, Any]) -> None:
                                         latest = await self._archives.read_meta(archive_uri)
                                         plans = latest.get("work_item_replays", [])
-                                        if plan not in plans:
+                                        merged = merge_work_item_replays(plans, [plan])
+                                        if merged != plans:
                                             await self._merge_archive_meta(
-                                                archive_uri, {"work_item_replays": [*plans, plan]}
+                                                archive_uri, {"work_item_replays": merged}
                                             )
 
                                     work_item_kwargs.update(
@@ -2308,7 +2318,7 @@ class Session:
                                     **work_item_kwargs,
                                 )
 
-                            replay_plans = (
+                            replay_plans = merge_work_item_replays(
                                 (await self._archives.read_meta(archive_uri)).get(
                                     "work_item_replays", []
                                 )
@@ -2430,6 +2440,14 @@ class Session:
                                 )
 
                 if work_item_mode and working_memory_enabled:
+                    unprocessed = {message.id for message in messages} - completed_memory_steps.get(
+                        "long_term", set()
+                    )
+                    if unprocessed:
+                        raise ValueError(
+                            "work_item checkpoint requires successful extraction of all batches: "
+                            + ", ".join(sorted(unprocessed))
+                        )
                     work_checkpoint = await self._prepare_work_item_checkpoint(
                         archive_uri, messages, previous_checkpoint
                     )
@@ -2583,6 +2601,9 @@ class Session:
                 completed, meta.get("completed_memory_steps")
             )
             for key in keys:
+                if key == "work_item_replays":
+                    inherited[key] = merge_work_item_replays(inherited[key], meta.get(key, []))
+                    continue
                 inherited[key].extend(
                     value for value in meta.get(key, []) if value not in inherited[key]
                 )
@@ -2647,21 +2668,37 @@ class Session:
         )
         uris.extend(uri for uri in previous_uris if uri not in uris)
         items = [await wi.read_work_item(self._viking_fs, self.ctx, uri) for uri in uris]
+        source_archives = await self._work_item_source_archives(archive_uri, messages)
         residual, coverage = wi.coverage_report(
             messages,
             meta.get("work_item_coverage", []),
             archive_uri,
             meta.get("continuation_coverage", []),
+            previous_residual=previous.get("residual", []),
+            source_archives=source_archives,
+            previous_checkpoint_uri=(
+                f"{self._session_uri}/history/{previous['archive_id']}/.done"
+                if previous.get("archive_id")
+                else ""
+            ),
         )
-        # Persist the ledger even if budget/index checks below reject publication.
+        budgets = wi.get_work_item_budgets()
+        residual_tokens = estimate_text_tokens(wi.residual_text(residual))
+        # Keep diagnostics even if continuation repair or publication fails.
         await self._merge_archive_meta(
             archive_uri,
             {
                 "coverage": coverage,
-                "residual_tokens": estimate_text_tokens(wi.residual_text(residual)),
-                "residual_token_budget": wi.RESIDUAL_TOKEN_BUDGET,
+                "residual_tokens": residual_tokens,
+                "residual_token_budget": budgets.continuation_token_budget,
             },
         )
+        # This stage is independently repeatable after canonical writes finish.
+        # It never replays those writes or the frozen extraction plan.
+        residual = await self._prepare_work_item_continuation(archive_uri, residual, meta)
+        repaired_tokens = estimate_text_tokens(wi.residual_text(residual))
+        if repaired_tokens != residual_tokens:
+            await self._merge_archive_meta(archive_uri, {"residual_tokens": repaired_tokens})
         overview, active = wi.build_projection(items, residual)
         active_uris = {item["uri"] for item in active}
         cold = [
@@ -2699,6 +2736,7 @@ class Session:
         return {
             "mode": wi.WORK_ITEM_MODE,
             "version": 1,
+            "continuation_version": 2,
             "archive_id": archive_uri.rsplit("/", 1)[-1],
             "compact_ready": True,
             "work_items": [
@@ -2713,6 +2751,97 @@ class Session:
             "residual": residual,
             "coverage": coverage,
         }
+
+    async def _work_item_source_archives(
+        self, archive_uri: str, messages: List[Message]
+    ) -> Dict[str, str]:
+        """Locate the actual raw archive even when recovering failed predecessors."""
+        pending = {message.id for message in messages if message.message_kind != "checkpoint"}
+        sources = {}
+        current = self._archives.archive_index_from_uri(archive_uri)
+        for ref in await self._archives.list_refs():
+            if ref["index"] > current:
+                continue
+            for source in await self._archives.read_messages(ref["archive_uri"]):
+                if source.id in pending:
+                    sources[source.id] = ref["archive_uri"]
+                    pending.remove(source.id)
+            if not pending:
+                break
+        return sources
+
+    async def _prepare_work_item_continuation(
+        self, archive_uri: str, residual: List[Dict[str, Any]], meta: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        """Migrate legacy raw carry and repair oversized summaries independently."""
+        budgets = wi.get_work_item_budgets()
+        # Reserve the fixed projection wrapper even when the caller configures
+        # an overall budget smaller than the continuation allowance.
+        wrapper, _ = wi.build_projection([], [], token_budget=budgets.projection_token_budget)
+        limit = min(
+            budgets.continuation_token_budget,
+            budgets.projection_token_budget - estimate_text_tokens(wrapper) - 8,
+        )
+        needs_migration = any(value.get("message_kind") != "checkpoint" for value in residual)
+        if not needs_migration and estimate_text_tokens(wi.residual_text(residual)) <= limit:
+            return residual
+        if limit <= 0:
+            raise ValueError("work_item projection has no room for continuation")
+        fingerprint = hashlib.sha256(
+            json.dumps([residual, limit], sort_keys=True, ensure_ascii=False).encode()
+        ).hexdigest()
+        cached = meta.get("continuation_projection", {})
+        if cached.get("input_hash") == fingerprint and cached.get("status") == "ready":
+            result = cached.get("residual")
+            if (
+                isinstance(result, list)
+                and result
+                and all(value.get("message_kind") == "checkpoint" for value in result)
+                and estimate_text_tokens(wi.residual_text(result)) <= limit
+            ):
+                return result
+        await self._merge_archive_meta(
+            archive_uri,
+            {
+                "continuation_projection": {"status": "pending", "input_hash": fingerprint},
+            },
+        )
+        # The model candidate is rendered before we attach the publication URI.
+        # Reserve that mandatory suffix so a near-limit candidate participates
+        # in the compactor's shrinking retries instead of failing forever here.
+        repair_limit = limit - estimate_text_tokens(f"\nSource coverage: {archive_uri}/.done")
+        if repair_limit <= 0:
+            raise ValueError("work_item continuation budget cannot fit its source reference")
+        result = await self._compact_work_item_continuation(residual, repair_limit)
+        if not result or any(value.get("message_kind") != "checkpoint" for value in result):
+            raise ValueError("continuation repair returned no valid continuation state")
+        for value in result:
+            value["source_checkpoint_uri"] = f"{archive_uri}/.done"
+            value["source_continuation_ids"] = [source["id"] for source in residual]
+        # A model or adapter must never bypass the actual rendered budget check.
+        wi.build_projection([], result, residual_token_budget=limit)
+        await self._merge_archive_meta(
+            archive_uri,
+            {
+                "continuation_projection": {
+                    "status": "ready",
+                    "input_hash": fingerprint,
+                    "residual": result,
+                },
+            },
+        )
+        return result
+
+    async def _compact_work_item_continuation(
+        self, residual: List[Dict[str, Any]], token_budget: int
+    ) -> List[Dict[str, Any]]:
+        """Bounded background retry; never invoked by context/compact reads."""
+        from openviking.session.continuation import compact_continuation
+
+        vlm = await self._get_vlm_config()
+        if not (vlm and vlm.is_available()):
+            raise ValueError("A configured VLM is required to repair continuation state")
+        return await compact_continuation(vlm, residual, token_budget)
 
     async def _read_work_item_projection(
         self, checkpoint: Dict[str, Any]

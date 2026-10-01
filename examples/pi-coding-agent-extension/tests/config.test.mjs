@@ -33,6 +33,7 @@ async function withPluginSection(body, fn, env = {}, cliConfig = null) {
     OV_DEBUG_LOG: process.env.OV_DEBUG_LOG,
     OPENVIKING_BYPASS_SESSION: process.env.OPENVIKING_BYPASS_SESSION,
     OPENVIKING_BYPASS_SESSION_PATTERNS: process.env.OPENVIKING_BYPASS_SESSION_PATTERNS,
+    OPENVIKING_TAKEOVER_OVERVIEW_BUDGET: process.env.OPENVIKING_TAKEOVER_OVERVIEW_BUDGET,
   };
   process.env.OPENVIKING_CREDENTIAL_SOURCE = "env";
   process.env.OPENVIKING_URL = "http://127.0.0.1:1933";
@@ -48,6 +49,7 @@ async function withPluginSection(body, fn, env = {}, cliConfig = null) {
   delete process.env.OV_DEBUG_LOG;
   delete process.env.OPENVIKING_BYPASS_SESSION;
   delete process.env.OPENVIKING_BYPASS_SESSION_PATTERNS;
+  delete process.env.OPENVIKING_TAKEOVER_OVERVIEW_BUDGET;
   for (const [key, value] of Object.entries(env)) {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
@@ -82,8 +84,29 @@ test("loadConfig defaults takeover on", async () => {
 });
 
 test("loadConfig opts into work-item memory explicitly and rejects unknown modes", async () => {
-  await withPluginSection({ workingMemoryMode: "work_item" }, (cfg) => assert.equal(cfg.workingMemoryMode, "work_item"));
-  await withPluginSection({ workingMemoryMode: "automatic" }, (cfg) => assert.equal(cfg.workingMemoryMode, "legacy"));
+  await withPluginSection({ workingMemoryMode: "work_item" }, (cfg) => {
+    assert.equal(cfg.workingMemoryMode, "work_item");
+    assert.equal(cfg.takeoverOverviewBudget, 42000);
+  });
+  await withPluginSection({ workingMemoryMode: "automatic" }, (cfg) => {
+    assert.equal(cfg.workingMemoryMode, "legacy");
+    assert.equal(cfg.takeoverOverviewBudget, 3000);
+  });
+});
+
+test("work-item overview budget preserves JSON choices and accepts an environment override", async () => {
+  await withPluginSection({ workingMemoryMode: "work_item", takeoverOverviewBudget: 3000 }, (cfg) => {
+    assert.equal(cfg.takeoverOverviewBudget, 3000, "an explicit legacy-sized budget stays explicit");
+  });
+  await withPluginSection({ workingMemoryMode: "work_item", takeoverOverviewBudget: 24000 }, (cfg) => {
+    assert.equal(cfg.takeoverOverviewBudget, 24000);
+  });
+  await withPluginSection({ workingMemoryMode: "work_item", takeoverOverviewBudget: 24000 }, (cfg) => {
+    assert.equal(cfg.takeoverOverviewBudget, 36000);
+  }, { OPENVIKING_TAKEOVER_OVERVIEW_BUDGET: "36000" });
+  await withPluginSection({ workingMemoryMode: "work_item", takeoverOverviewBudget: "invalid" }, (cfg) => {
+    assert.equal(cfg.takeoverOverviewBudget, 42000, "invalid settings do not masquerade as an explicit budget");
+  });
 });
 
 test("loadConfig reads the takeover knobs", async () => {

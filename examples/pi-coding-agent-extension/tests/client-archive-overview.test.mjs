@@ -32,6 +32,7 @@ test("readArchiveCheckpoint requires a matching published archive and never read
       starting_message_id: "s1", ending_message_id: "s2", work_items: [] } };
   for (const [result, ready] of [
     [valid, true],
+    [{ ...valid, checkpoint: { ...valid.checkpoint, continuation_version: 2 } }, true],
     [{ ...valid, status: "not_ready" }, false],
     [{ ...valid, archive_id: "archive_006" }, false],
     [{ ...valid, checkpoint: { ...valid.checkpoint, archive_id: "archive_006" } }, false],

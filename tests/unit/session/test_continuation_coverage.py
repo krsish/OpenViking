@@ -78,15 +78,17 @@ def test_long_unassigned_conversation_can_publish_after_explicit_continuation_su
     assert f"Source coverage: {ARCHIVE}/.done" in projection
 
 
-def test_unclassified_long_message_keeps_original_and_explains_budget_failure():
-    raw = message("unclassified-long", "No classification yet. " * 600)
+def test_unselected_long_message_has_an_archive_destination_without_entering_hot_context():
+    raw = message("unselected-long", "Historical diagnostic output. " * 30000)
 
     residual, ledger = wi.coverage_report([raw], [], ARCHIVE)
+    projection, _ = wi.build_projection([], residual)
 
-    assert residual == [raw.to_dict()]
-    assert ledger == [{"message_id": raw.id, "residual_uri": f"{ARCHIVE}/.done"}]
-    with pytest.raises(ValueError, match="residual_tokens=.*message_ids=.*unclassified-long"):
-        wi.build_projection([], residual)
+    assert residual == []
+    assert ledger[0]["message_id"] == raw.id
+    assert ledger[0]["disposition"] == "archive_only"
+    assert ledger[0]["archive_uri"] == f"{ARCHIVE}/messages.jsonl"
+    assert "Historical diagnostic output" not in projection
 
 
 @pytest.mark.parametrize(
@@ -100,14 +102,16 @@ def test_discard_requires_nonempty_reason_and_cannot_compete_with_summary(fields
         wi.resolve_continuation_coverage(context, [{"ranges": "0", **fields}])
 
 
-def test_explicit_discard_is_auditable_and_does_not_drop_neighbouring_constraint():
+def test_explicit_discard_is_auditable_and_does_not_drop_previous_constraint():
     messages = [message("hello", "Hello!"), message("constraint", CONSTRAINT)]
     classified = wi.resolve_continuation_coverage(
         ExtractContext(messages),
         [{"ranges": "0", "reason": "Greeting only; no unresolved question or commitment."}],
     )
 
-    residual, ledger = wi.coverage_report(messages, [], ARCHIVE, classified)
+    residual, ledger = wi.coverage_report(
+        messages, [], ARCHIVE, classified, previous_residual=[messages[1].to_dict()]
+    )
 
     assert residual == [messages[1].to_dict()]
     assert ledger[0]["explicitly_dropped"].startswith("Greeting only")
@@ -169,23 +173,25 @@ def test_partial_tool_result_can_be_classified_by_summary_or_reason(classificati
         assert ledger[0]["explicitly_dropped"] == classification["reason"]
 
 
-def test_partial_chunks_do_not_release_full_original_message():
+def test_partial_chunks_do_not_falsely_claim_full_source_summary_coverage():
     raw = message("chunked", "An unresolved detail remains. " * 500 + CONSTRAINT)
     context = ExtractContext([raw])
     assert len(context.messages) > 1
 
     partial = wi.resolve_continuation_coverage(context, [{"ranges": "0", "summary": "One detail."}])
-    residual, _ = wi.coverage_report([raw], [], ARCHIVE, partial)
+    residual, ledger = wi.coverage_report([raw], [], ARCHIVE, partial)
 
     assert partial == []
-    assert residual == [raw.to_dict()]
+    assert residual == []
+    assert ledger[0]["disposition"] == "archive_only"
+    assert "summary" not in ledger[0]
     complete = wi.resolve_continuation_coverage(
         context, [{"ranges": all_ranges(context), "summary": CONSTRAINT}]
     )
     assert complete[0]["source_message_ids"] == [raw.id]
 
 
-def test_ranges_covering_one_message_and_part_of_next_keep_next_original():
+def test_ranges_covering_one_message_and_part_of_next_only_attribute_complete_source():
     short = message("short", "Wait for invoice approval.")
     long = message("long", "Still needed detail. " * 500 + CONSTRAINT)
     context = ExtractContext([short, long])
@@ -198,9 +204,10 @@ def test_ranges_covering_one_message_and_part_of_next_keep_next_original():
 
     assert classified[0]["source_message_ids"] == [short.id]
     assert residual[0]["role"] == "assistant"
-    assert residual[1] == long.to_dict()
+    assert len(residual) == 1
     assert "summary" in ledger[0]
     assert "summary" not in ledger[1]
+    assert ledger[1]["disposition"] == "archive_only"
 
 
 def test_overlapping_classifications_are_rejected_before_coverage_changes():
@@ -319,13 +326,19 @@ def test_summary_survives_next_round_as_background_context_with_constraints():
     inherited = Message.from_dict(previous[0])
     new_message = message("new", "Continue checking the invoice.")
 
-    residual, _ = wi.coverage_report([inherited, new_message], [], ARCHIVE + "-next")
+    residual, ledger = wi.coverage_report(
+        [inherited, new_message], [], ARCHIVE + "-next", previous_residual=previous
+    )
     projection, _ = wi.build_projection([], residual)
 
     assert inherited.role == "assistant"
+    assert inherited.id != raw.id
+    assert inherited.message_kind == "checkpoint"
+    assert inherited.source_message_ids == [raw.id]
     assert inherited.created_at == raw.created_at
     assert CONSTRAINT in projection
-    assert "Continue checking the invoice." in projection
+    assert "Continue checking the invoice." not in projection
+    assert ledger[1]["disposition"] == "archive_only"
     assert f"Source coverage: {ARCHIVE}/.done" in projection
 
 
@@ -337,7 +350,9 @@ def test_shared_summary_is_emitted_once_and_all_source_ids_remain_auditable():
 
     residual, ledger = wi.coverage_report(messages, [], ARCHIVE, classified)
     restored = [Message.from_dict(value) for value in residual]
-    next_residual, _ = wi.coverage_report(restored, [], ARCHIVE + "-next")
+    next_residual, _ = wi.coverage_report(
+        restored, [], ARCHIVE + "-next", previous_residual=residual
+    )
 
     assert len(residual) == 1
     assert [row["message_id"] for row in ledger] == ["one", "two"]
@@ -345,6 +360,31 @@ def test_shared_summary_is_emitted_once_and_all_source_ids_remain_auditable():
     assert next_residual == residual
     assert f"Source coverage: {ARCHIVE}/.done" in restored[0].content
     assert restored[0].role == "assistant"
+
+
+def test_previous_continuation_is_kept_until_explicitly_resolved():
+    original = message("constraint", CONSTRAINT)
+    classified = wi.resolve_continuation_coverage(
+        ExtractContext([original]), [{"ranges": "0", "summary": CONSTRAINT}]
+    )
+    previous, _ = wi.coverage_report([original], [], ARCHIVE, classified)
+    inherited = Message.from_dict(previous[0])
+    later = message("approval", "The invoices are backed up and email approval is granted.")
+    sources = [inherited, later]
+
+    kept, _ = wi.coverage_report(sources, [], ARCHIVE + "-next", previous_residual=previous)
+    assert kept == previous
+
+    resolved = wi.resolve_continuation_coverage(
+        ExtractContext(sources),
+        [{"ranges": "0", "reason": "The newer approval resolves the previous restriction."}],
+    )
+    residual, ledger = wi.coverage_report(
+        sources, [], ARCHIVE + "-next", resolved, previous_residual=previous
+    )
+    assert residual == []
+    assert ledger[0]["explicitly_dropped"].startswith("The newer approval")
+    assert ledger[1]["disposition"] == "archive_only"
 
 
 def test_large_source_id_ledger_does_not_consume_continuation_projection_budget():

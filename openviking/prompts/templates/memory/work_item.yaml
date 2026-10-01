@@ -17,19 +17,22 @@ description: |
   result distinct. Tool evidence is evidence of execution, not a user preference.
   Account for this conversation's continuation information: update/create the relevant
   work_item when its state changes. Do not create a task solely to hold non-task continuation.
-  For messages not fully accounted for by a work_item, use sdk.continuation in Python or
+  For continuation not fully accounted for by a work_item, use sdk.continuation in Python or
   continuation_coverage in JSON: ranges plus either a concise continuation summary or an
   explicit reason that nothing remains to continue. Preserve unresolved questions,
   constraints and commitments even when another memory stores related facts. Keep all
-  summaries together below 600 estimated tokens. Partial tool previews may be attributed
+  continuation within the configured token budget given in the output contract, including
+  previous continuation and formatting. Partial tool previews may be attributed
   to work_items or continuation summaries/reasons. Coverage records where continuation
   information belongs; it does not certify every fact in the original output. Update state
   from visible evidence and the conversation, without inventing unseen results or treating
   a completed tool as a completed task. If an outcome is unclear, retain the pending
   verification and its reference. Original tool results remain in the session archive.
-  Unclassified messages are retained verbatim and can exceed the
-  checkpoint budget. Previous continuation summaries are background, not new user evidence;
-  carry forward still-relevant details and remove only explicitly resolved information.
+  New original messages not selected for work_items or continuation are archive_only:
+  their complete original text stays in storage without being copied into working memory.
+  Previous continuation summaries are background, not new user evidence, and remain active
+  by default. Carry forward still-relevant details; update, merge, resolve, or transfer them
+  to a specific work_item only with supporting evidence. Omission does not resolve them.
   A request to resume existing work needs an activation even if no state changed: select
   that already-read item with activate(ranges=...) in Python, or work_item_activations
   in JSON. Match the current request to its goal and scope, not its title alone. Candidate
@@ -38,7 +41,8 @@ description: |
   Use complete concise string values for changed fields; an empty string explicitly clears
   a resolved optional field. Omitted/null fields retain their previous values. Resolve or
   replace stale steps and decisions, do not append a history of every round.
-  All fields combined MUST stay within 1200 estimated tokens. Current state is a short
+  All fields and the rendered body MUST fit within the configured per-work_item token budget
+  given in the output contract, leaving room for headings. Current state is a short
   snapshot, next_action is the immediate next step, waiting_for includes the waiting party
   and release condition. Keep only currently useful references and decisions.
   status is open, in_progress, waiting, blocked, done, or cancelled. Do not mark a plan done

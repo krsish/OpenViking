@@ -374,6 +374,50 @@ def test_memory_maintenance_review_tokens_defaults_and_validates(monkeypatch):
         OpenVikingConfig.from_dict({"memory": {"maintenance_review_tokens": 0}})
 
 
+def test_work_item_budgets_default_and_round_trip(monkeypatch):
+    monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
+    defaults = OpenVikingConfig.from_dict({}).memory
+    assert defaults.work_item_token_budget == 10000
+    assert defaults.continuation_token_budget == 10000
+    assert defaults.work_item_projection_token_budget == 42000
+    values = {
+        "work_item_token_budget": 12000,
+        "continuation_token_budget": 6000,
+        "work_item_projection_token_budget": 44000,
+    }
+    configured = OpenVikingConfig.from_dict({"memory": values}).memory
+    assert {name: configured.to_dict()[name] for name in values} == values
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["work_item_token_budget", "continuation_token_budget", "work_item_projection_token_budget"],
+)
+@pytest.mark.parametrize("invalid", [0, -1, 1.5, True, "10000"])
+def test_work_item_budgets_require_positive_integers(field, invalid):
+    from openviking_cli.utils.config.memory_config import MemoryConfig
+
+    with pytest.raises(ValueError):
+        MemoryConfig(**{field: invalid})
+
+
+def test_work_item_budget_reader_tracks_current_configuration(monkeypatch):
+    from types import SimpleNamespace
+
+    from openviking.session.work_item_budget import WorkItemBudgets, get_work_item_budgets
+    from openviking_cli.utils.config.memory_config import MemoryConfig
+
+    config = SimpleNamespace(memory=MemoryConfig())
+    monkeypatch.setattr("openviking.session.work_item_budget.get_openviking_config", lambda: config)
+    assert get_work_item_budgets() == WorkItemBudgets()
+    config.memory = MemoryConfig(
+        work_item_token_budget=11000,
+        continuation_token_budget=7000,
+        work_item_projection_token_budget=41000,
+    )
+    assert get_work_item_budgets() == WorkItemBudgets(11000, 7000, 41000)
+
+
 def test_openviking_config_ignores_deprecated_memory_version(monkeypatch):
     monkeypatch.setenv(OPENVIKING_CONFIG_ENV, "/tmp/codex-no-config.json")
 
