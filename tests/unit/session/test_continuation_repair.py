@@ -237,6 +237,10 @@ async def test_legacy_summary_migration_and_next_update_keep_both_original_archi
     owner._prepare_work_item_continuation = lambda uri, residual, meta, **kwargs: (
         Session._prepare_work_item_continuation(owner, uri, residual, meta, **kwargs)
     )
+    owner._read_continuation_store = lambda previous: Session._read_continuation_store(
+        owner, previous
+    )
+    owner._continuation_extraction_background = Session._continuation_extraction_background
     migrated = await Session._prepare_work_item_checkpoint(
         owner, current_archive, [legacy], previous_checkpoint
     )

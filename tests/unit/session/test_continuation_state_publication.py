@@ -10,6 +10,7 @@ import pytest
 from openviking.message import Message
 from openviking.session import work_items as wi
 from openviking.session.continuation_state import confirm_continuation_promotions
+from openviking.session.memory.memory_updater import ExtractContext
 from openviking.session.work_item_budget import WorkItemBudgets
 from openviking.utils.token_estimation import estimate_text_tokens
 from tests.unit.session.test_work_item_checkpoint import (
@@ -153,6 +154,68 @@ async def test_resolved_issue_leaves_hot_view_but_archive_keeps_history_and_reas
     assert reason in json.dumps(done["coverage"])
     assert fs.files[f"{old_uri}/.done"] == historical_done
     assert fs.files[f"{old_uri}/messages.jsonl"] == source.to_jsonl()
+
+
+@pytest.mark.asyncio
+async def test_settled_background_stays_closed_after_publication_and_following_checkpoint():
+    session, fs = session_with_fs()
+    completed_text = "The one-off question was answered and delivered; no follow-up remains."
+    constraint_text = "Do not push without explicit approval; no push is currently planned."
+    originals = [message("answer", completed_text), message("constraint", constraint_text)]
+    old_uri, previous = await prepare(
+        session,
+        fs,
+        1,
+        originals,
+        {},
+        [transition("create", [value.id], summary=value.content) for value in originals],
+    )
+    await publish(session, old_uri, previous)
+    historical_done = fs.files[f"{old_uri}/.done"]
+    identities = {wi.continuation_content(value): value["id"] for value in previous["residual"]}
+    completed_id = identities[completed_text]
+    constraint_id = identities[constraint_text]
+    resolve_reason = (
+        "The existing state records delivery of the answer and no remaining obligation."
+    )
+    keep_reason = "Still-applicable constraint: pushing requires explicit approval."
+    fresh = message("greeting", "Hello.")
+    actions = wi.resolve_continuation_coverage(
+        ExtractContext([Message.from_dict(value) for value in previous["residual"]] + [fresh]),
+        [
+            {"action": "resolve", "continuation_id": completed_id, "reason": resolve_reason},
+            {"action": "keep", "continuation_id": constraint_id, "reason": keep_reason},
+        ],
+    )
+
+    uri, closed = await prepare(session, fs, 2, [fresh], previous, actions)
+    await publish(session, uri, closed)
+    published = json.loads(fs.files[f"{uri}/.done"])
+    assert [value["id"] for value in published["residual"]] == [constraint_id]
+    overview = fs.files[f"{uri}/.overview.md"]
+    assert completed_text not in overview
+    assert constraint_text in overview
+    assert resolve_reason not in overview
+    assert keep_reason not in overview
+    for identity, state, reason in (
+        (completed_id, "resolved", resolve_reason),
+        (constraint_id, "active", keep_reason),
+    ):
+        row = next(value for value in published["coverage"] if value["message_id"] == identity)
+        assert row["continuation_state"] == state
+        assert row["continuation_actions"][0]["reason"] == reason
+    assert fs.files[f"{old_uri}/.done"] == historical_done
+
+    # Load the actual published checkpoint as the next round's background.
+    # An omitted closed issue must not be resurrected from earlier history.
+    next_uri, next_done = await prepare(
+        session, fs, 3, [message("another-greeting", "Good morning.")], published, []
+    )
+    await publish(session, next_uri, next_done)
+    assert [value["id"] for value in next_done["residual"]] == [constraint_id]
+    assert completed_text not in fs.files[f"{next_uri}/.overview.md"]
+    assert constraint_text in fs.files[f"{next_uri}/.overview.md"]
+    assert fs.files[f"{old_uri}/.done"] == historical_done
 
 
 @pytest.mark.asyncio
@@ -321,12 +384,16 @@ async def test_state_overflow_archives_whole_old_issue_and_keeps_recent_issue(mo
     )
     await publish(session, uri, done)
     assert done["continuation_degraded"] is True
-    pending = done["pending_continuation_uri"]
-    saved = json.loads(fs.files[pending])
-    assert long_text.strip() in wi.residual_text(saved["entries"])
+    store_uri = done["continuation_store_uri"]
+    saved = json.loads(fs.files[store_uri])
+    cold = [value for value in saved["items"].values() if value["residency"] == "cold"]
+    assert len(cold) == 1
+    assert cold[0]["state"] == "active"
+    assert cold[0]["eviction_reason"] == "budget"
+    assert cold[0]["message"]["parts"][0]["text"] == long_text
     overview = fs.files[f"{uri}/.overview.md"]
     assert short_text in overview
     assert long_text not in overview
-    assert pending in overview
-    assert estimate_text_tokens(wi.residual_text(done["residual"], pending)) <= 400
+    assert store_uri in overview
+    assert estimate_text_tokens(wi.residual_text(done["residual"], None, store_uri)) <= 400
     assert all(value.get("continuation_state_version") == 1 for value in done["residual"])

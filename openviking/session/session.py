@@ -41,9 +41,15 @@ from openviking.session.checkpoints import (
 )
 from openviking.session.continuation_overflow import (
     continuation_recovery_notice,
+    continuation_store_notice,
     select_continuation_fallback,
 )
 from openviking.session.continuation_provenance import prepare_continuation_provenance
+from openviking.session.continuation_recall import select_cold_continuations
+from openviking.session.continuation_store import (
+    finalize_continuation_store,
+    prepare_continuation_store,
+)
 from openviking.session.extraction_batch import (
     ExtractionBatchLimits,
     ExtractionMessageBatch,
@@ -2018,6 +2024,7 @@ class Session:
         work_item_mode = effective_policy.working_memory_mode == wi.WORK_ITEM_MODE
         work_checkpoint = None
         previous_checkpoint = {}
+        previous_continuation = []
 
         try:
             await self._validate_work_item_capability(effective_policy)
@@ -2032,17 +2039,25 @@ class Session:
                 previous_checkpoint, uncovered = await self._work_item_history(
                     before_index=archive_index
                 )
-                residual = _continuation_background_messages(
-                    previous_checkpoint.get("residual", [])
-                )
-                messages = self._archives.stable_deduplicate_messages(
-                    residual + uncovered + messages
-                )
                 if uncovered:
                     coverage_start_archive = previous_checkpoint.get("archive_id", "archive_001")
                     await self._inherit_work_item_progress(
                         archive_uri, previous_checkpoint, completed_memory_steps
                     )
+                # Candidate retrieval does not make cold items active. The
+                # publication stage requires a transition with fresh evidence.
+                store = await self._read_continuation_store(previous_checkpoint)
+                current_meta = await self._archives.read_meta(archive_uri)
+                previous_continuation = self._continuation_extraction_background(
+                    previous_checkpoint,
+                    store,
+                    uncovered + messages,
+                    current_meta.get("continuation_coverage", []),
+                )
+                residual = _continuation_background_messages(previous_continuation)
+                messages = self._archives.stable_deduplicate_messages(
+                    residual + uncovered + messages
+                )
             if not messages:
                 raise ValueError("session commit archive has no recoverable messages")
             first_message_id = messages[0].id
@@ -2292,7 +2307,7 @@ class Session:
                                         current_meta.get("work_item_coverage", []),
                                         archive_uri,
                                         current_meta.get("continuation_coverage", []),
-                                        previous_residual=previous_checkpoint.get("residual", []),
+                                        previous_residual=previous_continuation,
                                     )
                                     work_item_kwargs["continuation_background"] = (
                                         _continuation_background_messages(continuation_state)
@@ -2676,12 +2691,51 @@ class Session:
         messages = [message for batch in reversed(uncovered) for message in batch]
         return checkpoint, self._archives.stable_deduplicate_messages(messages)
 
+    async def _read_continuation_store(self, checkpoint: Dict[str, Any]) -> Dict[str, Any]:
+        """Read only the latest published index; old overflow snapshots stay historical."""
+        uri = checkpoint.get("continuation_store_uri")
+        if not uri:
+            return {"legacy_pending_continuation_uri": checkpoint.get("pending_continuation_uri")}
+        store = json.loads(await self._viking_fs.read_file(uri, ctx=self.ctx))
+        if store.get("version") != 1 or not isinstance(store.get("items"), dict):
+            raise ValueError("Invalid continuation store")
+        return store
+
+    @staticmethod
+    def _continuation_extraction_background(
+        checkpoint: Dict[str, Any],
+        store: Dict[str, Any],
+        messages: List[Message],
+        actions: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        hot = checkpoint.get("residual", [])
+        known = {value["id"] for value in hot}
+        candidates = select_cold_continuations(store, messages)
+        # A retry may carry already-frozen actions for candidates retrieved
+        # before a later user turn. Reapply them against the same stored state.
+        requested = {value.get("continuation_id") for value in actions or []}
+        candidates.extend(
+            value["message"]
+            for identity, value in store.get("items", {}).items()
+            if identity in requested and value["state"] == "active"
+        )
+        result = list(hot)
+        for value in candidates:
+            if value["id"] not in known:
+                result.append(value)
+                known.add(value["id"])
+        return result
+
     async def _prepare_work_item_checkpoint(
         self, archive_uri: str, messages: List[Message], previous: Dict[str, Any]
     ) -> Dict[str, Any]:
         from openviking.session.memory.work_item_index import work_item_index_ready
 
         meta = await self._archives.read_meta(archive_uri)
+        previous_store = await self._read_continuation_store(previous)
+        previous_residual = self._continuation_extraction_background(
+            previous, previous_store, messages, meta.get("continuation_coverage", [])
+        )
         # New evidence first, followed by the previous active set. Semantic
         # discovery happens in the existing extractor/recall pipeline.
         message_order = {message.id: index for index, message in enumerate(messages)}
@@ -2711,13 +2765,28 @@ class Session:
             meta.get("work_item_coverage", []),
             archive_uri,
             meta.get("continuation_coverage", []),
-            previous_residual=previous.get("residual", []),
+            previous_residual=previous_residual,
             source_archives=source_archives,
             previous_checkpoint_uri=(
                 f"{self._session_uri}/history/{previous['archive_id']}/.done"
                 if previous.get("archive_id")
                 else ""
             ),
+        )
+        store, residual = prepare_continuation_store(
+            previous_store,
+            previous.get("residual", []),
+            residual,
+            messages,
+            meta.get("continuation_coverage", []),
+            coverage,
+            archive_uri,
+        )
+        store_uri = f"{archive_uri}/continuation-store.json"
+        legacy_pending = store.get("legacy_pending_continuation_uri")
+        has_cold = any(
+            value["state"] == "active" and value["residency"] == "cold"
+            for value in store["items"].values()
         )
         budgets = wi.get_work_item_budgets()
         residual_tokens = estimate_text_tokens(wi.residual_text(residual))
@@ -2736,15 +2805,26 @@ class Session:
             archive_uri,
             residual,
             meta,
-            pending_continuation_uri=previous.get("pending_continuation_uri"),
+            pending_continuation_uri=legacy_pending,
+            continuation_store_uri=store_uri,
+            has_cold_continuation=has_cold,
         )
-        pending_uri = meta.get("continuation_projection", {}).get("pending_continuation_uri")
-        repaired_tokens = estimate_text_tokens(wi.residual_text(residual, pending_uri))
+        store = finalize_continuation_store(store, residual)
+        cold_entries = [
+            value
+            for value in store["items"].values()
+            if value["state"] == "active" and value["residency"] == "cold"
+        ]
+        recovery_uri = store_uri if cold_entries or legacy_pending else None
+        # Publish the index only after all complete entries and provenance are
+        # available. A failed write leaves the previous checkpoint authoritative.
+        await self._viking_fs.write_file(
+            store_uri, json.dumps(store, ensure_ascii=False, indent=2), ctx=self.ctx
+        )
+        repaired_tokens = estimate_text_tokens(wi.residual_text(residual, None, recovery_uri))
         if repaired_tokens != residual_tokens:
             await self._merge_archive_meta(archive_uri, {"residual_tokens": repaired_tokens})
-        overview, active = wi.build_projection(
-            items, residual, pending_continuation_uri=pending_uri
-        )
+        overview, active = wi.build_projection(items, residual, continuation_store_uri=recovery_uri)
         active_uris = {item["uri"] for item in active}
         cold = [
             item
@@ -2781,10 +2861,13 @@ class Session:
         return {
             "mode": wi.WORK_ITEM_MODE,
             "version": 1,
-            "continuation_version": 4,
+            "continuation_version": 5,
             "continuation_provenance_uri": f"{archive_uri}/continuation-provenance.json",
-            "pending_continuation_uri": pending_uri,
-            "continuation_degraded": bool(pending_uri),
+            "continuation_store_uri": store_uri,
+            "cold_continuation_count": len(cold_entries),
+            "pending_continuation_uri": legacy_pending,
+            "continuation_degraded": bool(legacy_pending)
+            or any(value.get("eviction_reason") == "budget" for value in cold_entries),
             "archive_id": archive_uri.rsplit("/", 1)[-1],
             "compact_ready": True,
             "work_items": [
@@ -2825,6 +2908,8 @@ class Session:
         meta: Dict[str, Any],
         *,
         pending_continuation_uri: Optional[str] = None,
+        continuation_store_uri: Optional[str] = None,
+        has_cold_continuation: bool = False,
     ) -> List[Dict[str, Any]]:
         """Bound hot state, preserving complete provenance and overflow in storage."""
         budgets = wi.get_work_item_budgets()
@@ -2837,9 +2922,19 @@ class Session:
         )
         if limit <= 0:
             raise ValueError("work_item projection has no room for continuation")
+        recovery_store_uri = (
+            continuation_store_uri if has_cold_continuation or pending_continuation_uri else None
+        )
         fingerprint = hashlib.sha256(
             json.dumps(
-                [residual, limit, pending_continuation_uri, 4],
+                [
+                    residual,
+                    limit,
+                    pending_continuation_uri,
+                    continuation_store_uri,
+                    has_cold_continuation,
+                    5,
+                ],
                 sort_keys=True,
                 ensure_ascii=False,
             ).encode()
@@ -2857,7 +2952,11 @@ class Session:
                     for value in result
                 )
                 and estimate_text_tokens(
-                    wi.residual_text(result, cached.get("pending_continuation_uri"))
+                    wi.residual_text(
+                        result,
+                        cached.get("pending_continuation_uri"),
+                        cached.get("continuation_store_uri"),
+                    )
                 )
                 <= limit
             ):
@@ -2878,7 +2977,10 @@ class Session:
         )
         needs_repair = (
             len(checkpoint_inputs) != len(residual)
-            or estimate_text_tokens(wi.residual_text(normalized, pending_continuation_uri)) > limit
+            or estimate_text_tokens(
+                wi.residual_text(normalized, pending_continuation_uri, recovery_store_uri)
+            )
+            > limit
         )
         result = normalized
         mode = "unchanged"
@@ -2905,6 +3007,7 @@ class Session:
                     migrated,
                     residual_token_budget=limit,
                     pending_continuation_uri=pending_continuation_uri,
+                    continuation_store_uri=recovery_store_uri,
                 )
             except ValueError:
                 pass
@@ -2916,7 +3019,9 @@ class Session:
             try:
                 # Reserve mandatory references and any inherited recovery notice.
                 overhead = f"\nSource coverage: {archive_uri}/.done"
-                if pending_continuation_uri:
+                if recovery_store_uri:
+                    overhead += "\n\n" + continuation_store_notice(recovery_store_uri)
+                elif pending_continuation_uri:
                     overhead += "\n\n" + continuation_recovery_notice(pending_continuation_uri)
                 repair_limit = limit - estimate_text_tokens(overhead) - 4
                 if repair_limit <= 0:
@@ -2934,30 +3039,38 @@ class Session:
                     result,
                     residual_token_budget=limit,
                     pending_continuation_uri=pending_continuation_uri,
+                    continuation_store_uri=recovery_store_uri,
                 )
                 mode = "compacted"
             except Exception as exc:
                 # Preserve complete entries before allowing a reduced hot view.
                 # Storage failures remain failures; they never authorize loss.
                 repair_error = str(exc)[:1000]
-                overflow_uri = f"{archive_uri}/continuation-overflow.json"
+                overflow_uri = continuation_store_uri or f"{archive_uri}/continuation-overflow.json"
                 if pending_continuation_uri == overflow_uri:
                     raise ValueError("continuation overflow cannot reference itself") from exc
-                result, _omitted = select_continuation_fallback(normalized, limit, overflow_uri)
-                await self._viking_fs.write_file(
-                    overflow_uri,
-                    json.dumps(
-                        {
-                            "version": 1,
-                            "previous_pending_continuation_uri": pending_continuation_uri,
-                            "entries": residual,
-                            "reason": repair_error,
-                        },
-                        ensure_ascii=False,
-                    ),
-                    ctx=self.ctx,
+                result, _omitted = select_continuation_fallback(
+                    normalized, limit, overflow_uri, cold_store=bool(continuation_store_uri)
                 )
-                pending_continuation_uri = overflow_uri
+                if continuation_store_uri:
+                    # The caller persists all complete entries in the shared
+                    # store before publishing this reduced projection.
+                    recovery_store_uri = continuation_store_uri
+                else:
+                    await self._viking_fs.write_file(
+                        overflow_uri,
+                        json.dumps(
+                            {
+                                "version": 1,
+                                "previous_pending_continuation_uri": pending_continuation_uri,
+                                "entries": residual,
+                                "reason": repair_error,
+                            },
+                            ensure_ascii=False,
+                        ),
+                        ctx=self.ctx,
+                    )
+                    pending_continuation_uri = overflow_uri
                 result, ledger = prepare_continuation_provenance(
                     residual, result, archive_uri, compacted=False
                 )
@@ -2969,6 +3082,7 @@ class Session:
             result,
             residual_token_budget=limit,
             pending_continuation_uri=pending_continuation_uri,
+            continuation_store_uri=recovery_store_uri,
         )
         await self._viking_fs.write_file(
             f"{archive_uri}/continuation-provenance.json",
@@ -2983,6 +3097,7 @@ class Session:
                 "input_hash": fingerprint,
                 "residual": result,
                 "pending_continuation_uri": pending_continuation_uri,
+                "continuation_store_uri": recovery_store_uri,
                 "repair_error": repair_error,
             }
         }
@@ -3020,6 +3135,12 @@ class Session:
             items,
             checkpoint.get("residual", []),
             pending_continuation_uri=checkpoint.get("pending_continuation_uri"),
+            continuation_store_uri=(
+                checkpoint.get("continuation_store_uri")
+                if checkpoint.get("cold_continuation_count")
+                or checkpoint.get("pending_continuation_uri")
+                else None
+            ),
         )
         active_uris = {item["uri"] for item in active}
         for item in items:

@@ -78,25 +78,29 @@ async def test_compaction_failure_publishes_bounded_checkpoint_with_complete_ove
     extractor.assert_awaited_once()
     compactor.assert_awaited_once()
     done = json.loads(fs.files[f"{uri}/.done"])
-    pending_uri = f"{uri}/continuation-overflow.json"
+    store_uri = f"{uri}/continuation-store.json"
     assert done["compact_ready"]
     assert done["continuation_degraded"] is True
-    assert done["pending_continuation_uri"] == pending_uri
+    assert done["pending_continuation_uri"] is None
+    assert done["continuation_store_uri"] == store_uri
+    assert done["cold_continuation_count"] == 1
     assert estimate_text_tokens(wi.residual_text(done["residual"])) <= 300
-    overflow = json.loads(fs.files[pending_uri])
-    assert overflow["version"] == 1
-    assert not overflow.get("previous_pending_continuation_uri")
-    assert overflow["entries"] == compactor.call_args.args[0]
-    assert summary.strip() in wi.residual_text(overflow["entries"])
-    assert overflow["entries"][0]["parts"][0]["text"] == summary
-    assert overflow["reason"]
+    store = json.loads(fs.files[store_uri])
+    assert store["version"] == 1
+    assert not store.get("legacy_pending_continuation_uri")
+    entries = list(store["items"].values())
+    assert [entry["message"] for entry in entries] == compactor.call_args.args[0]
+    assert entries[0]["message"]["parts"][0]["text"] == summary
+    assert entries[0]["state"] == "active"
+    assert entries[0]["residency"] == "cold"
+    assert entries[0]["eviction_reason"] == "budget"
     # No entry fits by itself. Publish the recovery instruction, never a sliced
     # prefix that could silently remove the deployment constraint.
     assert summary not in fs.files[f"{uri}/.overview.md"]
-    assert pending_uri in fs.files[f"{uri}/.overview.md"]
+    assert store_uri in fs.files[f"{uri}/.overview.md"]
     public = await session.get_session_archive("archive_001")
     assert public["status"] == "ready"
-    assert pending_uri in public["overview"]
+    assert store_uri in public["overview"]
     assert estimate_text_tokens(public["overview"]) <= continuation_budgets.projection_token_budget
     assert fs.files[f"{uri}/messages.jsonl"] == source.to_jsonl()
 
@@ -116,6 +120,7 @@ async def test_next_checkpoint_preserves_pending_overflow_after_short_or_empty_e
     fs.files[pending_uri] = json.dumps(
         {"version": 1, "entries": [old_source.to_dict()], "reason": "VLM unavailable"}
     )
+    old_overflow = fs.files[pending_uri]
     fresh = message("fresh", "The quick question has been answered.")
     uri = archive(fs, 2, [fresh])
     set_continuation(fs, uri, fresh.id, summary)
@@ -127,51 +132,69 @@ async def test_next_checkpoint_preserves_pending_overflow_after_short_or_empty_e
     compactor.assert_not_awaited()
     assert done["pending_continuation_uri"] == pending_uri
     assert done["continuation_degraded"] is True
-    assert pending_uri in fs.files[f"{uri}/.overview.md"]
+    store_uri = done["continuation_store_uri"]
+    store = json.loads(fs.files[store_uri])
+    assert store["legacy_pending_continuation_uri"] == pending_uri
+    assert fs.files[pending_uri] == old_overflow
+    assert json.loads(await fs.read_file(pending_uri))["entries"] == [old_source.to_dict()]
+    assert store_uri in fs.files[f"{uri}/.overview.md"]
+    assert pending_uri not in fs.files[f"{uri}/.overview.md"]
     public = await session.get_session_archive("archive_002")
     assert public["status"] == "ready"
-    assert pending_uri in public["overview"]
+    assert store_uri in public["overview"]
+    assert pending_uri not in public["overview"]
     assert estimate_text_tokens(public["overview"]) <= continuation_budgets.projection_token_budget
     if summary:
         assert summary in public["overview"]
 
 
 @pytest.mark.asyncio
-async def test_repeated_overflow_links_previous_artifact_without_growing_hot_pointer_list(
+async def test_repeated_overflow_keeps_latest_index_without_growing_hot_pointer_list(
     monkeypatch, continuation_budgets
 ):
     session, fs = session_with_fs()
     compactor = AsyncMock(side_effect=RuntimeError("VLM unavailable"))
     monkeypatch.setattr(session, "_compact_work_item_continuation", compactor)
     previous = {}
-    pending_uris = []
+    snapshots = {}
     for number in range(1, 4):
         source = message(f"source-{number}")
         uri = archive(fs, number, [source])
         set_continuation(fs, uri, source.id, f"Unresolved constraint {number}. " * 1000)
         done = await publish(session, uri, source, previous)
-        pending_uri = f"{uri}/continuation-overflow.json"
-        overflow = json.loads(fs.files[pending_uri])
-        if pending_uris:
-            assert overflow["previous_pending_continuation_uri"] == pending_uris[-1]
-        else:
-            assert not overflow.get("previous_pending_continuation_uri")
-        assert done["pending_continuation_uri"] == pending_uri
+        store_uri = f"{uri}/continuation-store.json"
+        store = json.loads(fs.files[store_uri])
+        assert len(store["items"]) == number
+        assert not store.get("legacy_pending_continuation_uri")
+        for index in range(1, number + 1):
+            assert any(
+                value["message"]["parts"][0]["text"] == f"Unresolved constraint {index}. " * 1000
+                for value in store["items"].values()
+            )
+        assert all(
+            value["state"] == "active"
+            and value["residency"] == "cold"
+            and value["eviction_reason"] == "budget"
+            for value in store["items"].values()
+        )
+        assert done["continuation_store_uri"] == store_uri
+        assert done["pending_continuation_uri"] is None
         assert done["continuation_degraded"] is True
         hot = json.dumps(done["residual"])
         overview = fs.files[f"{uri}/.overview.md"]
-        assert pending_uri in overview
-        for prior in pending_uris:
+        assert overview.count(store_uri) == 1
+        for prior, snapshot in snapshots.items():
             assert prior not in hot
             assert prior not in overview
+            assert fs.files[prior] == snapshot
         assert estimate_text_tokens(wi.residual_text(done["residual"])) <= 300
-        pending_uris.append(pending_uri)
+        snapshots[store_uri] = fs.files[store_uri]
         previous = done
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "failed_artifact", ["continuation-overflow.json", "continuation-provenance.json"]
+    "failed_artifact", ["continuation-store.json", "continuation-provenance.json"]
 )
 async def test_failed_durable_continuation_write_does_not_publish_checkpoint(
     monkeypatch, continuation_budgets, failed_artifact
@@ -180,7 +203,7 @@ async def test_failed_durable_continuation_write_does_not_publish_checkpoint(
     source = message("approval", "Deployment must wait for approval.")
     uri = archive(fs, 1, [source])
     summary = "Deployment must wait for approval."
-    if failed_artifact == "continuation-overflow.json":
+    if failed_artifact == "continuation-store.json":
         summary *= 1000
     extractor = AsyncMock(
         return_value={

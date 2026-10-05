@@ -88,6 +88,27 @@ class MemoryConfig(BaseModel):
         strict=True,
         description="Maximum estimated tokens in the complete working-memory continuation block.",
     )
+    continuation_ttl_enabled: bool = Field(
+        default=True,
+        description="Move idle, unprotected continuation items from working memory to cold storage.",
+    )
+    continuation_idle_turns: int = Field(
+        default=30,
+        gt=0,
+        strict=True,
+        description="User turns without related activity before a continuation item becomes cold.",
+    )
+    continuation_idle_days: float = Field(
+        default=7.0,
+        gt=0,
+        description="Days without related activity before the shorter idle-turn threshold applies.",
+    )
+    continuation_min_idle_turns: int = Field(
+        default=5,
+        gt=0,
+        strict=True,
+        description="Minimum idle user turns required together with continuation_idle_days.",
+    )
     work_item_projection_token_budget: int = Field(
         default=42000,
         gt=0,

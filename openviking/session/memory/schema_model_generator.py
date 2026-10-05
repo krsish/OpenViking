@@ -75,14 +75,49 @@ class WorkItemActivation(BaseModel):
     ranges: str = Field(..., description="Current user message indices requesting this same work.")
 
 
+class ContinuationProtection(BaseModel):
+    """Evidence-backed protection from idle continuation eviction."""
+
+    kind: Literal["constraint", "pinned", "commitment", "none"] = Field(
+        ...,
+        description=(
+            "constraint for a still-applicable rule; pinned for the user's explicit request "
+            "to keep attention on this item; commitment for a promise needed by ongoing "
+            "work or an approaching due date; none to remove prior protection."
+        ),
+    )
+    reason: str = Field(
+        ...,
+        description="Concrete reason and scope in which this protection remains applicable.",
+    )
+    ranges: str = Field(
+        ...,
+        description=(
+            "Source indices establishing or removing protection. Include complete current "
+            "non-checkpoint evidence. Initial registration of an existing item's protection "
+            "may instead cite all chunks of that item's own checkpoint. Removing protection "
+            "always needs current non-checkpoint evidence."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_evidence(self):
+        if not self.reason.strip() or not self.ranges.strip():
+            raise ValueError("continuation protection requires a concrete reason and ranges")
+        return self
+
+
 class ContinuationCoverage(BaseModel):
     """Maintain stable continuation items outside canonical work items."""
 
     action: Literal["", "create", "update", "keep", "resolve", "promote"] = Field(
         default="",
         description=(
-            "create a new item; update/keep an existing continuation_id; resolve with new "
-            "evidence; promote into a successfully saved work_item. Empty is legacy coverage."
+            "create a new item; update an existing continuation_id; keep in active working "
+            "memory with a concrete retention reason; resolve an already-settled item using "
+            "its current state or new evidence, removing it only from active working memory "
+            "while preserving archive history; promote into a successfully saved work_item. "
+            "Empty is legacy coverage."
         ),
     )
     continuation_id: str = Field(
@@ -95,15 +130,29 @@ class ContinuationCoverage(BaseModel):
     ranges: str = Field(
         default="",
         description=(
-            "Current conversation source indices supporting the action. Required except "
-            "for keep. Updates and resolutions must include new supporting evidence."
+            "Current conversation source indices supporting the action. Required for "
+            "create, update and promote, which must include new non-checkpoint evidence. "
+            "Optional for keep and resolve: the existing item's settled state can justify closure. "
+            "For keep, cite new related messages to refresh activity or restore a cold item; "
+            "a keep reason without new evidence does neither."
         ),
     )
     summary: str = Field(
         default="", description="Concise continuation state, including constraints."
     )
     reason: str = Field(
-        default="", description="Why these messages have no remaining continuation."
+        default="",
+        description=(
+            "Required for keep: identify a remaining request, still-valid constraint, "
+            "commitment, reference needed for ongoing work, or uncertainty to verify. "
+            "Archival background alone is not a valid keep reason: history is already stored. "
+            "Required for resolve: explain why this item has no remaining obligations or "
+            "applicable constraints, based on its current state or new evidence. "
+            "An unanswered question or unfinished action cannot be resolved merely because "
+            "it is temporary, unprotected, or has no deadline. "
+            "For promote, explain transfer to the work_item; for legacy coverage, why no "
+            "continuation remains."
+        ),
     )
     work_item_page_id: Optional[int] = Field(
         default=None,
@@ -114,9 +163,20 @@ class ContinuationCoverage(BaseModel):
             "that preserves this item's state. The server confirms successful persistence."
         ),
     )
+    protection: Optional[ContinuationProtection] = Field(
+        default=None,
+        description=(
+            "Optional on create, update or keep: register evidence-backed protection from "
+            "idle eviction, or remove it with kind='none'. Omit to preserve existing "
+            "protection. A keep reason alone does not grant protection or refresh activity. "
+            "Protection does not bypass the working-memory token budget."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_action(self):
+        if self.protection is not None and self.action not in {"create", "update", "keep"}:
+            raise ValueError("continuation protection is only allowed for create, update or keep")
         # Keep legacy semantic checks in the resolver for archived plans and clients
         # that still emit ranges plus summary/reason without an action.
         if not self.action:
@@ -134,11 +194,11 @@ class ContinuationCoverage(BaseModel):
                 raise ValueError(f"{self.action} requires continuation_id")
             if self.action == "update" and (not has_summary or has_reason):
                 raise ValueError("update requires summary and no reason")
-            if self.action == "keep" and (has_summary or has_reason):
-                raise ValueError("keep preserves original content; omit summary and reason")
+            if self.action == "keep" and (has_summary or not has_reason):
+                raise ValueError("keep requires a concrete retention reason and no summary")
             if self.action in {"resolve", "promote"} and (not has_reason or has_summary):
                 raise ValueError(f"{self.action} requires reason and no summary")
-        if self.action != "keep" and not self.ranges.strip():
+        if self.action in {"create", "update", "promote"} and not self.ranges.strip():
             raise ValueError(f"{self.action} requires supporting ranges")
         if self.action == "promote":
             if self.work_item_page_id is None:

@@ -60,9 +60,40 @@ V1 使用 OpenViking 的 token 估算器，默认限制为：
 
 Continuation 维护带有服务端稳定 ID 的当前事项列表，不再累积历轮摘要。每轮提取结合已有事项和新消息：未变化的事项沿用原文；更新时替换该事项的当前正文，保留原 ID；明确解决需说明原因，随后移出热视图；升级为 work item 时，只有对应任务成功写入后才移除原事项。模型漏报的事项继续保留，不将遗漏解释成解决。历史内容和状态变化留在 archive。投影统一显示一次背景标题，不再给每个事项重复追加旧摘要标题。
 
-提取协议支持 `create`、`keep`、`update`、`resolve` 和 `promote`。旧事项通过 `continuation_id` 定位，新建事项不接受模型编造的 ID。更新与解决需要本轮消息依据，不能仅凭旧 checkpoint 正文。升级时，Python 指定 work-item 对象（`work_item=...`），JSON 指定其 page ID（`work_item_page_id`）。只选中或读取任务不算升级成功：成功写入的任务必须覆盖被转移的 continuation 事项。未变化的事项可以直接 keep，无需重复正文或补造新依据。
+提取协议支持 `create`、`keep`、`update`、`resolve` 和 `promote`。旧事项通过 `continuation_id` 定位，新建事项不接受模型编造的 ID。`create`、`update` 和 `promote` 需要 ranges 引用本轮非 checkpoint 消息依据。已经闭环的旧事项可以通过原 ID 和基于当前状态的原因直接 `resolve`，无需新消息或 ranges。服务端将关闭决定绑定到当前正文的 fingerprint，过时的关闭决定不能删除更新后的状态。升级时，Python 指定 work-item 对象（`work_item=...`），JSON 指定其 page ID（`work_item_page_id`）。只选中或读取任务不算升级成功：成功写入的任务必须覆盖被转移的 continuation 事项。
+
+`keep` 必须说明仍需保留的具体原因：未完成动作或问题、仍适用的约束、持续有效的承诺，或尚未核实的结果；无需 ranges 或重复摘要正文。没有立即要执行的下一步，不代表长期约束或等待回复的事项已解决。结果不明确时继续保留，不把沉默或遗漏当作完成依据。例如，已经交付且没有后续义务的一次性答疑可以关闭；“未经批准不要 push”即使当前没有 push 计划，也仍需保留。原因写入 archive 的状态变化账本，不追加到热摘要。已冻结的旧提取计划仍可重放，包括没有 reason 的旧 `keep`；新生成的动作遵循新契约。
 
 常规 continuation 更新来自 work-item 提取输出（Python 的 `sdk.continuation` 或 JSON 的 `continuation_coverage`），不额外调用总结模型。稳定事项 ID 与原始消息 ID 分开，事项携带来源引用，作为 assistant 背景传递，不能成为重新开启终态任务的新用户证据。明确成功的空提取结果可以让新消息仅归档，同时保留旧事项；异常、无返回或根本未执行提取时，不能仅因原文已保存就推进 checkpoint。
+
+### 闲置 continuation 与冷存储
+
+事项的生命周期（`active`、`resolved`、`promoted`）与是否进入 working memory（`hot`、`cold`）分开记录。闲置逐出只改变存放位置，不将尚未完成的事项判定为已完成。每个 checkpoint 通过 `continuation_store_uri` 引用所在 archive 的 `continuation-store.json`。文件按稳定 continuation ID 保存最新完整消息、生命周期、冷热位置、最后相关活动、保护信息和逐出原因。这是 session 内部存储，不是新增一种与 work item 平级、经过向量索引的 memory。历史 archive 快照和原始消息仍然保留。
+
+Work-item 会话默认开启闲置逐出，在服务端 `memory` 配置中设置：
+
+```json
+{
+  "memory": {
+    "continuation_ttl_enabled": true,
+    "continuation_idle_turns": 30,
+    "continuation_idle_days": 7,
+    "continuation_min_idle_turns": 5
+  }
+}
+```
+
+未受保护的 active 事项连续 30 个用户轮次没有相关活动，或连续七天没有相关活动且期间至少经过五个用户轮次，就移入冷存储。一次真实用户请求及其后续 assistant/tool 处理算一个逻辑轮次，工具回包、archive 拆批、提取重放不会额外增加轮次。服务端在准备 checkpoint 时先处理本轮证据，再判断闲置，不依靠定时器清空会话。因此，用户只是休假后回来，不会仅因时间流逝就失去热事项。旧事项没有活动记录时，会获得迁移宽限期。
+
+只有新的相关证据会刷新活动，例如用户追问、收到批准或工具产生相关进展。正文不变时，`keep` 可以通过 `ranges` 引用这些证据，无需重复摘要。没有证据的重复 `keep`、摘要改写、再次出现在模型背景中、读取历史文件，都不会刷新事项。服务端校验消息身份，语义相关性由模型判断。仍适用的约束、用户明确要求持续关注的事项、持续承诺，可以用结构化 `protection` 申请闲置保护，但需要具体适用原因和来源 ranges；泛泛的 keep reason 不会获得保护。该保护不绕过 continuation 的整体预算限制。
+
+两套提取协议都支持在 `create`、`update`、`keep` 中提供 `protection: {kind, reason, ranges}`。kind 分别为 `constraint`、`pinned`、`commitment`、`none`（撤销保护），reason 说明具体依据和适用范围；省略时保留原保护。通常 ranges 必须包含完整的本轮非 checkpoint 证据。旧事项此前没有登记保护时，首次登记可以只引用自身完整 checkpoint，但需 fingerprint 匹配；这一例外不会刷新活动。撤销保护始终需要新证据。
+
+服务端只保证已登记的保护生效，不根据摘要关键词自动推断保护。模型仍可能漏标约束，或将未完成事项误判为 resolved；没有长期任务、截止日期或保护需求，并不代表事项已经完成。原始证据与状态历史仍保存在 archive，但这些语义判断需要继续观察实际模型输出。
+
+热视图只保留一个冷存储恢复入口，不为每个冷事项留下 stub。用户重提旧话题时，提取阶段可以查看最多三个完整的 active/cold 候选，总计不超过 2,000 估算 tokens。优先匹配最新真实用户请求或该轮工具结果中的精确 ID，否则根据该请求做保守的英文词／中文二字组匹配。这是词法候选选择，不是向量检索，也不保证语义召回。寒暄或工具长日志的宽泛关键词匹配不会触发候选。候选只作为背景提供；恢复到热视图需要以原 ID 明确 `keep` 或 `update`，并引用相关新证据。仅仅读取或在模型输出中遗漏，仍保持冷存储。已 resolved、promoted 的事项不会从旧快照自动复活。
+
+候选正文不会被截断。单条超过召回预算时，即使精确命中 ID 也仍留在存储层，agent 可以沿恢复入口直接读取。提示要求 agent 在继续相关工作前查询最新状态，但不是强制执行门禁；模型仍可能漏召回或误判相关性。
 
 多个成功写入的 work item 分担同一原消息的不同片段时，会合并其 ranges 后判断整条消息是否覆盖；失败写入不贡献覆盖。工具 input/output 每个字段最多保留前 2,000 字符，并附截断提示；整块工具证据最多 16,000 估算 tokens，优先近期结果。partial 表示预览不完整，不剥夺消息归属和续接分类资格。状态更新可以使用可见证据，但不能虚构未见结果或将工具结束等同于任务完成；结果不明确时保留待验证事项及引用。模型提供的 source ranges 和分类是归属声明，账本**不是所有续接事实均已保留的形式证明**。archive_only 内容可从存储追回，但模型仍可能漏选应进入热视图的新信息；存储层保留原文不等于热记忆没有遗漏。
 
@@ -72,9 +103,9 @@ Archive 在应用前将已分配 ID 的 work-item 操作保存在现有 metadata
 
 提取完成与 checkpoint 就绪分开记录。完整 continuation 超预算，或旧 checkpoint 仍携带旧格式原文 residual 时，单独的后台 repair 阶段负责压缩续接内容。这个异常恢复路径会调用 LLM；正常投影、context 读取、archive 读取和 Pi compact hook 不调用 LLM。Repair 重试复用已完成的权威状态写入，不重新执行这些写入。成功的 repair 或降级结果会持久化，后续发布失败时可以复用。
 
-模型调用失败、返回无效结果或仍然超预算时，先将完整续接快照写入 `continuation-overflow.json`，再按最新相关消息优先保留能装下的完整条目，较旧条目优先移出热视图，不按字符截断。单条本身过大时可以只保留恢复提示。标题、来源引用和恢复提示都计入 continuation 与整体 WM 预算。归档或来源账本写入失败、预算小到容不下提示时，仍拒绝发布。
+模型调用失败、返回无效结果或仍然超预算时，预算降级与闲置逐出共用 continuation store，必须先持久化完整状态，才能将装不下的事项移出热视图。预算降级按最新相关消息优先保留能装下的完整条目，较旧条目优先移出，不按字符截断。单条本身过大时可以只保留恢复提示。标题、来源引用和恢复提示都计入 continuation 与整体 WM 预算。归档或来源账本写入失败、预算小到容不下提示时，仍拒绝发布。
 
-降级 checkpoint 标记 `continuation_degraded: true`，并携带独立的 `pending_continuation_uri`。后续摘要省略它或将普通 continuation 标为已解决，都不会清除该指针；context、archive 和 Pi compact 的视图持续提示先读取相关归档。再次溢出时，新快照引用此前待恢复快照，热视图仅携带一个入口。当前不会因一次读取自动清除待恢复状态；该提示保证可追溯，不是强制 agent 读取的执行门禁，也不代表所有约束仍完整位于热记忆中。
+预算降级标记 `continuation_degraded: true`；只有正常闲置逐出时不标记 degraded。context、archive 和 Pi compact 的视图持续保留 store 恢复入口。旧 checkpoint 的 `pending_continuation_uri` 和串联的 `continuation-overflow.json` 快照仍可读取，新 store 将尚未恢复的旧链记录为 `legacy_pending_continuation_uri`，不把历史快照自动合并回当前状态。读取快照不会自动清除待恢复状态，也不会刷新活动时间。能否重新进入热视图，以事项的最新状态为准。
 
 生成有界投影后，最后通过临时文件加 rename 发布 `.done`。只有 overview 文件不代表 checkpoint 就绪。未完成项移出热视图前，要逐项确认其向量记录覆盖所需的权威版本；终态项仍异步索引，但不阻塞发布。这不是等待全局 embedding 队列的屏障，仍在热视图内的项不必等待无关索引。保存原文与可通过向量检索找回是两个不同条件。
 

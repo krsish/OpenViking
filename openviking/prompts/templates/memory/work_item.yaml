@@ -11,18 +11,22 @@ description: |
   Use an existing page_id only after reading its canonical state and confirming the same
   goal and scope. Same title or topic alone is not identity; do not merge unrelated work.
   The server allocates immutable work_item IDs. Renaming or switching sessions keeps the ID.
-  Apply only NEW conversation evidence. Prior WM and existing memory are background, not
-  fresh facts that override a newer canonical state. Preserve still-valid constraints,
+  Apply only NEW conversation evidence when changing canonical work_item state. Prior WM
+  and existing memory cannot override a newer canonical state. This restriction does not
+  prevent resolving an already-settled continuation from its supplied state, as described
+  below. Preserve still-valid constraints,
   unanswered user questions and commitments. Keep plan, attempted action, and verified
   result distinct. Tool evidence is evidence of execution, not a user preference.
   Account for this conversation's continuation information: update/create the relevant
   work_item when its state changes. Do not create a task solely to hold non-task continuation.
   For continuation not fully accounted for by a work_item, use sdk.continuation in Python or
   continuation_coverage in JSON. Maintain stable continuation items: use each supplied
-  continuation_id with action keep (no content change), update (complete latest summary),
-  resolve (new evidence and reason), or promote (specific work_item and reason). Use action
+  continuation_id with action keep (unchanged content plus a concrete retention reason),
+  update (complete latest summary), resolve (reason explaining closure), or promote
+  (specific work_item and reason). Use action
   create with summary only for a genuinely new matter; the server assigns its ID. Supply
-  supporting conversation ranges except for keep. Never recreate the previous items as a
+  supporting ranges with new non-checkpoint evidence for create, update and promote.
+  Ranges are optional for keep and resolve. Never recreate the previous items as a
   new round-by-round summary. Preserve unresolved questions,
   constraints and commitments even when another memory stores related facts. Keep all
   continuation within the configured token budget given in the output contract, including
@@ -34,13 +38,44 @@ description: |
   verification and its reference. Original tool results remain in the session archive.
   New original messages not selected for work_items or continuation are archive_only:
   their complete original text stays in storage without being copied into working memory.
-  Previous continuation items are background, not new user evidence, and remain active
-  by default under the same ID. Omission does not resolve them. Keep unchanged items without
-  rewriting; update only with supporting new evidence and preserve all still-valid details.
+  Previous continuation items are background, not new user evidence, and are preserved
+  by default under the same ID. Omission does not resolve them. keep retains an item in
+  active working memory; resolve removes it only from active working memory, preserving
+  its history and original evidence in the archive. Neither action deletes archive data.
+  For keep, reason must identify
+  a remaining request, still-valid constraint, continuing commitment, reference needed for
+  ongoing work, or uncertainty that needs verification. A still-valid constraint requires
+  retention even without a next action. Keep unchanged content without rewriting; update only
+  with supporting new evidence and preserve all still-valid details.
   Progress, completed substeps, new phases and changed next actions within the same matter
   are updates under the same ID while any follow-up remains. Never resolve an old item and
-  create a new item merely to express its progress. Resolve only when evidence settles every
-  pending part and no continuation of the same matter remains. Promote only after updating or
+  create a new item merely to express its progress. Review each item's current state together
+  with new messages. Resolve only when all its obligations are settled and no applicable
+  constraints or necessary continuation remain. The supplied item's already-settled state
+  can justify resolve without any new evidence or ranges; explain that basis in reason.
+  If completion or applicability is uncertain, keep and explain what needs verification.
+  If a completed Q&A or delivery record has no remaining obligations or applicable constraints,
+  emit resolve, even when no new messages concern it. "Keep for archival background" is not
+  a valid keep reason: archiving is already done and does not require keeping the item active.
+  The server may move idle, unprotected items to cold storage without resolving them.
+  An unanswered question or unfinished action remains active even if temporary, low priority,
+  without a deadline, or unprotected. Use keep without protection for such an unchanged item;
+  leave cooling to the server. Lack of protection is not completion or cancellation evidence. Cite
+  ranges of new related messages on keep or update to refresh activity. Repeating keep,
+  rewriting a summary, reading history, or seeing the item in this prompt does not refresh
+  it. Restore a supplied cold item only when new messages concern it: reuse its ID with
+  keep or update and supporting new ranges. Resolve it instead if already settled.
+  Register protection from idle eviction with optional protection={kind, reason, ranges}
+  on create, update or keep: kind constraint for a still-applicable rule, pinned for the
+  user's explicit instruction to keep attention on this item, or commitment for a promise
+  needed by ongoing work or an approaching due date. Name its concrete reason and scope,
+  and cite complete supporting non-checkpoint messages. Initial registration for an old
+  item may cite all chunks of that item's own checkpoint. Register existing constraints
+  this way instead of relying on a keep reason alone. Ordinary unfinished work or a vague
+  keep reason does not warrant protection. Omit protection to preserve it; use kind none
+  with current non-checkpoint evidence and reason to remove it when no longer applicable.
+  Protection does not bypass the working-memory token budget.
+  Promote only after updating or
   creating a work_item that preserves the complete item, with ranges including every
   source index of the old continuation (including all chunks) and the new evidence.
   Reading or activating the work_item alone cannot transfer the item. Reference it as

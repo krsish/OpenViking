@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Both extraction languages preserve stable continuation state transitions."""
 
+import hashlib
 import json
 from copy import deepcopy
 from types import SimpleNamespace
@@ -14,7 +15,7 @@ from openviking.message import Message, TextPart
 from openviking.prompts.manager import PromptManager
 from openviking.server.identity import RequestContext, Role
 from openviking.session import work_items as wi
-from openviking.session.memory.dataclass import MemoryFile, ResolvedOperation
+from openviking.session.memory.dataclass import MemoryFile, ResolvedOperation, ResolvedOperations
 from openviking.session.memory.extract_loop import ExtractLoop
 from openviking.session.memory.extraction_output_protocol import (
     ExtractionOutputContext,
@@ -65,7 +66,21 @@ def _call(fields):
             "ranges": "1",
             "summary": "Tests passed; update the documentation next.",
         },
-        {"action": "keep", "continuation_id": "c-approval"},
+        {
+            "action": "keep",
+            "continuation_id": "c-approval",
+            "reason": "Awaiting the user's deployment approval.",
+        },
+        {
+            "action": "keep",
+            "continuation_id": "c-constraint",
+            "reason": "The user's instruction not to push commits still applies to this session.",
+        },
+        {
+            "action": "resolve",
+            "continuation_id": "c-test",
+            "reason": "The existing summary confirms the answer was delivered with no open questions.",
+        },
         {
             "action": "resolve",
             "continuation_id": "c-test",
@@ -98,9 +113,11 @@ def test_state_and_legacy_actions_parse_in_both_languages(context, protocol_name
         {"action": "create", "summary": "No source"},
         {"action": "update", "ranges": "1", "summary": "Missing stable ID"},
         {"action": "update", "continuation_id": "c-test", "summary": "No new evidence"},
+        {"action": "keep", "continuation_id": "c-test"},
+        {"action": "keep", "continuation_id": "c-test", "reason": "   "},
         {"action": "keep", "continuation_id": "c-test", "summary": "Changed by keep"},
         {"action": "resolve", "continuation_id": "c-test", "ranges": "1"},
-        {"action": "resolve", "continuation_id": "c-test", "reason": "No evidence"},
+        {"action": "resolve", "continuation_id": "c-test", "reason": "   "},
         {
             "action": "promote",
             "continuation_id": "c-test",
@@ -115,6 +132,20 @@ def test_state_and_legacy_actions_parse_in_both_languages(context, protocol_name
 def test_invalid_state_transitions_fail_shared_schema_validation(entry):
     with pytest.raises(ValidationError):
         ContinuationCoverage.model_validate(entry)
+
+
+@pytest.mark.parametrize("protocol_name", ["json", "python"])
+def test_keep_without_retention_reason_requests_repair(context, protocol_name):
+    entry = {"action": "keep", "continuation_id": "c-test"}
+    source = (
+        json.dumps({"continuation_coverage": [entry]}) if protocol_name == "json" else _call(entry)
+    )
+
+    operations, error = create_extraction_output_protocol(protocol_name).parse(source, context)
+
+    assert operations is None
+    assert "keep requires" in error
+    assert "reason" in error
 
 
 @pytest.mark.parametrize("existing", [False, True])
@@ -198,17 +229,27 @@ def test_contract_describes_stable_items_and_safe_promotion(context):
         assert "Never recreate an existing item" in contract
         assert "Never use resolve plus create" in contract
         assert "changed next action within the same matter requires update" in contract
+        assert "reason with new evidence" not in contract
+        assert "every action except keep" not in contract
+        assert "Updates and resolutions must include new supporting evidence" not in contract
+        assert "still-valid constraints" in contract
+        assert "keep retains an item in active working memory" in contract
+        assert "resolve removes it only from active working memory" in contract
+        assert "neither deletes archive data" in contract
+        assert "emit resolve even when no new messages concern them" in contract
         final_instruction = create_extraction_output_protocol(name).render_final_instruction(
             context
         )
         assert "never resolve plus create" in final_instruction
+        assert "preserves archive history" in final_instruction
+        assert "do not keep it solely for archival background" in final_instruction
 
 
 @pytest.mark.parametrize(
     "entry",
     [
         {"action": "update", "continuation_id": "c-test", "ranges": "1"},
-        {"action": "resolve", "continuation_id": "c-test", "reason": "No evidence"},
+        {"action": "keep", "continuation_id": "c-test"},
         {"action": "create", "ranges": "0", "summary": "New", "continuation_id": "invented"},
         {"action": "resolve", "ranges": "0", "reason": "Missing stable ID"},
         {"action": "discard", "continuation_id": "c-test", "ranges": "0", "reason": "Unknown"},
@@ -218,7 +259,16 @@ def test_contract_describes_stable_items_and_safe_promotion(context):
 def test_json_invalid_actions_request_repair_instead_of_being_silently_filtered(context, entry):
     operations, error = create_extraction_output_protocol("json").parse(
         json.dumps(
-            {"continuation_coverage": [{"action": "keep", "continuation_id": "c-other"}, entry]}
+            {
+                "continuation_coverage": [
+                    {
+                        "action": "keep",
+                        "continuation_id": "c-other",
+                        "reason": "Still awaiting verification.",
+                    },
+                    entry,
+                ]
+            }
         ),
         context,
     )
@@ -234,7 +284,7 @@ def test_json_state_validation_keeps_json_repair_and_legacy_list_tolerance(conte
     source = """```json
     {"continuation_coverage": [
       {"ranges": {}, "summary": "Invalid legacy field"},
-      {"action": "keep", "continuation_id": "c-test"},
+      {"action": "keep", "continuation_id": "c-test", "reason": "Still awaiting verification."},
     ]}
     ```"""
 
@@ -287,21 +337,111 @@ def test_long_checkpoint_keeps_its_stable_id_after_extraction_chunking():
     assert actions[0]["source_message_ids"] == ["new-result"]
 
 
-def test_checkpoint_chunks_alone_cannot_supply_new_resolution_evidence():
+def test_completed_checkpoint_chunks_can_resolve_without_current_messages():
+    body = "The user's question was answered and the reply was delivered. " * 1000
+    original = Message(
+        id="c-completed",
+        role="assistant",
+        message_kind="checkpoint",
+        parts=[TextPart(body)],
+    )
+    extraction = ExtractContext([original])
+    assert len(extraction.messages) > 1
+    assert all(message.message_kind == "checkpoint" for message in extraction.messages)
+
+    actions = wi.resolve_continuation_coverage(
+        extraction,
+        [
+            {
+                "action": "resolve",
+                "continuation_id": original.id,
+                "reason": "The supplied summary records a delivered answer with nothing unsettled.",
+            }
+        ],
+    )
+
+    assert actions[0]["continuation_id"] == original.id
+    assert actions[0]["source_message_ids"] == []
+    assert (
+        actions[0]["continuation_fingerprint"] == hashlib.sha256(body.strip().encode()).hexdigest()
+    )
+
+
+def test_resolution_without_ranges_still_rejects_unknown_item():
+    with pytest.raises(ValueError, match="Unknown continuation item"):
+        wi.resolve_continuation_coverage(
+            _long_checkpoint_context(),
+            [
+                {
+                    "action": "resolve",
+                    "continuation_id": "invented-id",
+                    "reason": "An invented identity cannot resolve a supplied item.",
+                }
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"action": "create", "summary": "A new matter needs current evidence."},
+        {
+            "action": "update",
+            "continuation_id": "c-long",
+            "summary": "A changed state needs current evidence.",
+        },
+        {
+            "action": "promote",
+            "continuation_id": "c-long",
+            "reason": "A transfer needs current evidence and a saved task.",
+            "work_item_page_id": 100,
+        },
+    ],
+)
+def test_checkpoint_chunks_alone_cannot_supply_evidence_for_new_state(entry):
     extraction = _long_checkpoint_context()
 
     with pytest.raises(ValueError, match="current non-checkpoint evidence"):
         wi.resolve_continuation_coverage(
             extraction,
-            [
+            [{**entry, "ranges": f"0-{len(extraction.messages) - 2}"}],
+        )
+
+
+def test_legacy_frozen_keep_without_reason_still_replays():
+    archive = "viking://user/alice/sessions/state-test/history/archive_002"
+    previous = wi.continuation_message(
+        "Do not push commits during this session.",
+        archive.replace("002", "001"),
+        ["origin"],
+        None,
+        continuation_id="c-constraint",
+    )
+    # Resolved operations are already validated and frozen. A schema change
+    # must not revalidate these historical keeps as fresh model output.
+    frozen = ResolvedOperations.model_validate(
+        {
+            "upsert_operations": [],
+            "delete_file_contents": [],
+            "errors": [],
+            "continuation_coverage": [
                 {
-                    "action": "resolve",
-                    "continuation_id": "c-long",
-                    "ranges": f"0-{len(extraction.messages) - 2}",
-                    "reason": "Treating the old summary as a new result is unsafe.",
+                    "action": "keep",
+                    "continuation_id": previous["id"],
+                    "source_message_ids": [],
+                    "summary": "",
+                    "reason": "",
                 }
             ],
-        )
+        }
+    )
+
+    remaining, _ = wi.coverage_report(
+        [], [], archive, frozen.continuation_coverage, previous_residual=[previous]
+    )
+
+    assert [item["id"] for item in remaining] == [previous["id"]]
+    assert wi.continuation_content(remaining[0]) == wi.continuation_content(previous)
 
 
 @pytest.mark.asyncio

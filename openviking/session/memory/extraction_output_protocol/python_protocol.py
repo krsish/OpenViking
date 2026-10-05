@@ -188,12 +188,27 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
                     'ranges="4", summary="""Complete latest state of this item"""): '
                     "use the same ID for progress, new phases and changed next actions; "
                     "do not resolve and recreate the same matter.",
-                    '- sdk.continuation(action="keep", continuation_id="<supplied ID>"): '
-                    "preserve this item's content unchanged.",
+                    '- sdk.continuation(action="keep", continuation_id="<supplied ID>", '
+                    'reason="""The deployment approval is still pending"""): '
+                    "retain in active working memory unchanged; explain the pending matter, still-valid "
+                    "constraint, continuing commitment, necessary reference or uncertainty. "
+                    "An applicable constraint can need retention without a next action. "
+                    "Include ranges when new messages actually concern this item; keep alone "
+                    "does not refresh its idle age.",
+                    '- sdk.continuation(action="keep", continuation_id="<supplied ID>", '
+                    'reason="""The no-push rule still applies to this session""", '
+                    'protection={"kind": "constraint", "reason": "User forbids pushing '
+                    'during this session", "ranges": "2"}): '
+                    "register protection from idle eviction with concrete scope and source evidence. "
+                    "kind can be constraint, pinned, commitment or none (remove protection). "
+                    "This optional field is supported on create, update and keep; omit it to "
+                    "preserve existing protection. It does not bypass the token budget.",
                     '- sdk.continuation(action="resolve", continuation_id="<supplied ID>", '
-                    'ranges="4", reason="""Evidence that this item is resolved"""): '
-                    "only when no continuation of this matter remains, not merely when "
-                    "its previous next step is complete.",
+                    'reason="""The recorded answer was delivered; no obligations or '
+                    'applicable constraints remain"""): '
+                    "remove only from active working memory; archive history is preserved. "
+                    "The item's own settled state can justify closure; no new evidence or "
+                    "ranges are required. Keep uncertain completion or still-valid constraints.",
                     '- sdk.continuation(action="promote", continuation_id="<supplied ID>", '
                     'ranges="4", work_item=task, reason="""This task preserves the item"""): '
                     "task must be an existing work_item binding or the result of "
@@ -346,7 +361,18 @@ class PythonExtractionOutputProtocol(ExtractionOutputProtocol):
             "sdk.continuation(action=..., continuation_id=...): keep, update, resolve or promote. "
             "Keep the same ID when a matter progresses or its next step changes: use update, "
             "never resolve plus create. Resolve only when nothing remains to continue for "
-            "that matter. Use action='create' only for a new matter."
+            "that matter, including applicable constraints. Keep requires a concrete reason "
+            "to retain the item, including still-valid constraints or uncertainty to verify. "
+            "Resolve may rely on the item's own settled state and omit ranges; explain the "
+            "completion basis in reason. keep retains active working memory; resolve removes "
+            "only the active item and preserves archive history. Emit resolve for a settled "
+            "item with no remaining obligations or applicable constraints; do not keep it "
+            "solely for archival background. Use action='create' only for a new matter. "
+            "Cite new related ranges to refresh an item's activity or restore a supplied cold "
+            "item under its existing ID; repeating keep does neither. Register applicable "
+            "constraints, user-pinned items or continuing commitments with evidence-backed "
+            "protection; omit protection to preserve it, or use kind='none' with fresh evidence "
+            "to remove it."
             if any(schema.memory_type == "work_item" for schema in context.schemas)
             else ""
         )
@@ -959,7 +985,15 @@ class _PythonProgramCompiler:
                 self._error(node, "continuation() accepts keyword arguments only")
             kwargs = self._eval_keywords(
                 node,
-                allowed={"action", "continuation_id", "ranges", "summary", "reason", "work_item"},
+                allowed={
+                    "action",
+                    "continuation_id",
+                    "ranges",
+                    "summary",
+                    "reason",
+                    "work_item",
+                    "protection",
+                },
             )
             if not kwargs.get("action"):
                 if set(kwargs) not in ({"ranges", "summary"}, {"ranges", "reason"}):

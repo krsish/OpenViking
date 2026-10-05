@@ -12,7 +12,10 @@ import json
 from typing import Any
 
 from openviking.message import Message, TextPart
-from openviking.session.continuation_overflow import continuation_recovery_notice
+from openviking.session.continuation_overflow import (
+    continuation_recovery_notice,
+    continuation_store_notice,
+)
 from openviking.session.memory.utils.memory_file_utils import (
     MemoryFileUtils,
     memory_version_from_fields,
@@ -57,10 +60,16 @@ def ready_checkpoint(done: dict[str, Any], archive_id: str) -> bool:
 
 
 def residual_text(
-    messages: list[dict[str, Any]], pending_continuation_uri: str | None = None
+    messages: list[dict[str, Any]],
+    pending_continuation_uri: str | None = None,
+    continuation_store_uri: str | None = None,
 ) -> str:
+    notice = (
+        continuation_store_notice(continuation_store_uri)
+        if continuation_store_uri
+        else continuation_recovery_notice(pending_continuation_uri)
+    )
     if not messages:
-        notice = continuation_recovery_notice(pending_continuation_uri)
         return "## Continuation\n" + notice if notice else ""
     parts = [CONTINUATION_HEADER]
     sources = []
@@ -74,7 +83,6 @@ def residual_text(
             sources.append(source)
         parts.append(f"[{message['id']}] {content}")
     parts.extend(f"Source coverage: {source}" for source in sources)
-    notice = continuation_recovery_notice(pending_continuation_uri)
     if notice:
         parts.append(notice)
     return "## Continuation\n" + "\n\n".join(parts)
@@ -121,6 +129,7 @@ def build_projection(
     *,
     residual_token_budget: int | None = None,
     pending_continuation_uri: str | None = None,
+    continuation_store_uri: str | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Pack whole item blocks in priority order; never truncate constraints."""
     budgets = get_work_item_budgets()
@@ -128,7 +137,7 @@ def build_projection(
         token_budget = budgets.projection_token_budget
     if residual_token_budget is None:
         residual_token_budget = budgets.continuation_token_budget
-    remaining = residual_text(residual, pending_continuation_uri)
+    remaining = residual_text(residual, pending_continuation_uri, continuation_store_uri)
     residual_tokens = estimate_text_tokens(remaining)
     if residual_tokens > residual_token_budget:
         identities = [message.get("id") for message in residual]
@@ -368,11 +377,15 @@ def resolve_continuation_coverage(
             ranges = fields.get("ranges", "")
             selected = selected_source_messages(extract_context, ranges) if ranges else []
             ids = covered_source_message_ids(extract_context, ranges) if ranges else []
-            if action != "keep" and not any(
+            # An item's own settled state can justify closing that item. It
+            # cannot supply new evidence for creating/updating canonical state.
+            # Keep the ID and current-body fingerprint checks for every closure.
+            requires_evidence = action in {"create", "update", "promote"}
+            if requires_evidence and not any(
                 message.message_kind != "checkpoint" for message in selected
             ):
                 raise ValueError(f"Continuation {action} requires current non-checkpoint evidence")
-            if action != "keep" and not ids:
+            if requires_evidence and not ids:
                 raise ValueError("Continuation action requires complete source attribution")
             entry = {
                 "action": action,
@@ -381,6 +394,38 @@ def resolve_continuation_coverage(
                 "summary": summary,
                 "reason": reason,
             }
+            protection = fields.get("protection")
+            if protection is not None:
+                protection_sources = selected_source_messages(extract_context, protection["ranges"])
+                protection_ids = covered_source_message_ids(extract_context, protection["ranges"])
+                has_fresh_evidence = bool(set(protection_ids) - checkpoints)
+                registers_existing = (
+                    action != "create"
+                    and protection["kind"] != "none"
+                    and protection_ids == [identity]
+                    and all(
+                        message.message_kind == "checkpoint"
+                        and (
+                            chunk_meta[id(message)].source_message_id
+                            if id(message) in chunk_meta
+                            else message.id
+                        )
+                        == identity
+                        for message in protection_sources
+                    )
+                )
+                if not has_fresh_evidence and not registers_existing:
+                    raise ValueError(
+                        "Continuation protection requires complete current non-checkpoint "
+                        "evidence, or its own complete checkpoint for initial registration"
+                    )
+                # The retention store checks that checkpoint-only registration is
+                # initial and that this action's body fingerprint is still current.
+                entry["protection"] = {
+                    "kind": protection["kind"],
+                    "reason": protection["reason"].strip(),
+                    "source_message_ids": protection_ids,
+                }
             from openviking.session.continuation_state import (
                 continuation_fingerprint,
                 new_continuation_id,

@@ -85,6 +85,7 @@ class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
                     entry.get("action", "") != ""
                     or entry.get("continuation_id", "") != ""
                     or entry.get("work_item_page_id") is not None
+                    or entry.get("protection") is not None
                 ):
                     continue
                 try:
@@ -110,7 +111,19 @@ class JsonExtractionOutputProtocol(ExtractionOutputProtocol):
             "continuation_coverage action: keep, update, resolve or promote. Use create only "
             "for a new matter. Progress and changed next steps within the same matter require "
             "update with the same ID; never resolve plus create to rewrite it. Resolve only "
-            "when no continuation of that matter remains. Promotion requires a successful "
+            "when no continuation of that matter remains, including applicable constraints. "
+            "Keep requires a concrete reason to retain the item, including still-valid "
+            "constraints or uncertainty to verify. Resolve may rely on the item's own "
+            "settled state and omit ranges; explain the completion basis in reason. "
+            "keep retains active working memory; resolve removes only the active item and "
+            "preserves archive history. Emit resolve for a settled item with no remaining "
+            "obligations or applicable constraints; do not keep it solely for archival background. "
+            "Cite new related ranges to refresh an item's activity or restore a supplied cold "
+            "item under its existing ID; repeating keep does neither. Register applicable "
+            "constraints, user-pinned items or continuing commitments with evidence-backed "
+            "protection; omit protection to preserve it, or use kind='none' with fresh evidence "
+            "to remove it. "
+            "Promotion requires a successful "
             "work_item create/update whose "
             "ranges cover every source index of the old continuation and the new evidence; "
             "reading or activating a work_item alone does not transfer the continuation. "

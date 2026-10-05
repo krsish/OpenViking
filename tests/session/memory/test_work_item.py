@@ -652,7 +652,8 @@ def test_extraction_contracts_use_configured_budgets_and_preserve_existing_conti
         assert "12345 estimated tokens" in contract
         assert "6789 estimated tokens" in contract
         assert "archive_only" in contract
-        assert "Previous continuation remains active by default" in contract
+        assert "Previous continuation is preserved by default" in contract
+        assert "move idle, unprotected items to cold storage without resolving them" in contract
         assert "Missing classifications keep original messages" not in contract
         assert "below 600" not in contract
         assert "within 1200" not in contract

@@ -159,3 +159,57 @@ async def test_real_failed_task_write_cannot_complete_promotion(pipeline, monkey
         for row in ledger
         for action in row.get("continuation_actions", [])
     )
+
+
+@pytest.mark.asyncio
+async def test_real_pipeline_closes_settled_background_but_keeps_standing_obligations(pipeline):
+    summaries = {
+        "answered": "The memory-policy question was answered and delivered; nothing remains open.",
+        "constraint": "Do not push without explicit approval, even though no push is now planned.",
+        "waiting": "The requested approval has not arrived; wait for the user's response.",
+        "uncertain": "The test tool stopped, but its output is incomplete; success is unverified.",
+    }
+    previous = [
+        wi.continuation_message(
+            text,
+            "viking://user/alice/sessions/continuation-state/history/archive_001",
+            [f"original-{identity}"],
+            "2026-10-01T00:00:00Z",
+            continuation_id=identity,
+        )
+        for identity, text in summaries.items()
+    ]
+    reasons = {
+        "answered": "The recorded answer was delivered and the question has no remaining obligation.",
+        "constraint": "Still-applicable constraint: explicit approval is required before any push.",
+        "waiting": "Pending: the user has not yet supplied the requested approval.",
+        "uncertain": "Pending verification: incomplete tool output does not establish test success.",
+    }
+    messages = [Message.from_dict(value) for value in previous] + [source("greeting", "Hello.")]
+    program = (
+        "\n".join(
+            f"sdk.continuation(action={'resolve' if identity == 'answered' else 'keep'!r}, "
+            f"continuation_id={identity!r}, reason={reason!r})"
+            for identity, reason in reasons.items()
+        )
+        + "\nsdk.commit()"
+    )
+
+    extracted = await pipeline.run(program, messages)
+    current, ledger = apply_coverage(extracted, messages, 2, previous)
+
+    assert {value["id"] for value in current} == {"constraint", "waiting", "uncertain"}
+    assert {value["id"]: wi.continuation_content(value) for value in current} == {
+        identity: text for identity, text in summaries.items() if identity != "answered"
+    }
+    assert not extracted.result.written_uris
+    assert not extracted.result.edited_uris
+    for identity, reason in reasons.items():
+        row = next(value for value in ledger if value["message_id"] == identity)
+        action = row["continuation_actions"][0]
+        assert action["reason"] == reason
+        assert action["state"] == ("resolved" if identity == "answered" else "active")
+        assert action["source_message_ids"] == []
+    assert all(
+        action["continuation_fingerprint"] for action in extracted.operations.continuation_coverage
+    )
