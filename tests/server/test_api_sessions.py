@@ -471,6 +471,7 @@ async def test_get_session_context_includes_incomplete_archive_messages(
     assert resp.status_code == 200
     body = resp.json()
     assert [m["parts"][0]["text"] for m in body["result"]["messages"]] == [
+        "Archived seed",
         "Pending user message",
         "Pending assistant response",
         "Current live message",
@@ -1342,11 +1343,9 @@ async def test_get_session_context_endpoint_returns_trimmed_latest_archive_and_m
     )
 
 
-@pytest.mark.parametrize("wm_enabled", [False, True])
 async def test_get_session_archive_endpoint_returns_archive_details(
     client: httpx.AsyncClient,
     service,
-    wm_enabled,
 ):
     # See test_get_session_context_*: stub memory extraction (not covered by the
     # server fake VLM) so the archive completes; this test checks the archive
@@ -1368,10 +1367,7 @@ async def test_get_session_archive_endpoint_returns_archive_details(
         f"/api/v1/sessions/{session_id}/messages",
         json=_message_request("assistant", content="archived answer"),
     )
-    commit_resp = await client.post(
-        f"/api/v1/sessions/{session_id}/commit", json={"working_memory_enabled": wm_enabled}
-    )
-    assert commit_resp.json()["result"]["effective_working_memory_enabled"] is wm_enabled
+    commit_resp = await client.post(f"/api/v1/sessions/{session_id}/commit")
     task_id = commit_resp.json()["result"]["task_id"]
     await _wait_for_task(client, task_id)
 
@@ -1380,8 +1376,8 @@ async def test_get_session_archive_endpoint_returns_archive_details(
     body = resp.json()
     assert body["status"] == "ok"
     assert body["result"]["archive_id"] == "archive_001"
-    assert bool(body["result"]["overview"]) is wm_enabled
-    assert bool(body["result"]["abstract"]) is wm_enabled
+    assert body["result"]["overview"]
+    assert body["result"]["abstract"]
     assert [m["parts"][0]["text"] for m in body["result"]["messages"]] == [
         "archived question",
         "archived answer",
@@ -1448,9 +1444,7 @@ async def test_commit_failed_when_summary_fails_does_not_block_next_commit(
     """If the core Working Memory summary fails, the archive is .failed.json (no
     .done) and the task fails — but a failed archive must not block later commits.
     """
-    create_resp = await client.post(
-        "/api/v1/sessions", json={"memory_policy": {"working_memory": {"enabled": True}}}
-    )
+    create_resp = await client.post("/api/v1/sessions", json={})
     session_id = create_resp.json()["result"]["session_id"]
 
     async def failing_summary(*args, **kwargs):
@@ -1487,11 +1481,3 @@ async def test_commit_failed_when_summary_fails_does_not_block_next_commit(
     body = resp.json()
     assert body["status"] == "ok"
     assert body["result"]["archived"] is True
-
-
-@pytest.mark.parametrize("invalid", ["false", "true", 0, 1, {}, []])
-def test_commit_working_memory_override_requires_boolean(invalid):
-    from pydantic import ValidationError
-
-    with pytest.raises(ValidationError):
-        sessions_router.CommitRequest.model_validate({"working_memory_enabled": invalid})

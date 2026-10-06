@@ -304,8 +304,6 @@ export interface BatchAddMessagesOptions {
 }
 /** Session commit and turn-retention options. */
 export interface CommitSessionOptions {
-  /** Override only Working Memory for this commit; null inherits the session policy. */
-  workingMemoryEnabled?: boolean | null;
   keepRecentCount?: number;
   retentionMode?: "turn_budget";
   keepRecentTurnCount?: number;

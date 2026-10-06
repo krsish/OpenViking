@@ -4,8 +4,6 @@ import uuid
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from openviking.pyagfs import AGFSNotFoundError
-
 
 class MockLocalAGFS:
     """
@@ -128,7 +126,7 @@ class MockLocalAGFS:
     def read_file(self, path, ctx=None, **kwargs):
         p = self._resolve(path)
         if not p.exists():
-            raise AGFSNotFoundError(path)
+            raise FileNotFoundError(path)
         return p.read_bytes()
 
     def read(self, path, ctx=None, **kwargs):
@@ -160,7 +158,7 @@ class MockLocalAGFS:
     def stat(self, path, ctx=None):
         p = self._resolve(path)
         if not p.exists():
-            raise AGFSNotFoundError(path)
+            raise FileNotFoundError(path)
         s = p.stat()
         return {
             "size": s.st_size,

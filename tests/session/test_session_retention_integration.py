@@ -4,7 +4,6 @@
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
@@ -728,7 +727,6 @@ async def test_wm_creation_returns_two_products_in_one_model_call(
             )
 
     vlm = FakeVLM()
-    session._vlm_resolver = SimpleNamespace(get_vlm=AsyncMock(return_value=vlm))
     monkeypatch.setattr(
         "openviking.session.session.get_openviking_config",
         lambda: SimpleNamespace(vlm=vlm),
@@ -766,12 +764,11 @@ async def test_wm_creation_passes_configured_output_language_to_prompt(client, m
         def is_available() -> bool:
             return True
 
-        async def get_completion_async(self, prompt, **kwargs):
-            prompts.append({"prompt": prompt, **kwargs})
+        async def get_completion_async(self, **kwargs):
+            prompts.append(kwargs)
             return "# Working Memory"
 
     vlm = FakeVLM()
-    session._vlm_resolver = SimpleNamespace(get_vlm=AsyncMock(return_value=vlm))
     monkeypatch.setattr(
         "openviking.session.session.get_openviking_config",
         lambda: SimpleNamespace(vlm=vlm, output_language_override="zh-CN"),
@@ -795,12 +792,11 @@ async def test_wm_creation_detects_language_from_multiline_user_message(client, 
         def is_available() -> bool:
             return True
 
-        async def get_completion_async(self, prompt, **kwargs):
-            prompts.append({"prompt": prompt, **kwargs})
+        async def get_completion_async(self, **kwargs):
+            prompts.append(kwargs)
             return "# Working Memory"
 
     vlm = FakeVLM()
-    session._vlm_resolver = SimpleNamespace(get_vlm=AsyncMock(return_value=vlm))
     monkeypatch.setattr(
         "openviking.session.session.get_openviking_config",
         lambda: SimpleNamespace(vlm=vlm),
@@ -811,7 +807,9 @@ async def test_wm_creation_detects_language_from_multiline_user_message(client, 
             _text_message(
                 "multiline-user",
                 "user",
-                "Task details:\n当前生产环境已经完成部署。\n请用中文总结当前状态和后续风险。",
+                "Task details:\n"
+                "当前生产环境已经完成部署。\n"
+                "请用中文总结当前状态和后续风险。",
             )
         ]
     )
@@ -863,7 +861,6 @@ async def test_wm_update_returns_two_products_in_one_model_call(
             )
 
     vlm = FakeVLM()
-    session._vlm_resolver = SimpleNamespace(get_vlm=AsyncMock(return_value=vlm))
     monkeypatch.setattr(
         "openviking.session.session.get_openviking_config",
         lambda: SimpleNamespace(vlm=vlm),

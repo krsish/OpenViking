@@ -19,7 +19,7 @@ export function buildMemoryPolicy(preset: MemoryPreset): UserMemoryPolicy {
   return {
     self: { enabled: true },
     peer: { enabled: preset === 'general' },
-    working_memory: { enabled: false },
+    working_memory: { enabled: true },
     ...(preset === 'general'
       ? {}
       : {
@@ -41,8 +41,7 @@ export function identifyMemoryPreset(
       return (
         policy.self?.enabled !== false &&
         (policy.peer?.enabled !== false) === expected.peer?.enabled &&
-        (policy.working_memory?.enabled ?? false) ===
-          expected.working_memory?.enabled &&
+        policy.working_memory?.enabled !== false &&
         (types
           ? types.length === expectedTypes.length &&
             expectedTypes.every((type) => types.includes(type))
