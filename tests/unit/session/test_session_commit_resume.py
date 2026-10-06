@@ -25,10 +25,10 @@ def test_new_queue_snapshot_preserves_wm_across_worker_reload(enabled):
         session_uri="viking://user/default/sessions/s",
         archive_uri="viking://user/default/sessions/s/history/archive_001",
         user={},
-        memory_policy=MemoryPolicy(working_memory_enabled=enabled).to_dict(),
+        memory_policy=MemoryPolicy(enable_working_memory=enabled).to_dict(),
     )
     restored = SessionCommitMsg.from_dict(message.to_dict())
-    assert MemoryPolicy.from_dict(restored.memory_policy).working_memory_enabled is enabled
+    assert MemoryPolicy.from_dict(restored.memory_policy).enable_working_memory is enabled
 
 
 def test_legacy_queued_work_keeps_old_default_without_migrating_user_policy():
@@ -43,8 +43,8 @@ def test_legacy_queued_work_keeps_old_default_without_migrating_user_policy():
             "memory_policy": policy,
         }
     )
-    assert MemoryPolicy.from_dict(message.memory_policy).working_memory_enabled is True
-    assert MemoryPolicy.from_dict(policy).working_memory_enabled is False
+    assert MemoryPolicy.from_dict(message.memory_policy).enable_working_memory is True
+    assert MemoryPolicy.from_dict(policy).enable_working_memory is False
     assert message.memory_policy["self"] == policy["self"]
     assert message.memory_policy["memory_types"] == policy["memory_types"]
 

@@ -1358,7 +1358,7 @@ Commit a session. Message archiving (Phase 1) completes before the response retu
 |-----------|------|----------|---------|-------------|
 | session_id | str | Yes | - | Session ID to commit |
 | keep_recent_count | int | No | 0 | Number of recent live messages to retain (kept live, not archived) after commit. `0` (default) archives all messages. |
-| working_memory_enabled | bool or null | No | null | Override only WM generation for this commit. Omitted/null inherits the resolved policy; true/false leaves self/peer/memory_types and saved policies unchanged. Strings/numbers are rejected. The response includes `effective_working_memory_enabled`. |
+| enable_working_memory | bool or null | No | null | Override only WM generation for this commit. Omitted/null inherits the resolved policy; true/false leaves self/peer/memory_types and saved policies unchanged. Strings/numbers are rejected. The response includes `effective_enable_working_memory`. |
 | reset_context | bool | No | false | HTTP API: archive all live messages, then append a boundary archive containing only a `.done` marker with `context_reset`. Keeps the session ID and raw history, clears injected context and stops future summaries from inheriting pre-reset overviews. Requires `keep_recent_count=0` and no `retention_mode`. |
 
 `reset_context` is used by the OpenClaw plugin reset hook and `Session.commit_async()`. It also creates a boundary when there are no live messages, unless the newest archive is already a reset boundary. Memory extraction for older archives can finish independently; long-term memories are preserved. The SDK and CLI do not expose a dedicated `reset_context` option; use the HTTP API when needed.

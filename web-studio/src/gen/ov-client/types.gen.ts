@@ -266,7 +266,7 @@ export type CommitRequest = {
     /**
      * Override only Working Memory generation for this commit; null inherits policy.
      */
-    working_memory_enabled?: boolean | null;
+    enable_working_memory?: boolean | null;
     /**
      * Keep Recent Count
      *

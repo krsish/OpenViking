@@ -655,7 +655,7 @@ class TestCommit:
         session.add_message("user", [TextPart("Round 2 user")])
         session.add_message("assistant", [TextPart("Round 2 assistant")])
 
-        result = await session.commit_async(keep_recent_count=2, working_memory_enabled=True)
+        result = await session.commit_async(keep_recent_count=2, enable_working_memory=True)
         task_result = await _wait_for_task(result["task_id"])
 
         assert task_result["status"] == "completed"
@@ -696,7 +696,7 @@ class TestCommit:
 
         session.add_message("user", [TextPart("First round message")])
         session.add_message("assistant", [TextPart("First round response")])
-        result1 = await session.commit_async(working_memory_enabled=True)
+        result1 = await session.commit_async(enable_working_memory=True)
         await _wait_for_task(result1["task_id"])
 
         previous_overview = await session._archives.read_overview(result1["archive_uri"])
@@ -722,7 +722,7 @@ class TestCommit:
 
         session.add_message("user", [TextPart("Second round message")])
         session.add_message("assistant", [TextPart("Second round response")])
-        result2 = await session.commit_async(working_memory_enabled=True)
+        result2 = await session.commit_async(enable_working_memory=True)
         task_result = await _wait_for_task(result2["task_id"])
 
         assert task_result["status"] == "completed"

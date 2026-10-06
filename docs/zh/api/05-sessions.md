@@ -1357,7 +1357,7 @@ ov add-memory '[{"role":"user","content":"Hello"},{"role":"assistant","content":
 |------|------|------|--------|------|
 | session_id | str | 是 | - | 要提交的会话 ID |
 | keep_recent_count | int | 否 | 0 | 提交后保留为 live 状态的最近消息数 (保持 live, 不归档)。`0` (默认) 归档全部消息。 |
-| working_memory_enabled | bool 或 null | 否 | null | 仅覆盖本次 commit 的 WM 生成开关；省略/null 沿用有效策略，true/false 不改变 self、peer、memory_types 或已保存策略。拒绝字符串和数字；响应的 `effective_working_memory_enabled` 返回实际生效值。 |
+| enable_working_memory | bool 或 null | 否 | null | 仅覆盖本次 commit 的 WM 生成开关；省略/null 沿用有效策略，true/false 不改变 self、peer、memory_types 或已保存策略。拒绝字符串和数字；响应的 `effective_enable_working_memory` 返回实际生效值。 |
 | reset_context | bool | 否 | false | HTTP API：归档全部 live messages 后追加只含 `.done`（带 `context_reset`）的边界 archive，目录内没有消息文件。保留 session ID 和原始历史，清空注入上下文，并阻止后续摘要继承 reset 前的 overview。要求 `keep_recent_count=0`，且不设置 `retention_mode`。 |
 
 `reset_context` 供 OpenClaw 插件 reset hook 和 `Session.commit_async()` 使用；没有 live messages 时也会创建边界；若最新 archive 已是 reset 边界则不重复创建。旧 archive 的记忆提取可以继续完成，长期记忆保留。SDK 和 CLI 没有专用的 `reset_context` 参数，需要时使用 HTTP API。

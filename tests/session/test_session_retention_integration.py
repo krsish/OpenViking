@@ -163,7 +163,7 @@ async def test_done_with_missing_required_overview_reports_failed_without_raw(
         done={
             "starting_message_id": "u1",
             "ending_message_id": "u1",
-            "working_memory_enabled": True,
+            "enable_working_memory": True,
         },
     )
 

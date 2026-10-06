@@ -587,7 +587,7 @@ class CommitRequest(BaseModel):
     behavior.
     """
 
-    working_memory_enabled: Optional[StrictBool] = Field(
+    enable_working_memory: Optional[StrictBool] = Field(
         default=None,
         description="Override only Working Memory generation for this commit; null inherits policy.",
     )
@@ -672,7 +672,7 @@ async def commit_session(
     service = get_service()
     commit_kwargs: Dict[str, Any] = {"keep_recent_count": body.keep_recent_count}
     optional_retention = {
-        "working_memory_enabled": body.working_memory_enabled,
+        "enable_working_memory": body.enable_working_memory,
         "retention_mode": body.retention_mode,
         "keep_recent_turn_count": body.keep_recent_turn_count,
         "retained_message_token_budget": body.retained_message_token_budget,

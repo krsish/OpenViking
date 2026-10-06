@@ -1369,9 +1369,9 @@ async def test_get_session_archive_endpoint_returns_archive_details(
         json=_message_request("assistant", content="archived answer"),
     )
     commit_resp = await client.post(
-        f"/api/v1/sessions/{session_id}/commit", json={"working_memory_enabled": wm_enabled}
+        f"/api/v1/sessions/{session_id}/commit", json={"enable_working_memory": wm_enabled}
     )
-    assert commit_resp.json()["result"]["effective_working_memory_enabled"] is wm_enabled
+    assert commit_resp.json()["result"]["effective_enable_working_memory"] is wm_enabled
     task_id = commit_resp.json()["result"]["task_id"]
     await _wait_for_task(client, task_id)
 
@@ -1494,4 +1494,4 @@ def test_commit_working_memory_override_requires_boolean(invalid):
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
-        sessions_router.CommitRequest.model_validate({"working_memory_enabled": invalid})
+        sessions_router.CommitRequest.model_validate({"enable_working_memory": invalid})

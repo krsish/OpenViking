@@ -105,6 +105,15 @@ class ArchiveStore:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def normalize_done(done: Dict[str, Any]) -> Dict[str, Any]:
+        """Read markers written before the WM switch was renamed."""
+        normalized = dict(done)
+        if "enable_working_memory" not in normalized and "working_memory_enabled" in normalized:
+            normalized["enable_working_memory"] = normalized["working_memory_enabled"]
+        normalized.pop("working_memory_enabled", None)
+        return normalized
+
+    @staticmethod
     def archive_index_from_uri(archive_uri: str) -> int:
         """Parse archive_NNN suffix into an integer index."""
         match = re.search(r"archive_(\d+)$", archive_uri.rstrip("/"))
@@ -252,7 +261,7 @@ class ArchiveStore:
                     raw_done = await self._viking_fs.read_file(done_uri, ctx=self._ctx)
                     parsed_done = json.loads(raw_done or "{}")
                     if isinstance(parsed_done, dict):
-                        done = parsed_done
+                        done = self.normalize_done(parsed_done)
                 except Exception as exc:
                     # Marker existence still means completion, but unreadable
                     # contents cannot extend coverage to earlier archives.
@@ -265,7 +274,7 @@ class ArchiveStore:
                 # Otherwise leave overview empty here and let context assembly
                 # lazy-load the newest terminal completed archive's overview.
                 overview = ""
-                if done.get("working_memory_enabled") is True:
+                if done.get("enable_working_memory") is True:
                     overview = await self.read_overview(archive["archive_uri"])
                     if not overview.strip():
                         # New markers distinguish an intentionally overview-less
@@ -354,7 +363,7 @@ class ArchiveStore:
                     "archive_uri": state.archive_uri,
                     "index": state.index,
                     "context_reset": state.done.get("context_reset") is True,
-                    "working_memory_enabled": state.done.get("working_memory_enabled"),
+                    "enable_working_memory": state.done.get("enable_working_memory"),
                 }
             )
 
@@ -368,7 +377,7 @@ class ArchiveStore:
             )
         except Exception:
             return {}
-        return done if isinstance(done, dict) else {}
+        return self.normalize_done(done) if isinstance(done, dict) else {}
 
     async def is_context_reset_archive(self, archive_uri: str) -> bool:
         """Return True when the archive's ``.done`` marks a context reset boundary."""

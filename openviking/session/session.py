@@ -143,7 +143,7 @@ def _apply_agent_evolution_setting(
         self_enabled=policy.self_enabled,
         peer_enabled=policy.peer_enabled,
         memory_types=effective_types,
-        working_memory_enabled=policy.working_memory_enabled,
+        enable_working_memory=policy.enable_working_memory,
     )
 
 
@@ -1215,7 +1215,7 @@ class Session:
         keep_recent_count: int = 0,
         *,
         memory_policy: Optional[Dict[str, Any]] = None,
-        working_memory_enabled: Optional[bool] = None,
+        enable_working_memory: Optional[bool] = None,
         retention_mode: Optional[str] = None,
         keep_recent_turn_count: Optional[int] = None,
         retained_message_token_budget: Optional[int] = None,
@@ -1226,7 +1226,7 @@ class Session:
             self.commit_async(
                 keep_recent_count=keep_recent_count,
                 memory_policy=memory_policy,
-                working_memory_enabled=working_memory_enabled,
+                enable_working_memory=enable_working_memory,
                 retention_mode=retention_mode,
                 keep_recent_turn_count=keep_recent_turn_count,
                 retained_message_token_budget=retained_message_token_budget,
@@ -1240,7 +1240,7 @@ class Session:
         keep_recent_count: int = 0,
         *,
         memory_policy: Optional[Dict[str, Any]] = None,
-        working_memory_enabled: Optional[bool] = None,
+        enable_working_memory: Optional[bool] = None,
         retention_mode: Optional[str] = None,
         keep_recent_turn_count: Optional[int] = None,
         retained_message_token_budget: Optional[int] = None,
@@ -1314,8 +1314,8 @@ class Session:
         effective_min_tail = max(0, int(1 if min_raw_tail_steps is None else min_raw_tail_steps))
         if turn_mode and effective_token_budget <= 0:
             raise ValueError("retained_message_token_budget must be greater than 0")
-        if working_memory_enabled is not None and not isinstance(working_memory_enabled, bool):
-            raise ValueError("working_memory_enabled must be a boolean or null")
+        if enable_working_memory is not None and not isinstance(enable_working_memory, bool):
+            raise ValueError("enable_working_memory must be a boolean or null")
         in_memory_default_memory_policy = self._meta.memory_policy
         agent_evolution_enabled = self._agent_evolution_enabled
         if self._agent_evolution_enabled_provider is not None:
@@ -1332,9 +1332,9 @@ class Session:
                 effective_policy,
                 agent_evolution_enabled=agent_evolution_enabled,
             )
-            if working_memory_enabled is not None:
+            if enable_working_memory is not None:
                 effective_policy = replace(
-                    effective_policy, working_memory_enabled=working_memory_enabled
+                    effective_policy, enable_working_memory=enable_working_memory
                 )
             effective_memory_policy = effective_policy.to_dict()
             effective_memory_types = sorted(_effective_memory_types(effective_policy))
@@ -1404,9 +1404,9 @@ class Session:
                     effective_policy,
                     agent_evolution_enabled=agent_evolution_enabled,
                 )
-                if working_memory_enabled is not None:
+                if enable_working_memory is not None:
                     effective_policy = replace(
-                        effective_policy, working_memory_enabled=working_memory_enabled
+                        effective_policy, enable_working_memory=enable_working_memory
                     )
                 effective_memory_policy = effective_policy.to_dict()
                 effective_memory_types = sorted(_effective_memory_types(effective_policy))
@@ -1447,7 +1447,7 @@ class Session:
                     "task_id": None,
                     "archive_uri": None,
                     "archived": False,
-                    "effective_working_memory_enabled": effective_policy.working_memory_enabled,
+                    "effective_enable_working_memory": effective_policy.enable_working_memory,
                     "reason": "no_messages",
                     "trace_id": trace_id,
                     **({"reset_context": True} if reset_context else {}),
@@ -1501,7 +1501,7 @@ class Session:
                     "task_id": None,
                     "archive_uri": None,
                     "archived": False,
-                    "effective_working_memory_enabled": effective_policy.working_memory_enabled,
+                    "effective_enable_working_memory": effective_policy.enable_working_memory,
                     "reason": "all_within_keep_window",
                     "trace_id": trace_id,
                     "estimated_active_tokens": (
@@ -1648,7 +1648,7 @@ class Session:
             "task_id": task_id,
             "archive_uri": archive_uri,
             "archived": True,
-            "effective_working_memory_enabled": effective_policy.working_memory_enabled,
+            "effective_enable_working_memory": effective_policy.enable_working_memory,
             "trace_id": trace_id,
             **({"reset_context": True} if reset_context else {}),
             "estimated_active_tokens": (
@@ -1677,7 +1677,7 @@ class Session:
         try:
             await self._viking_fs.write_file(
                 f"{archive_uri}/.done",
-                json.dumps({"context_reset": True, "working_memory_enabled": False}),
+                json.dumps({"context_reset": True, "enable_working_memory": False}),
                 ctx=self.ctx,
             )
         except Exception as exc:
@@ -2001,12 +2001,12 @@ class Session:
                     ov_config = get_openviking_config()
                     effective_policy = MemoryPolicy.from_dict(memory_policy)
                     extraction_batch_limits = resolve_extraction_batch_limits(auto_commit_policy)
-                    working_memory_enabled = effective_policy.working_memory_enabled
+                    enable_working_memory = effective_policy.enable_working_memory
                     logger.info(
-                        "Session commit task=%s archive=%s working_memory_enabled=%s",
+                        "Session commit task=%s archive=%s enable_working_memory=%s",
                         task_id,
                         archive_uri,
-                        working_memory_enabled,
+                        enable_working_memory,
                     )
                     checkpoint_requests = (
                         await self._checkpoints.collect_requests_for_phase2(
@@ -2014,7 +2014,7 @@ class Session:
                             covered_failed_archives,
                             messages,
                         )
-                        if working_memory_enabled
+                        if enable_working_memory
                         else []
                     )
                     latest_archive_overview = (
@@ -2022,7 +2022,7 @@ class Session:
                             exclude_archive_uri=archive_uri,
                             before_archive_index=archive_index,
                         )
-                        if working_memory_enabled
+                        if enable_working_memory
                         else ""
                     )
                     extraction_messages = await self._tool_outputs.hydrate_for_extraction(messages)
@@ -2035,7 +2035,7 @@ class Session:
                     )
 
                     async def _run_archive_summary() -> None:
-                        if not working_memory_enabled:
+                        if not enable_working_memory:
                             logger.info(
                                 "Working Memory summary skipped "
                                 "(memory_policy.working_memory.enabled=false)"
@@ -2190,7 +2190,7 @@ class Session:
                         and (long_term_memory_types is None or bool(long_term_memory_types))
                         and bool(long_term_messages)
                     )
-                    if working_memory_enabled or (self._session_compressor and long_term_has_work):
+                    if enable_working_memory or (self._session_compressor and long_term_has_work):
                         logger.info(
                             "Starting post-commit extraction from %s archived messages",
                             len(messages),
@@ -2198,7 +2198,7 @@ class Session:
 
                         extraction_tasks: List[Any] = []
                         extraction_labels: List[str] = []
-                        if working_memory_enabled:
+                        if enable_working_memory:
                             extraction_tasks.append(_run_archive_summary())
                             extraction_labels.append("archive_summary")
 
@@ -2374,7 +2374,7 @@ class Session:
                 archive_uri,
                 first_message_id,
                 last_message_id,
-                working_memory_enabled=working_memory_enabled,
+                enable_working_memory=enable_working_memory,
                 coverage_start_archive=coverage_start_archive,
                 coverage_end_archive=coverage_end_archive,
                 covered_failed_archives=covered_failed_archives,
@@ -2460,7 +2460,7 @@ class Session:
         first_message_id: str,
         last_message_id: str,
         *,
-        working_memory_enabled: Optional[bool] = None,
+        enable_working_memory: Optional[bool] = None,
         coverage_start_archive: Optional[str] = None,
         coverage_end_archive: Optional[str] = None,
         covered_failed_archives: Optional[List[str]] = None,
@@ -2474,7 +2474,7 @@ class Session:
             {
                 "starting_message_id": first_message_id,
                 "ending_message_id": last_message_id,
-                "working_memory_enabled": working_memory_enabled,
+                "enable_working_memory": enable_working_memory,
                 "coverage_start_archive": coverage_start_archive or archive_id,
                 "coverage_end_archive": coverage_end_archive or archive_id,
                 "covered_failed_archives": list(covered_failed_archives or []),
@@ -2609,7 +2609,7 @@ class Session:
                 continue
 
             overview = await self._archives.read_overview(archive["archive_uri"])
-            if not overview and archive.get("working_memory_enabled") is not False:
+            if not overview and archive.get("enable_working_memory") is not False:
                 break
 
             abstract = (
@@ -2681,7 +2681,7 @@ class Session:
             elif await self._archives.is_context_reset_archive(terminal["archive_uri"]):
                 terminal = None
             elif (await self._archives.read_done(terminal["archive_uri"])).get(
-                "working_memory_enabled"
+                "enable_working_memory"
             ) is not False:
                 # A required overview that is missing or unreadable still keeps
                 # the archive terminal here; the warning is emitted by the full
