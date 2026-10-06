@@ -9,7 +9,7 @@ import asyncio
 import inspect
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional
 from uuid import uuid4
@@ -1215,6 +1215,7 @@ class Session:
         keep_recent_count: int = 0,
         *,
         memory_policy: Optional[Dict[str, Any]] = None,
+        working_memory_enabled: Optional[bool] = None,
         retention_mode: Optional[str] = None,
         keep_recent_turn_count: Optional[int] = None,
         retained_message_token_budget: Optional[int] = None,
@@ -1225,6 +1226,7 @@ class Session:
             self.commit_async(
                 keep_recent_count=keep_recent_count,
                 memory_policy=memory_policy,
+                working_memory_enabled=working_memory_enabled,
                 retention_mode=retention_mode,
                 keep_recent_turn_count=keep_recent_turn_count,
                 retained_message_token_budget=retained_message_token_budget,
@@ -1238,6 +1240,7 @@ class Session:
         keep_recent_count: int = 0,
         *,
         memory_policy: Optional[Dict[str, Any]] = None,
+        working_memory_enabled: Optional[bool] = None,
         retention_mode: Optional[str] = None,
         keep_recent_turn_count: Optional[int] = None,
         retained_message_token_budget: Optional[int] = None,
@@ -1311,6 +1314,8 @@ class Session:
         effective_min_tail = max(0, int(1 if min_raw_tail_steps is None else min_raw_tail_steps))
         if turn_mode and effective_token_budget <= 0:
             raise ValueError("retained_message_token_budget must be greater than 0")
+        if working_memory_enabled is not None and not isinstance(working_memory_enabled, bool):
+            raise ValueError("working_memory_enabled must be a boolean or null")
         in_memory_default_memory_policy = self._meta.memory_policy
         agent_evolution_enabled = self._agent_evolution_enabled
         if self._agent_evolution_enabled_provider is not None:
@@ -1327,6 +1332,10 @@ class Session:
                 effective_policy,
                 agent_evolution_enabled=agent_evolution_enabled,
             )
+            if working_memory_enabled is not None:
+                effective_policy = replace(
+                    effective_policy, working_memory_enabled=working_memory_enabled
+                )
             effective_memory_policy = effective_policy.to_dict()
             effective_memory_types = sorted(_effective_memory_types(effective_policy))
             agent_memory_skip_reason = _agent_memory_skip_reason(
@@ -1395,6 +1404,10 @@ class Session:
                     effective_policy,
                     agent_evolution_enabled=agent_evolution_enabled,
                 )
+                if working_memory_enabled is not None:
+                    effective_policy = replace(
+                        effective_policy, working_memory_enabled=working_memory_enabled
+                    )
                 effective_memory_policy = effective_policy.to_dict()
                 effective_memory_types = sorted(_effective_memory_types(effective_policy))
                 agent_memory_skip_reason = _agent_memory_skip_reason(
@@ -1434,6 +1447,7 @@ class Session:
                     "task_id": None,
                     "archive_uri": None,
                     "archived": False,
+                    "effective_working_memory_enabled": effective_policy.working_memory_enabled,
                     "reason": "no_messages",
                     "trace_id": trace_id,
                     **({"reset_context": True} if reset_context else {}),
@@ -1487,6 +1501,7 @@ class Session:
                     "task_id": None,
                     "archive_uri": None,
                     "archived": False,
+                    "effective_working_memory_enabled": effective_policy.working_memory_enabled,
                     "reason": "all_within_keep_window",
                     "trace_id": trace_id,
                     "estimated_active_tokens": (
@@ -1633,6 +1648,7 @@ class Session:
             "task_id": task_id,
             "archive_uri": archive_uri,
             "archived": True,
+            "effective_working_memory_enabled": effective_policy.working_memory_enabled,
             "trace_id": trace_id,
             **({"reset_context": True} if reset_context else {}),
             "estimated_active_tokens": (
@@ -1649,7 +1665,10 @@ class Session:
         """
         # ponytail: reuse archive ordering; no second session identity or context store.
         newest = f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
-        if self._compression.compression_index > 0 and await self._archives.is_context_reset_archive(newest):
+        if (
+            self._compression.compression_index > 0
+            and await self._archives.is_context_reset_archive(newest)
+        ):
             return  # Context is already empty; no second boundary needed.
         self._compression.compression_index += 1
         archive_uri = (
@@ -1983,6 +2002,12 @@ class Session:
                     effective_policy = MemoryPolicy.from_dict(memory_policy)
                     extraction_batch_limits = resolve_extraction_batch_limits(auto_commit_policy)
                     working_memory_enabled = effective_policy.working_memory_enabled
+                    logger.info(
+                        "Session commit task=%s archive=%s working_memory_enabled=%s",
+                        task_id,
+                        archive_uri,
+                        working_memory_enabled,
+                    )
                     checkpoint_requests = (
                         await self._checkpoints.collect_requests_for_phase2(
                             archive_uri,
@@ -2127,7 +2152,9 @@ class Session:
                             archive_uri,
                             {
                                 "completed_memory_steps": (
-                                    self._archives.serialize_completed_memory_steps(completed_memory_steps)
+                                    self._archives.serialize_completed_memory_steps(
+                                        completed_memory_steps
+                                    )
                                 )
                             },
                         )
@@ -2582,10 +2609,14 @@ class Session:
                 continue
 
             overview = await self._archives.read_overview(archive["archive_uri"])
-            if not overview:
+            if not overview and archive.get("working_memory_enabled") is not False:
                 break
 
-            abstract = await self._archives.read_abstract(archive["archive_uri"], overview)
+            abstract = (
+                await self._archives.read_abstract(archive["archive_uri"], overview)
+                if overview
+                else ""
+            )
             return {
                 "archive_id": archive_id,
                 "abstract": abstract,
@@ -2649,7 +2680,9 @@ class Session:
                 }
             elif await self._archives.is_context_reset_archive(terminal["archive_uri"]):
                 terminal = None
-            else:
+            elif (await self._archives.read_done(terminal["archive_uri"])).get(
+                "working_memory_enabled"
+            ) is not False:
                 # A required overview that is missing or unreadable still keeps
                 # the archive terminal here; the warning is emitted by the full
                 # scan used for Phase 2 bookkeeping.
@@ -2674,7 +2707,9 @@ class Session:
                     archive["archive_uri"],
                 )
 
-        merged_messages = self._archives.stable_deduplicate_messages(archive_messages + list(self._messages))
+        merged_messages = self._archives.stable_deduplicate_messages(
+            archive_messages + list(self._messages)
+        )
         merged_messages = await self._checkpoints.insert_terminal_checkpoints(
             merged_messages,
             terminal if terminal_state == "completed" else None,

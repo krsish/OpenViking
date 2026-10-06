@@ -354,18 +354,25 @@ class ArchiveStore:
                     "archive_uri": state.archive_uri,
                     "index": state.index,
                     "context_reset": state.done.get("context_reset") is True,
+                    "working_memory_enabled": state.done.get("working_memory_enabled"),
                 }
             )
 
         return completed
 
+    async def read_done(self, archive_uri: str) -> Dict[str, Any]:
+        """Read completion metadata without changing the terminal boundary."""
+        try:
+            done = json.loads(
+                await self._viking_fs.read_file(f"{archive_uri}/.done", ctx=self._ctx)
+            )
+        except Exception:
+            return {}
+        return done if isinstance(done, dict) else {}
+
     async def is_context_reset_archive(self, archive_uri: str) -> bool:
         """Return True when the archive's ``.done`` marks a context reset boundary."""
-        try:
-            done = json.loads(await self._viking_fs.read_file(f"{archive_uri}/.done", ctx=self._ctx))
-        except Exception:
-            return False
-        return isinstance(done, dict) and done.get("context_reset") is True
+        return (await self.read_done(archive_uri)).get("context_reset") is True
 
     # ------------------------------------------------------------------
     # Sidecar readers
@@ -374,9 +381,7 @@ class ArchiveStore:
     async def read_overview(self, archive_uri: str) -> str:
         """Read archive overview text."""
         try:
-            overview = await self._viking_fs.read_file(
-                f"{archive_uri}/.overview.md", ctx=self._ctx
-            )
+            overview = await self._viking_fs.read_file(f"{archive_uri}/.overview.md", ctx=self._ctx)
         except Exception:
             return ""
         return body_for_preview(overview or "")
@@ -384,9 +389,7 @@ class ArchiveStore:
     async def read_abstract(self, archive_uri: str, overview: str = "") -> str:
         """Read archive abstract text, falling back to summary extraction."""
         try:
-            abstract = await self._viking_fs.read_file(
-                f"{archive_uri}/.abstract.md", ctx=self._ctx
-            )
+            abstract = await self._viking_fs.read_file(f"{archive_uri}/.abstract.md", ctx=self._ctx)
         except Exception:
             abstract = ""
 
