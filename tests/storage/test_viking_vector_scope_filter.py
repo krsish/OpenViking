@@ -179,6 +179,41 @@ def test_mixed_visible_and_outside_targets_keep_original_tenant_filter():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("acl_enabled", [False, True])
+async def test_keywords_tenant_search_reuses_scope_filter_and_sets_bm25_fields(acl_enabled):
+    ctx = _ctx()
+    backend = object.__new__(VikingVectorIndexBackend)
+    backend.acl_manager = None
+    backend._acl_enabled = AsyncMock(return_value=acl_enabled)
+    tenant_backend = SimpleNamespace(search_by_keywords=AsyncMock(return_value=[]))
+    backend._get_backend_for_context = AsyncMock(return_value=tenant_backend)
+
+    await backend.search_by_keywords_in_tenant(
+        ctx=ctx,
+        query="OAuth token",
+        context_type="resource",
+        target_directories=["viking://resources/docs"],
+        extra_filter=Eq("status", "ready"),
+        level=[2],
+        limit=5,
+    )
+
+    kwargs = tenant_backend.search_by_keywords.await_args.kwargs
+    assert kwargs["query"] == "OAuth token"
+    assert kwargs["mode"] == "bm25"
+    assert kwargs["fields"] == ["content"]
+    assert kwargs["filter"] == _build(
+        ctx,
+        ["viking://resources/docs"],
+        extra_filter=Eq("status", "ready"),
+        level=[2],
+        acl_enabled=acl_enabled,
+    )
+    backend._acl_enabled.assert_awaited_once_with(ctx)
+    backend._get_backend_for_context.assert_awaited_once_with(ctx)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("legacy_mode", [{}, {"acl_mode": None}, {"acl_mode": "none"}])
 async def test_tenant_search_enforces_visible_roots_and_shared_acl(
     vector_backend_factory, tmp_path, legacy_mode

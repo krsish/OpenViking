@@ -1242,6 +1242,8 @@ class OpenGaussCollection(ICollection):
         offset: int = 0,
         filters: Optional[Dict[str, Any]] = None,
         output_fields: Optional[List[str]] = None,
+        mode: Optional[str] = None,
+        fields: Optional[List[str]] = None,
     ) -> SearchResult:
         raise NotImplementedError(
             "openGauss backend does not provide OpenViking keyword/full-text search"

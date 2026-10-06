@@ -316,6 +316,7 @@ type FindOptions struct {
 // SearchOptions controls Search.
 type SearchOptions struct {
 	EventsTimeDecayProtection string
+	SearchType                string
 	TargetURI                 any
 	Image                     string
 	SessionID                 string
@@ -339,6 +340,7 @@ type SearchOptions struct {
 type SearchContextOptions struct {
 	Image                     string
 	SessionID                 string
+	SearchType                string
 	Limit                     *int
 	NodeLimit                 *int
 	ScoreThreshold            *float64

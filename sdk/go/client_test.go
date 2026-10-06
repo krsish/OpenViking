@@ -177,7 +177,7 @@ func TestFindOmitsSearchFiltersWhenUnset(t *testing.T) {
 			t.Fatalf("path = %s", r.URL.Path)
 		}
 		body := readJSONBody(t, r)
-		requireBodyKeysAbsent(t, body, "since", "until", "time_field", "level", "tags", "agent_id", "agent_uri")
+		requireBodyKeysAbsent(t, body, "search_type", "since", "until", "time_field", "level", "tags", "agent_id", "agent_uri")
 		writeOK(t, w, map[string]any{"resources": []any{}})
 	}))
 	defer closeServer()
@@ -662,6 +662,9 @@ func TestSearchSendsSessionAndSearchFilters(t *testing.T) {
 		if got := body["session_id"]; got != "session-1" {
 			t.Fatalf("session_id = %#v", got)
 		}
+		if got := body["search_type"]; got != "keywords" {
+			t.Fatalf("search_type = %#v", got)
+		}
 		if got := body["target_uri"]; got != "viking://resources/docs" {
 			t.Fatalf("target_uri = %#v", got)
 		}
@@ -689,6 +692,7 @@ func TestSearchSendsSessionAndSearchFilters(t *testing.T) {
 	if _, err := client.Search(context.Background(), "auth", &SearchOptions{
 		TargetURI: "resources/docs",
 		SessionID: "session-1",
+		SearchType: "keywords",
 		Since:     "1d",
 		Until:     "2026-06-18",
 		TimeField: "updated_at",
@@ -727,6 +731,9 @@ func TestSearchContextSendsContextOptionsAndRejectsModeOverride(t *testing.T) {
 		if body["session_id"] != "session-1" || body["purpose"] != "coding" {
 			t.Fatalf("context fields = %#v", body)
 		}
+		if body["search_type"] != "keywords" {
+			t.Fatalf("search_type = %#v", body["search_type"])
+		}
 		if body["max_tokens"] != float64(3000) || body["dedup_turns"] != float64(5) {
 			t.Fatalf("budget fields = %#v", body)
 		}
@@ -743,6 +750,7 @@ func TestSearchContextSendsContextOptionsAndRejectsModeOverride(t *testing.T) {
 
 	result, err := client.SearchContext(context.Background(), "continue refactor", &SearchContextOptions{
 		SessionID:                 "session-1",
+		SearchType:                "keywords",
 		Purpose:                   "coding",
 		MaxTokens:                 Int(3000),
 		DedupTurns:                Int(5),

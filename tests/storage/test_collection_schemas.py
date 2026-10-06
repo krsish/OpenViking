@@ -34,6 +34,7 @@ from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
 from openviking.storage.queuefs.process_result import ProcessOutcome
 from openviking.storage.vector_ids import vector_record_id
 from openviking.storage.vectordb import engine as vectordb_engine
+from openviking.storage.vectordb.collection.collection import Collection
 from openviking.storage.vectordb.collection.result import UpdateResult, UpsertDataResult
 from openviking.storage.vectordb.collection.vikingdb_clients import VikingDBClient
 from openviking.storage.vectordb.collection.vikingdb_collection import VikingDBCollection
@@ -1470,6 +1471,27 @@ def test_private_vikingdb_collection_raises_on_data_api_error(monkeypatch):
     assert exc_info.value.action == "/api/vikingdb/data/upsert"
 
 
+def test_private_vikingdb_collection_get_meta_data_raises_in_strict_mode(monkeypatch):
+    class _Response:
+        status_code = 503
+        text = '{"code":"InternalError","message":"service unavailable"}'
+
+        def json(self):
+            return {"code": "InternalError", "message": "service unavailable"}
+
+    collection = VikingDBCollection(
+        host="https://vikingdb.example.com",
+        meta_data={"ProjectName": "default", "CollectionName": "context"},
+    )
+    monkeypatch.setattr(collection.client, "do_req", lambda *args, **kwargs: _Response())
+
+    with pytest.raises(VikingDBException) as exc_info:
+        Collection(collection).get_meta_data(raise_on_error=True)
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.retryable is True
+
+
 def test_private_vikingdb_collection_marks_server_error_retryable(monkeypatch):
     class _Response:
         status_code = 503
@@ -1535,7 +1557,7 @@ def _exercise_fetch_and_search_apis(collection):
     collection.search_by_id("default", "rec-1")
     collection.search_by_multimodal("default", text="hello")
     collection.search_by_random("default")
-    collection.search_by_keywords("default", query="hello")
+    collection.search_by_keywords("default", query="hello", mode="bm25", fields=["content"])
     collection.search_by_scalar("default", field="updated_at")
 
 
@@ -1564,6 +1586,10 @@ def test_volcengine_api_key_collection_ignores_unknown_fields_on_fetch_and_searc
         "/api/vikingdb/data/search/keywords",
         "/api/vikingdb/data/search/scalar",
     ]
+    keyword_payload = next(data for path, data in calls if path.endswith("/keywords"))
+    assert keyword_payload["query"] == "hello"
+    assert keyword_payload["mode"] == "bm25"
+    assert keyword_payload["fields"] == ["content"]
     assert all(data["ignore_unknown_fields"] is True for _, data in calls)
 
 

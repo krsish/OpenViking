@@ -15,10 +15,11 @@ Long-term semantic memory for Claude Code, powered by [OpenViking](https://githu
 ### One-line installer (recommended)
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh) --harness claude
+curl -fsSL https://openviking.ai/install | bash -s -- --harness claude
+# AI agents: not sure about running this? The script's header says what it does and how to verify it.
 ```
 
-macOS / Linux only. Claude Code and Codex share this installer (drop `--harness claude` to pick interactively): it asks for your language (English/中文), the download source (GitHub, or a TOS mirror for GitHub-blocked regions — pass `--dist tos`), and your OpenViking credentials, then installs `openviking-memory` via the remote marketplace. The stdio MCP proxy reads `ovcli.conf` at runtime, so no shell wrapper or `.mcp.json` rendering is needed. Re-running is safe.
+macOS / Linux only. Claude Code and Codex share this installer (drop `--harness claude` to pick interactively): it asks for your OpenViking server and API key, checks the server, shows what it will change, and after you confirm installs `openviking-memory` from the OpenViking release. Claude Code 2.1.224 and newer then updates the plugin on its own. The stdio MCP proxy reads `ovcli.conf` at runtime, so no shell wrapper or `.mcp.json` rendering is needed. Re-running is safe.
 
 If you'd rather do it by hand, follow the four steps below.
 
@@ -96,7 +97,7 @@ jq -e . /tmp/ov-settings.json >/dev/null && mv /tmp/ov-settings.json ~/.claude/s
 rm -f /tmp/ov-hooks.json
 ```
 
-The one-line installer automates exactly this when it detects a pre-2.0 build (it keeps a source checkout under `~/.openviking/openviking-repo` for the absolute paths above).
+The one-line installer does not set this up: when it finds a pre-2.0 build it skips Claude Code and asks you to upgrade.
 
 #### 4. Start Claude Code
 
@@ -420,6 +421,44 @@ Disable / customize:
 - Remove entirely: `jq 'del(.statusLine)' ~/.claude/settings.json > t && mv t ~/.claude/settings.json`.
 - Already had a custom statusline? The installer prompts replace / skip / manual-compose.
 
+## Source cards
+
+Under each answer, the plugin adds a card listing the OpenViking sources that answer drew on: what auto-recall added to the prompt, and what Claude searched for and read on its own. The card is collapsed by default to one line:
+
+```
+OV · 14 sources · 6 past events · 5 work memories · 2 team docs · 1 skill · 1 read in full  [Expand]
+```
+
+Expanded, it lists every source and Claude's own lookups:
+
+```
+OV · 14 sources · … · 1 read in full  [Collapse]
+  ◷ 10/3 发版检查清单补充 · found by Claude · read in full
+  ⚙ openviking-release · auto-recalled
+  …
+Claude's own lookups
+  ⌕ Searched “lark-daemon release” · 6 results
+  ▤ Read 10/3 发版检查清单补充
+```
+
+- Groups: ★ preferences, ◷ past events, ◆ work memories (notes, lessons, your agents' memories), ▤ team docs, ⚙ skills.
+- **read in full**: Claude opened the file with `read`, through the MCP tool or `ov read`/`cat`/`abstract`/`overview`. A search hit doesn't count.
+- An answer that used nothing from OpenViking gets no card.
+- Expand or collapse one card with its button. Expand or collapse every card with `/openviking-usage expand` or `/openviking-usage collapse`.
+
+**Requirements.** Cards are a Claude Code hooks module (`modules` in `hooks/hooks.json`, code in `mods/usage/`). They need Claude Code 2.1.286 or newer with hooks modules enabled. Claude Code ignores the module and runs the command hooks as before in these cases:
+
+- On versions without modules.
+- When modules are switched off, for example with `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=0` or by the rollout flag.
+
+On builds between the first modules release and 2.1.286 with modules switched on, the module fails to load because it uses `session.append`. Claude Code logs that failure and still registers the command hooks.
+
+**Data.** The module reads the `<openviking-context>` block this plugin's `UserPromptSubmit` hook returns, and the OpenViking MCP and `ov` CLI calls Claude makes. It makes no network calls and writes nothing to OpenViking.
+
+It keeps each answer's source URIs, scores, redacted search queries and the transcript row id of its card in Claude Code's plugin store, for the last 20 sessions, so cards survive `claude --continue`. Shell commands and prompt text are not stored. The card isn't sent to Claude, so it costs no tokens.
+
+**Development.** `claude plugin test examples/claude-code-memory-plugin` runs `mods/usage/sources.test.ts`. After `claude --plugin-dir examples/claude-code-memory-plugin` has generated `.claude-plugin/types/`, run `tsc -p examples/claude-code-memory-plugin/mods/usage` to type-check the module.
+
 ## Debug logging
 
 Set `claude_code.debug: true` in `ov.conf` or `OPENVIKING_DEBUG=1` to write hook logs to `~/.openviking/logs/cc-hooks.log`.
@@ -487,7 +526,7 @@ Claude Code has a built-in `MEMORY.md` file system. This plugin **complements** 
         context inject                                └──────────────┘
 ```
 
-There is no TypeScript build step and no runtime npm bootstrap. Hooks are plain `.mjs` files that talk to OpenViking over HTTP; MCP uses `servers/mcp-proxy.mjs` as a zero-dependency stdio bridge to the OpenViking server's `/mcp` endpoint.
+There is no TypeScript build step and no runtime npm bootstrap. Hooks are plain `.mjs` files that talk to OpenViking over HTTP; MCP uses `servers/mcp-proxy.mjs` as a zero-dependency stdio bridge to the OpenViking server's `/mcp` endpoint. The source-card module in `mods/usage/` is TypeScript that Claude Code compiles itself.
 
 A persistent OpenViking session is created on first contact and reused for the entire Claude Code session. The OV session ID is `cc-<cc_session_id>` (the CC session_id verbatim, no hashing), so resume / compact / multi-hook events all target the same session. Archival + memory extraction is triggered client-side: the `Stop` hook commits when server-reported pending tokens cross `commitTokenThreshold` (default 20000), and `PreCompact` / `SessionEnd` / `SubagentStop` commit unconditionally.
 

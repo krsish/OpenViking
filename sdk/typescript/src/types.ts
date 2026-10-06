@@ -166,12 +166,14 @@ export interface FindOptions {
   eventsTimeDecayProtection?: string | null;
   extra?: JsonObject;
 }
-/** Session-aware semantic retrieval options. */
+/** Session-aware retrieval options. */
 export interface SearchOptions extends FindOptions {
   sessionId?: string;
+  searchType?: "semantic" | "keywords";
 }
 /** Server-side context assembly options. */
 export interface SearchContextOptions {
+  searchType?: "semantic" | "keywords";
   image?: string;
   sessionId?: string;
   limit?: number;

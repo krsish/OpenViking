@@ -17,6 +17,7 @@
     "index.mjs",
     "lib/",
     "servers/",
+    "skills/",
     "scripts/",
     "README.md",
     "INSTALL.md",

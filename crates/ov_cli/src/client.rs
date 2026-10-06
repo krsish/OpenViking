@@ -34,6 +34,9 @@ fn compact_request_body(body: &mut Value) {
         if key == "processing_mode" {
             return value != "semantic_and_vectors";
         }
+        if key == "search_type" {
+            return value != "semantic";
+        }
         true
     });
 }
@@ -776,6 +779,7 @@ impl HttpClient {
         query: String,
         uri: String,
         image: Option<String>,
+        search_type: String,
         session_id: Option<String>,
         node_limit: i32,
         threshold: Option<f64>,
@@ -792,6 +796,7 @@ impl HttpClient {
         let mut body = serde_json::json!({
             "query": query,
             "image_url": image_url,
+            "search_type": search_type,
             "target_uri": uri,
             "session_id": session_id,
             "limit": node_limit,
@@ -2147,6 +2152,20 @@ mod tests {
         });
         super::compact_request_body(&mut body);
         assert_eq!(body["processing_mode"], "vectors_only");
+    }
+
+    #[test]
+    fn compact_request_body_drops_default_search_type_for_legacy_servers() {
+        let mut body = json!({"query": "OAuth token", "search_type": "semantic"});
+        super::compact_request_body(&mut body);
+        assert!(!body.as_object().unwrap().contains_key("search_type"));
+    }
+
+    #[test]
+    fn compact_request_body_keeps_keywords_search_type() {
+        let mut body = json!({"query": "OAuth token", "search_type": "keywords"});
+        super::compact_request_body(&mut body);
+        assert_eq!(body["search_type"], "keywords");
     }
 
     #[test]

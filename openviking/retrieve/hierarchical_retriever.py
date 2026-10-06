@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from openviking.core.context import ContextLevel
 from openviking.core.retrieval_targets import default_target_directories
+from openviking.core.retrieval_types import SearchType
 from openviking.models.embedder.base import EmbedResult, embed_compat
 from openviking.models.rerank import RerankClient
 from openviking.retrieve.retrieval_stats import get_stats_collector
@@ -96,6 +97,7 @@ class HierarchicalRetriever:
         level: Optional[List[int]] = None,
         events_time_decay_protection: Optional[str] = None,
         request_now: Optional[datetime] = None,
+        search_type: SearchType = "semantic",
     ) -> QueryResult:
         """
         Run one global vector search, then optionally rerank its candidates.
@@ -149,7 +151,7 @@ class HierarchicalRetriever:
         # Generate query vectors once to avoid duplicate embedding calls
         query_vector = None
         sparse_query_vector = None
-        if self.embedder:
+        if search_type == "semantic" and self.embedder:
             if image_query and not getattr(self.embedder, "supports_multimodal", False):
                 raise InvalidArgumentError("Image search requires a multimodal embedding model.")
             with telemetry.measure("search.embed_query"):
@@ -174,16 +176,26 @@ class HierarchicalRetriever:
 
         search_limit = limit * self.RERANK_CANDIDATE_MULTIPLIER if use_rerank else limit
         with telemetry.measure("search.vector_retrieval"):
-            vector_results = await vector_proxy.search_in_tenant(
-                query_vector=query_vector,
-                sparse_query_vector=sparse_query_vector,
-                context_type=context_type,
-                target_directories=target_dirs,
-                extra_filter=scope_dsl,
-                level=level,
-                limit=search_limit,
-                **decay_kwargs,
-            )
+            if search_type == "keywords":
+                vector_results = await vector_proxy.search_by_keywords_in_tenant(
+                    query=query.query,
+                    context_type=context_type,
+                    target_directories=target_dirs,
+                    extra_filter=scope_dsl,
+                    level=level,
+                    limit=search_limit,
+                )
+            else:
+                vector_results = await vector_proxy.search_in_tenant(
+                    query_vector=query_vector,
+                    sparse_query_vector=sparse_query_vector,
+                    context_type=context_type,
+                    target_directories=target_dirs,
+                    extra_filter=scope_dsl,
+                    level=level,
+                    limit=search_limit,
+                    **decay_kwargs,
+                )
         telemetry.count("vector.searches", 1)
         telemetry.count("vector.scored", len(vector_results))
         telemetry.count("vector.scanned", len(vector_results))

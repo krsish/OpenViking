@@ -394,6 +394,8 @@ export class OpenVikingClient {
       session_id:
         kind === "search" ? (options as SearchOptions).sessionId : undefined,
       events_time_decay_protection: options.eventsTimeDecayProtection,
+      search_type:
+        kind === "search" ? (options as SearchOptions).searchType : undefined,
       limit: options.limit,
       node_limit: options.nodeLimit,
       score_threshold: options.scoreThreshold,
@@ -423,6 +425,7 @@ export class OpenVikingClient {
     const body = compact({
       query,
       mode: "context",
+      search_type: options.searchType,
       image_url: imageUrl,
       session_id: options.sessionId,
       limit: options.limit,

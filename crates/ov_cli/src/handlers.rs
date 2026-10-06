@@ -1560,6 +1560,7 @@ pub async fn handle_search(
     query: Option<String>,
     uri: String,
     image: Option<String>,
+    search_type: String,
     session_id: Option<String>,
     node_limit: i32,
     threshold: Option<f64>,
@@ -1578,7 +1579,15 @@ pub async fn handle_search(
             "Search query or --image must not be empty.".to_string(),
         ));
     }
+    if search_type == "keywords" && image.is_some() {
+        return Err(Error::Client(
+            "--image is not supported with --search-type keywords.".to_string(),
+        ));
+    }
     let mut params = vec![format!("--uri={}", uri), format!("-n {}", node_limit)];
+    if search_type != "semantic" {
+        params.push(format!("--search-type {}", search_type));
+    }
     if let Some(ref img) = image {
         params.push(format!("--image {}", img));
     }
@@ -1618,6 +1627,7 @@ pub async fn handle_search(
         &query,
         &uri,
         image,
+        &search_type,
         session_id,
         node_limit,
         threshold,

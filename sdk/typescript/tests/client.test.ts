@@ -109,6 +109,7 @@ describe("OpenVikingClient", () => {
     await expect(
       client.searchContext("continue refactor", {
         sessionId: "session-1",
+        searchType: "keywords",
         purpose: "coding",
         maxTokens: 3000,
         dedupTurns: 5,
@@ -119,6 +120,7 @@ describe("OpenVikingClient", () => {
     expect(JSON.parse(String(fetcher.mock.calls[0]![1]?.body))).toEqual({
       query: "continue refactor",
       mode: "context",
+      search_type: "keywords",
       session_id: "session-1",
       purpose: "coding",
       max_tokens: 3000,
@@ -288,6 +290,23 @@ describe("OpenVikingClient", () => {
 
     expect(JSON.parse(String(fetcher.mock.calls[0]![1]?.body))).toEqual({
       query: "hello",
+    });
+  });
+
+  it("forwards the search type", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(ok({ resources: [] }));
+    const client = new OpenVikingClient({
+      baseUrl: "https://example.com",
+      fetch: fetcher,
+    });
+
+    await client.search("OAuth token", { searchType: "keywords" });
+
+    expect(JSON.parse(String(fetcher.mock.calls[0]![1]?.body))).toEqual({
+      query: "OAuth token",
+      search_type: "keywords",
     });
   });
 

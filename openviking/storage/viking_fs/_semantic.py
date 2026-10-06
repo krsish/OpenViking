@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Union
 
 from openviking.core.context import ContextLevel
 from openviking.core.retrieval_targets import resolve_retrieval_targets
+from openviking.core.retrieval_types import SearchType
 from openviking.server.error_mapping import is_not_found_error, map_exception
 from openviking.server.identity import RequestContext
 from openviking.storage.abstract_overview import (
@@ -27,6 +28,7 @@ from openviking.telemetry import get_current_telemetry
 from openviking.utils.image_search import build_multimodal_embedding_input
 from openviking.utils.time_decay import parse_duration_ms
 from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
+from openviking_cli.retrieve import ContextType
 
 
 class _SemanticMixin:
@@ -202,6 +204,7 @@ class _SemanticMixin:
         level: Optional[List[int]] = None,
         image_url: Optional[str] = None,
         events_time_decay_protection: Optional[str] = None,
+        search_type: SearchType = "semantic",
     ):
         """Semantic search.
 
@@ -271,7 +274,7 @@ class _SemanticMixin:
             raise RuntimeError("Vector store not initialized. Call OpenViking.initialize() first.")
 
         embedder = self._get_embedder(real_ctx)
-        if not embedder:
+        if search_type == "semantic" and not embedder:
             raise RuntimeError("Embedder not configured.")
 
         retriever = HierarchicalRetriever(
@@ -306,6 +309,7 @@ class _SemanticMixin:
             level=level,
             events_time_decay_protection=events_time_decay_protection,
             request_now=request_now,
+            search_type=search_type,
         )
 
         # Convert QueryResult to FindResult
@@ -398,6 +402,8 @@ class _SemanticMixin:
         level: Optional[List[int]] = None,
         image_url: Optional[str] = None,
         events_time_decay_protection: Optional[str] = None,
+        search_type: SearchType = "semantic",
+        context_types: Optional[List[ContextType]] = None,
     ):
         """Complex search with session context.
 
@@ -423,7 +429,6 @@ class _SemanticMixin:
         from openviking.retrieve.hierarchical_retriever import HierarchicalRetriever
         from openviking.retrieve.intent_analyzer import IntentAnalyzer
         from openviking_cli.retrieve import (
-            ContextType,
             FindResult,
             QueryPlan,
             TypedQuery,
@@ -475,20 +480,27 @@ class _SemanticMixin:
                 )
             analyzer = IntentAnalyzer(
                 max_recent_messages=5,
-                query_planner=await self._vlm_resolver.get_query_planner(
-                    real_ctx.account_id
-                ),
+                query_planner=await self._vlm_resolver.get_query_planner(real_ctx.account_id),
             )
             with telemetry.measure("search.intent_analysis"):
                 query_plan = await analyzer.analyze(
                     compression_summary=session_summary or "",
                     messages=current_messages or [],
                     current_message=query,
+                    context_type=context_types[0]
+                    if context_types and len(context_types) == 1
+                    else None,
                     target_abstract=target_abstract,
                 )
             typed_queries = query_plan.queries
             for tq in typed_queries:
                 tq.target_directories = retrieval_targets.target_directories
+                # Caller scope is authoritative even when the planner ignores its prompt.
+                if context_types and len(context_types) == 1:
+                    tq.context_type = context_types[0]
+                elif context_types and tq.context_type not in context_types:
+                    # The existing scope filter searches only the caller's allowed types.
+                    tq.context_type = None
         else:
             # No session context, or intent disabled: search with the raw query.
             typed_queries = [
@@ -525,6 +537,7 @@ class _SemanticMixin:
                 level=level,
                 events_time_decay_protection=events_time_decay_protection,
                 request_now=request_now,
+                search_type=search_type,
             )
 
         query_results = await asyncio.gather(*[_execute(tq) for tq in typed_queries])

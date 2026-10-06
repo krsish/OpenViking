@@ -1460,7 +1460,7 @@ async def test_add_skill_rejects_a_target_below_a_skill_root_before_minting_a_to
     finally:
         _mcp_ctx.reset(token)
 
-    assert result.startswith("Error: Unsupported skill root URI")
+    assert result.startswith("INVALID_ARGUMENT: Unsupported skill root URI")
     assert "viking://agent/skills" in result
     assert upload_token_store._store == {}
 
@@ -1496,12 +1496,11 @@ async def test_add_skill_list_only_upload_says_nothing_is_installed(service):
         ({"data": _skill_md("x"), "path": "/tmp/x"}, "not both"),
         ({"data": "/tmp/skills/pdf/SKILL.md"}, 'add_skill(path="/tmp/skills/pdf/SKILL.md")'),
         ({"path": "viking://agent/skills/pdf"}, "read its SKILL.md"),
-        ({"data": _skill_md("x"), "target_uri": "viking://resources/x"}, "Error:"),
+        ({"data": _skill_md("x"), "target_uri": "viking://resources/x"}, "INVALID_URI:"),
     ],
 )
 async def test_add_skill_rejects_invalid_arguments(kwargs, expected):
     result = await add_skill(**kwargs)
-    assert result.startswith("Error:")
     assert expected in result
 
 

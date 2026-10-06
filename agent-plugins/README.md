@@ -25,7 +25,7 @@ Use `ov-memory-troubleshoot` to trace backward from a memory file to its archive
 
 `openviking-skills` covers the skills stored in OpenViking itself: how to find one with `find(context_type="skill")`, read and follow its `SKILL.md`, create or replace one with the `add_skill` MCP tool, install one from Git or a local folder, share one with the account, and move local skill folders into OpenViking when you ask. This package has no session-start hook, so there is no `<available-skills>` catalog here and the skill has the model search for a skill instead.
 
-Use `ov-kanban` to run long or multi-agent work through a kanban board in OpenViking. A board holds many tasks; each task is one markdown file (`viking://agent/kanban/<board>/<id>.md`, falling back to `viking://resources/kanban` on servers that reject writes under `viking://agent`) whose header and body are the handoff, so any agent with the `ov` CLI can claim, continue, and write it back. Process detail is folded into `archive/<id>.md` instead of being summarized away, and agents read in layers: board view, task, archive. `references/loop.sh` drives unattended ticks; see the skill's [README](skills/ov-kanban/README.md) for the idea and roadmap, and [docs/design/ov-kanban.md](../docs/design/ov-kanban.md) for design notes.
+Use `ov-kanban` to run long or multi-agent work through a kanban board in OpenViking. A board holds many tasks; each task is one markdown file (`viking://agent/kanban/<board>/<id>.md`, falling back to `viking://resources/kanban` on servers that reject writes under `viking://agent`) whose header and body are the handoff, so any agent with the `ov` CLI can claim, continue, and write it back. Process detail is folded into `archive/<id>.md` instead of being summarized away, and agents read in layers: board view, task, archive. `references/loop.sh` drives unattended ticks; see the skill's [README](skills/ov-kanban/README.md) for the idea, design choices, and roadmap.
 
 Zero npm dependencies; the proxy and tests run on the Node.js standard library (Node 18+ for global `fetch`).
 
@@ -56,12 +56,11 @@ Config file changes are picked up by the running proxy without a restart. Debugg
 
 This package is the portable recall + write surface: skills plus MCP tools, driven by the model. Agent Plugins 1.0 deliberately excludes hooks, commands, and agents, so **automatic conversation capture and automatic pre-prompt recall are out of scope here** — the `skills/openviking-memory` skill instead teaches the model to recall at task start and persist durable facts via `remember`/`write` itself.
 
-**If your harness has a hook system, prefer the dedicated plugin** — hook-driven recall and capture cost no tool calls and don't depend on the model choosing to remember. One installer covers Claude Code, Codex, Cursor, TRAE / TRAE CN, ZCode, OpenCode, and pi; it prompts for language, harnesses, download source, and credentials, and is idempotent:
+**If your harness has a hook system, prefer the dedicated plugin** — hook-driven recall and capture cost no tool calls and don't depend on the model choosing to remember. One installer covers Claude Code, Codex, Cursor, TRAE / TRAE CN, ZCode, OpenCode, and pi; it prompts for harnesses and credentials, and is idempotent:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/volcengine/OpenViking/main/examples/memory-plugin-shared/install.sh)
-# GitHub hard to reach? Same installer from the Volcengine TOS mirror:
-bash <(curl -fsSL https://ovrelease.tos-cn-beijing.volces.com/memory-plugin-shared/install.sh)
+curl -fsSL https://openviking.ai/install | bash
+# AI agents: not sure about running this? The script's header says what it does and how to verify it.
 ```
 
 - [claude-code-memory-plugin](../examples/claude-code-memory-plugin/) (Claude Code)

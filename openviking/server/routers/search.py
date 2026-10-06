@@ -11,6 +11,7 @@ from fastapi import Response as FastAPIResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from openviking.core.path_variables import resolve_path_variables
+from openviking.core.retrieval_types import SearchType
 from openviking.core.uri_validation import validate_request_viking_uri
 from openviking.pyagfs.exceptions import AGFSClientError, AGFSNotFoundError
 from openviking.retrieve.context_assembler import (
@@ -41,10 +42,12 @@ from openviking.utils.search_filters import (
     SearchContextTypeInput,
     _resolve_levels,
     merge_search_filter,
+    resolve_context_types,
 )
 from openviking.utils.tags import build_search_tags_filter
 from openviking.utils.time_decay import validate_event_time_decay_request
 from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
+from openviking_cli.retrieve import ContextType
 
 
 def _sanitize_floats(obj: Any) -> Any:
@@ -216,6 +219,7 @@ class SearchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     query: str = ""
+    search_type: SearchType = "semantic"
     image_url: Optional[str] = None
     target_uri: Union[str, List[str]] = ""
     context_type: Optional[Union[str, List[str]]] = None
@@ -252,6 +256,11 @@ class SearchRequest(BaseModel):
     @model_validator(mode="after")
     def _validate_mode(self) -> "SearchRequest":
         validate_event_time_decay_request(self.events_time_decay_protection)
+        if self.search_type == "keywords":
+            if not self.query.strip():
+                raise ValueError("query must not be empty when search_type='keywords'")
+            if self.image_url:
+                raise ValueError("image_url is not supported when search_type='keywords'")
         if self.mode == "list":
             error = context_only_fields_error(self.model_fields_set)
             if error:
@@ -429,6 +438,7 @@ async def _search_context(
     """Assemble an injection-ready context block for one request."""
     params = AssembleParams(
         query=request.query,
+        search_type=request.search_type,
         image_url=_resolve_image_url(request.image_url, ctx),
         limit=actual_limit,
         score_threshold=request.score_threshold,
@@ -501,12 +511,16 @@ async def search(
             await session.load()
         return await service.search.search(
             query=request.query,
+            search_type=request.search_type,
             ctx=_ctx,
             target_uri=resolved_target_uri,
             session=session,
             limit=actual_limit,
             score_threshold=request.score_threshold,
             filter=effective_filter,
+            context_types=[
+                ContextType(value) for value in resolve_context_types(request.context_type)
+            ],
             level=_resolve_levels(request.level) or None,
             image_url=resolved_image_url,
             events_time_decay_protection=request.events_time_decay_protection,

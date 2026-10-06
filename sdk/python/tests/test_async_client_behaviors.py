@@ -912,8 +912,23 @@ async def test_search_forwards_level_zero_and_omits_unset_time_filters():
     assert payload["level"] == 0
     assert payload["session_id"] == "s1"
     assert payload["events_time_decay_protection"] == "0"
-    for key in ("since", "until", "time_field"):
+    for key in ("search_type", "since", "until", "time_field"):
         assert key not in payload
+
+
+@pytest.mark.asyncio
+async def test_search_and_search_context_forward_search_type():
+    client = AsyncHTTPClient(url="http://localhost:1933")
+    client._request = AsyncMock(return_value=object())
+    client._handle_response_data = lambda _response: {"result": {}}
+
+    await client.search("OAuth token", options={"search_type": "keywords"})
+    search_payload = client._request.await_args.kwargs["json"]
+    assert search_payload["search_type"] == "keywords"
+
+    await client.search_context("OAuth token", options={"search_type": "keywords"})
+    context_payload = client._request.await_args.kwargs["json"]
+    assert context_payload["search_type"] == "keywords"
 
 
 @pytest.mark.asyncio

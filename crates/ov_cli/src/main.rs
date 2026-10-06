@@ -972,6 +972,14 @@ enum Commands {
             help_heading = "Common options"
         )]
         image: Option<String>,
+        /// Retrieval type
+        #[arg(
+            long,
+            default_value = "semantic",
+            value_parser = ["semantic", "keywords"],
+            help_heading = "Common options"
+        )]
+        search_type: String,
         /// Target URI
         #[arg(
             short,
@@ -3919,6 +3927,7 @@ async fn main() {
         Commands::Search {
             query,
             image,
+            search_type,
             uri,
             session_id,
             node_limit,
@@ -3935,6 +3944,7 @@ async fn main() {
                 query,
                 uri,
                 image,
+                search_type,
                 session_id,
                 node_limit,
                 threshold,

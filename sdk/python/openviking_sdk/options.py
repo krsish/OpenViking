@@ -34,10 +34,11 @@ class FindOptions(_ExtraOptions, total=False):
 
 
 class SearchOptions(FindOptions, total=False):
-    pass
+    search_type: Literal["semantic", "keywords"]
 
 
 class SearchContextOptions(_ExtraOptions, total=False):
+    search_type: Literal["semantic", "keywords"]
     image: Any
     node_limit: int
     score_threshold: float

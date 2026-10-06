@@ -59,6 +59,12 @@ async def assemble_context(
 ) -> AssembleResult:
     """Run the full assembly pipeline for one request."""
     validate_event_time_decay_request(params.events_time_decay_protection)
+    if params.search_type == "keywords":
+        if params.image_url:
+            from openviking_cli.exceptions import InvalidArgumentError
+
+            raise InvalidArgumentError("image_url is not supported when search_type='keywords'")
+        await service.search.ensure_keywords_search_supported(ctx)
     quotas = normalize_quotas(params.quotas, params.purpose)
     penalties = normalize_penalties(params.other_peer_penalty)
 
@@ -116,6 +122,7 @@ async def assemble_context(
             filter=params.filter,
             image_url=params.image_url,
             events_time_decay_protection=params.events_time_decay_protection,
+            search_type=params.search_type,
             peer_scope=params.peer_scope,
             penalties=penalties,
             excluded=excluded,

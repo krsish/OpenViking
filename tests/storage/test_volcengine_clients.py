@@ -2,6 +2,7 @@ import pytest
 import requests
 from volcengine.base.Request import Request
 
+from openviking.storage.errors import ConnectionError
 from openviking.storage.vectordb.collection.collection import Collection
 from openviking.storage.vectordb.collection.volcengine_clients import (
     ClientForConsoleApi,
@@ -232,6 +233,29 @@ def test_volcengine_collection_get_meta_data_returns_empty_on_signature_error(mo
     monkeypatch.setattr(collection.console_client, "do_req", lambda *args, **kwargs: _Response())
 
     assert collection.get_meta_data() == {}
+
+
+def test_volcengine_collection_get_meta_data_raises_in_strict_mode(monkeypatch):
+    from openviking.storage.vectordb.collection.collection import Collection
+
+    class _Response:
+        status_code = 503
+        text = "service unavailable"
+
+        @staticmethod
+        def json():
+            return {"ResponseMetadata": {"Error": {"Code": "InternalError"}}}
+
+    collection = VolcengineCollection(
+        ak="test-ak",
+        sk="test-sk",
+        region="cn-beijing",
+        meta_data={"ProjectName": "default", "CollectionName": "context"},
+    )
+    monkeypatch.setattr(collection.console_client, "do_req", lambda *args, **kwargs: _Response())
+
+    with pytest.raises(ConnectionError, match="service unavailable"):
+        Collection(collection).get_meta_data(raise_on_error=True)
 
 
 def test_volcengine_collection_get_meta_data_returns_empty_on_collection_not_found(

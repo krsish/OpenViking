@@ -57,6 +57,7 @@ async def test_find_works_without_rerank_config(monkeypatch) -> None:
             level,
             events_time_decay_protection=None,
             request_now=None,
+            search_type="semantic",
         ):
             captured["typed_query"] = typed_query
             captured["ctx"] = ctx
@@ -65,6 +66,7 @@ async def test_find_works_without_rerank_config(monkeypatch) -> None:
             captured["score_threshold"] = score_threshold
             captured["scope_dsl"] = scope_dsl
             captured["level"] = level
+            captured["search_type"] = search_type
             return QueryResult(
                 query=typed_query,
                 matched_contexts=[
@@ -105,6 +107,7 @@ async def test_find_works_without_rerank_config(monkeypatch) -> None:
     assert captured["score_threshold"] == 0.2
     assert captured["scope_dsl"] == {"category": "doc"}
     assert captured["level"] is None
+    assert captured["search_type"] == "semantic"
     fs._ensure_access.assert_called_once_with("viking://resources/docs", request_ctx)
 
 
@@ -128,6 +131,7 @@ async def test_find_accepts_image_url_without_text_query(monkeypatch) -> None:
             level,
             events_time_decay_protection=None,
             request_now=None,
+            search_type="semantic",
         ):
             captured["typed_query"] = typed_query
             captured["mode"] = mode

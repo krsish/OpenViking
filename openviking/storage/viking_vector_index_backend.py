@@ -51,6 +51,12 @@ from openviking_cli.utils.config.vectordb_config import DEFAULT_INDEX_NAME, Vect
 
 logger = get_logger(__name__)
 
+_LOCAL_PURE_DENSE_SCORE_SCALES = {
+    "cosine": "cosine_affine_0_1",
+    "ip": "inner_product",
+    "l2": "one_minus_squared_l2",
+}
+
 RETRIEVAL_OUTPUT_FIELDS = [
     "uri",
     "level",
@@ -225,14 +231,21 @@ class _AsyncVectorAdapter:
                 self._closed = True
                 self._adapter.close()
 
-    async def collection_meta(self, index_name: str) -> Dict[str, Any]:
+    async def collection_meta(
+        self, index_name: str, *, raise_on_error: bool = False
+    ) -> Dict[str, Any]:
         def _get() -> Dict[str, Any]:
             collection = self._adapter.get_collection()
-            meta = collection.get_meta_data() or {}
+            meta = (
+                collection.get_meta_data(raise_on_error=True)
+                if raise_on_error
+                else collection.get_meta_data()
+            ) or {}
             if self._adapter.mode in {"local", "cuvs"}:
                 index_meta = collection.get_index_meta_data(index_name) or {}
-                if "ScalarIndex" in index_meta:
-                    meta["ScalarIndex"] = index_meta["ScalarIndex"]
+                for key in ("VectorIndex", "ScalarIndex"):
+                    if key in index_meta:
+                        meta[key] = index_meta[key]
             return meta
 
         return await self.run(_get)
@@ -504,19 +517,52 @@ class _SingleAccountBackend:
     async def get_collection_info(self) -> Optional[Dict[str, Any]]:
         if not await self.collection_exists():
             return None
-        config = self._collection_config
+        meta = (
+            await self._async_adapter.collection_meta(self._index_name)
+            if self._mode in {"local", "cuvs"}
+            else {}
+        )
+        vector_index = meta.get("VectorIndex") or {}
+        distance_metric = vector_index.get("Distance")
+        if not isinstance(distance_metric, str):
+            distance_metric = None
+        vector_dim = (
+            vector_index.get("Dimension")
+            or self._collection_config.get("vector_dim")
+            or next(
+                (
+                    field.get("Dim")
+                    for field in meta.get("Fields", [])
+                    if field.get("FieldType") == "vector"
+                ),
+                None,
+            )
+        )
         return {
             "name": self._collection_name,
-            "vector_dim": config.get("vector_dim"),
+            "backend": self._mode,
+            "index_name": self._index_name,
+            "vector_dim": vector_dim,
             "count": await self.count(),
             "status": "active",
+            "distance_metric": distance_metric,
+            "pure_dense_score_scale": (
+                _LOCAL_PURE_DENSE_SCORE_SCALES.get(distance_metric, "backend_defined")
+                if self._mode == "local" and distance_metric is not None
+                else "backend_defined"
+            ),
         }
 
     @_backend_operation
-    async def get_collection_meta(self) -> Optional[Dict[str, Any]]:
+    async def get_collection_meta(
+        self, *, raise_on_error: bool = False
+    ) -> Optional[Dict[str, Any]]:
         if not await self.collection_exists():
             return None
-        return await self._async_adapter.collection_meta(self._index_name)
+        return await self._async_adapter.collection_meta(
+            self._index_name,
+            raise_on_error=raise_on_error,
+        )
 
     @_backend_operation
     async def update_collection_description(self, description: str) -> bool:
@@ -1010,6 +1056,8 @@ class _SingleAccountBackend:
         offset: int = 0,
         filter: Optional[Dict[str, Any] | FilterExpr] = None,
         output_fields: Optional[List[str]] = None,
+        mode: Optional[str] = None,
+        fields: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         try:
             if self._bound_account_id:
@@ -1025,6 +1073,8 @@ class _SingleAccountBackend:
                 self._adapter.search_by_keywords,
                 keywords=keywords,
                 query=query,
+                mode=mode,
+                fields=fields,
                 limit=limit,
                 offset=offset,
                 filter=filter,
@@ -1250,12 +1300,13 @@ class VikingVectorIndexBackend:
         self,
         *,
         ctx: Optional[RequestContext] = None,
+        raise_on_error: bool = False,
     ) -> Optional[Dict[str, Any]]:
         if ctx:
             backend = await self._get_backend_for_context(ctx)
         else:
             backend = self._get_default_backend()
-        return await backend.get_collection_meta()
+        return await backend.get_collection_meta(raise_on_error=raise_on_error)
 
     async def update_collection_description(self, description: str) -> bool:
         return await self._get_default_backend().update_collection_description(description)
@@ -1787,6 +1838,8 @@ class VikingVectorIndexBackend:
         output_fields: Optional[List[str]] = None,
         *,
         ctx: Optional[RequestContext] = None,
+        mode: Optional[str] = None,
+        fields: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         if ctx:
             backend = await self._get_backend_for_context(ctx)
@@ -1800,6 +1853,8 @@ class VikingVectorIndexBackend:
         return await backend.search_by_keywords(
             keywords=keywords,
             query=query,
+            mode=mode,
+            fields=fields,
             limit=limit,
             offset=offset,
             filter=filter,
@@ -1923,6 +1978,37 @@ class VikingVectorIndexBackend:
             offset=offset,
             events_time_decay_protection=events_time_decay_protection,
             request_now=request_now,
+        )
+
+    async def search_by_keywords_in_tenant(
+        self,
+        ctx: RequestContext,
+        query: str,
+        context_type: Optional[str] = None,
+        target_directories: Optional[List[str]] = None,
+        extra_filter: Optional[FilterExpr | Dict[str, Any]] = None,
+        level: Optional[List[int]] = None,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        acl_enabled = await self._acl_enabled(ctx)
+        scope_filter = self._build_scope_filter(
+            ctx=ctx,
+            context_type=context_type,
+            target_directories=target_directories,
+            extra_filter=extra_filter,
+            level=level,
+            acl_enabled=acl_enabled,
+        )
+        backend = await self._get_backend_for_context(ctx)
+        return await backend.search_by_keywords(
+            query=query,
+            mode="bm25",
+            fields=["content"],
+            filter=scope_filter,
+            limit=limit,
+            offset=offset,
+            output_fields=RETRIEVAL_OUTPUT_FIELDS,
         )
 
     async def filter_in_tenant(
