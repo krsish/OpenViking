@@ -78,6 +78,9 @@ class Session:
         include_reasoning_content = bool(provider_spec and provider_spec.name == "deepseek")
 
         out: list[dict[str, Any]] = []
+        summary = self.metadata.get("conversation_summary")
+        if summary:
+            out.append({"role": "user", "content": f"[Earlier conversation summary]\n{summary}"})
         for m in recent:
             role = m["role"]
             content: Any = m.get("content", "")
@@ -95,6 +98,7 @@ class Session:
     def clear(self) -> None:
         """Clear all messages in the session."""
         self.messages = []
+        self.metadata["conversation_summary"] = ""
         self.updated_at = datetime.now()
 
     def clone(self) -> "Session":
@@ -307,6 +311,34 @@ class SessionManager:
                 session.created_at = latest.created_at
                 session.metadata = self._merge_metadata(latest.metadata, session.metadata)
             self._save_unlocked(session)
+
+    async def save_compacted(
+        self, session: Session, original_messages: list[dict[str, Any]], cut: int, summary: str
+    ) -> None:
+        """Archive the original JSONL and atomically publish summary plus tail."""
+        async with self._get_lock(session.key):
+            latest = self._load(session.key)
+            if latest is not None and latest.messages != original_messages:
+                raise RuntimeError("Session changed while its summary was being generated")
+            if session.messages != original_messages:
+                raise RuntimeError("Session changed while its summary was being generated")
+            candidate = session.clone()
+            candidate.messages = candidate.messages[cut:]
+            candidate.metadata["conversation_summary"] = summary
+            state = candidate.metadata.get("openviking", {})
+            for key in ("last_synced_local_index", "last_commit_local_index"):
+                if key in state:
+                    state[key] = max(-1, int(state[key]) - cut)
+            source = self._get_session_path(session.key)
+            if source.exists():
+                archive_dir = ensure_dir(self.sessions_dir / "history" / source.stem)
+                archive = archive_dir / f"{uuid.uuid4().hex}.jsonl"
+                archive.write_bytes(source.read_bytes())
+            self._save_unlocked(candidate)
+            # Publish in-memory state only after the replacement file is durable.
+            session.messages = candidate.messages
+            session.metadata = candidate.metadata
+            self._cache[session.key] = session
 
     def _save_unlocked(self, session: Session) -> None:
         """Persist a session while holding the per-session lock."""

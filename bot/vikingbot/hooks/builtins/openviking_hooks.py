@@ -142,12 +142,23 @@ class OpenVikingCompactHook(Hook):
             admin_commit_result = await client.commit_session(
                 session_id=session_id,
                 keep_recent_count=0,
+                working_memory_enabled=(
+                    True if getattr(agents_config, "session_context_enabled", False) else None
+                ),
                 retention_mode="turn_budget",
                 keep_recent_turn_count=keep_recent_turn_count,
                 retained_message_token_budget=retained_message_token_budget,
                 min_raw_tail_steps=min_raw_tail_steps,
                 user_id=session_user_id,
             )
+            if getattr(agents_config, "session_context_enabled", False):
+                confirmed = admin_commit_result.get("effective_working_memory_enabled") is True
+                state["working_memory_confirmed"] = confirmed
+                if not confirmed:
+                    logger.warning(
+                        "OpenViking did not confirm WM for this commit; keeping local history. "
+                        "Upgrade the server before enabling session_context_enabled."
+                    )
             logger.info(
                 f"[HOOK] Committed session {session_id} for user {session_user_id or 'current'}"
             )
@@ -238,31 +249,21 @@ class OpenVikingCompactHook(Hook):
                 should_close_client = False
             admin_user_id = getattr(client, "admin_user_id", None) or admin_user_id
 
-            if getattr(agents_config, "session_context_enabled", False):
-                return await self._execute_session_context_commit(
-                    context,
-                    vikingbot_session,
-                    client,
-                    agents_config,
-                    admin_user_id,
-                    force_commit=force_commit,
-                    keep_recent_turn_count=keep_recent_turn_count,
-                    retained_message_token_budget=retained_message_token_budget,
-                    min_raw_tail_steps=min_raw_tail_steps,
-                    commit_message_threshold=commit_message_threshold,
-                )
-
-            admin_result = await client.commit(
-                session_id,
-                vikingbot_session.messages,
-                user_id=client.session_owner_user_id(),
+            # Capture is incremental in both modes; native history must not
+            # resend the whole retained tail after every local compaction.
+            return await self._execute_session_context_commit(
+                context,
+                vikingbot_session,
+                client,
+                agents_config,
+                admin_user_id,
+                force_commit=force_commit,
+                keep_recent_turn_count=keep_recent_turn_count,
+                retained_message_token_budget=retained_message_token_budget,
+                min_raw_tail_steps=min_raw_tail_steps,
+                commit_message_threshold=commit_message_threshold,
             )
-            return {
-                "success": True,
-                "admin_result": admin_result,
-                "user_results": [],
-                "users_count": 0,
-            }
+
         except Exception as e:
             state = None
             if hasattr(vikingbot_session, "metadata"):

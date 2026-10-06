@@ -53,6 +53,7 @@ async def test_session_context_commit_uses_turn_budget_retention():
         {
             "session_id": make_openviking_storage_session_id(session_key.safe_name()),
             "keep_recent_count": 0,
+            "working_memory_enabled": None,
             "retention_mode": "turn_budget",
             "keep_recent_turn_count": 3,
             "retained_message_token_budget": 12_000,

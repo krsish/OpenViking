@@ -11,8 +11,41 @@ import pytest
 
 from openviking.message import Message, TextPart, ToolPart
 from openviking.service.task_tracker import TaskStatus, TaskTracker, set_task_tracker
+from openviking.session.memory_policy import MemoryPolicy
 from openviking.session.session import Session
 from openviking.storage.queuefs.session_commit_msg import SessionCommitMsg
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_new_queue_snapshot_preserves_wm_across_worker_reload(enabled):
+    message = SessionCommitMsg(
+        task_id="t",
+        session_id="s",
+        session_uri="viking://user/default/sessions/s",
+        archive_uri="viking://user/default/sessions/s/history/archive_001",
+        user={},
+        memory_policy=MemoryPolicy(working_memory_enabled=enabled).to_dict(),
+    )
+    restored = SessionCommitMsg.from_dict(message.to_dict())
+    assert MemoryPolicy.from_dict(restored.memory_policy).working_memory_enabled is enabled
+
+
+def test_legacy_queued_work_keeps_old_default_without_migrating_user_policy():
+    policy = {"self": {"enabled": False}, "memory_types": ["profile"]}
+    message = SessionCommitMsg.from_dict(
+        {
+            "task_id": "t",
+            "session_id": "s",
+            "session_uri": "viking://user/default/sessions/s",
+            "archive_uri": "viking://user/default/sessions/s/history/archive_001",
+            "user": {},
+            "memory_policy": policy,
+        }
+    )
+    assert MemoryPolicy.from_dict(message.memory_policy).working_memory_enabled is True
+    assert MemoryPolicy.from_dict(policy).working_memory_enabled is False
+    assert message.memory_policy["self"] == policy["self"]
+    assert message.memory_policy["memory_types"] == policy["memory_types"]
 
 
 class _TaskStore:
@@ -134,7 +167,9 @@ def test_phase2_auto_commit_policy_parameters_are_appended():
     signature = inspect.signature(Session._run_memory_extraction)
 
     assert list(signature.parameters)[-1] == "auto_commit_policy"
-    assert fields(SessionCommitMsg)[-1].name == "auto_commit_policy"
+    # New snapshot metadata is appended after the existing positional fields.
+    assert fields(SessionCommitMsg)[-2].name == "auto_commit_policy"
+    assert fields(SessionCommitMsg)[-1].name == "memory_policy_version"
 
 
 @pytest.mark.asyncio

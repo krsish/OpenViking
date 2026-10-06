@@ -75,6 +75,7 @@ export type OpenVikingClientOptions = {
 };
 
 export type CommitSessionResult = {
+  effective_working_memory_enabled?: boolean;
   session_id: string;
   /** "accepted" (async), "skipped" (no archive), "completed", "failed", or "timeout" (wait mode). */
   status: string;
@@ -841,6 +842,7 @@ export class OpenVikingClient {
     sessionId: string,
     options?: {
       wait?: boolean;
+      workingMemoryEnabled?: boolean;
       timeoutMs?: number;
       /**
        * WM v2: number of most-recent messages to keep live after commit.
@@ -871,6 +873,9 @@ export class OpenVikingClient {
       options?.agentId,
     );
     const body: Record<string, unknown> = {};
+    if (options?.workingMemoryEnabled !== undefined) {
+      body.working_memory_enabled = options.workingMemoryEnabled;
+    }
     if (options?.retentionMode === "turn_budget") {
       body.retention_mode = "turn_budget";
     } else if (keepRecentCount > 0) {

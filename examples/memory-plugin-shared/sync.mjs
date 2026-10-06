@@ -151,6 +151,11 @@ export const SKILL_TARGETS = [
     dir: join(ROOT, "agent-plugins", "skills"),
     committed: true,
   },
+  {
+    skill: "ov-experience-memory",
+    dir: join(ROOT, "examples", "openclaw-plugin", "skills"),
+    committed: true,
+  },
 ];
 
 const SOURCE_EXTENSIONS = new Set([".mjs", ".js", ".cjs", ".ts", ".mts"]);

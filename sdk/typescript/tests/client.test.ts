@@ -147,6 +147,7 @@ describe("OpenVikingClient", () => {
       sourceMessageIds: ["user-1"],
     });
     await client.commitSession("session-1", {
+      workingMemoryEnabled: true,
       retentionMode: "turn_budget",
       keepRecentTurnCount: 3,
       retainedMessageTokenBudget: 12_000,
@@ -161,6 +162,7 @@ describe("OpenVikingClient", () => {
       source_message_ids: ["user-1"],
     });
     expect(JSON.parse(String(fetcher.mock.calls[1]![1]?.body))).toEqual({
+      working_memory_enabled: true,
       retention_mode: "turn_budget",
       keep_recent_turn_count: 3,
       retained_message_token_budget: 12_000,

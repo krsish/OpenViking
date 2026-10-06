@@ -788,10 +788,12 @@ async def test_agent_loop_commits_before_model_at_context_limit(
         session_key, skip_heartbeat=True
     )
     assert [message["content"] for message in persisted_session.messages] == [
+        "old user",
+        "old assistant",
         "new question",
         "final answer",
     ]
-    assert persisted_session.metadata["openviking"]["last_synced_local_index"] == 1
+    assert persisted_session.metadata["openviking"]["last_synced_local_index"] == 3
 
 
 @pytest.mark.asyncio
@@ -851,7 +853,7 @@ async def test_agent_loop_precommit_counts_messages_since_last_commit(
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_post_turn_clears_local_session_after_openviking_commit(
+async def test_agent_loop_post_turn_preserves_local_session_after_openviking_commit(
     make_loop, temp_dir: Path, monkeypatch
 ):
     calls = []
@@ -900,9 +902,55 @@ async def test_agent_loop_post_turn_clears_local_session_after_openviking_commit
     )
     assert calls[-1]["force_commit"] is False
     assert calls[-1]["commit_message_threshold"] == 3
-    assert persisted_session.messages == []
+    assert [message["content"] for message in persisted_session.messages] == [
+        "new question",
+        "final answer",
+    ]
     assert persisted_session.metadata["openviking"]["session_id"] == (
         make_openviking_storage_session_id(session_key.safe_name())
     )
-    assert persisted_session.metadata["openviking"]["last_synced_local_index"] == -1
-    assert persisted_session.metadata["openviking"]["last_commit_local_index"] == -1
+    assert persisted_session.metadata["openviking"]["last_synced_local_index"] == 1
+    assert persisted_session.metadata["openviking"]["last_commit_local_index"] == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("summary", ["Keep the early constraint.", ""])
+async def test_manual_compact_saves_host_summary_before_replacing_history(
+    make_loop, monkeypatch, summary
+):
+    loop = make_loop(memory_window=8)
+    monkeypatch.setattr(loop, "_check_cmd_auth", lambda _: True)
+    monkeypatch.setattr(type(loop.config.ov_server), "is_available", lambda self: False)
+    loop._summarize_compact_chunk = AsyncMock(return_value=summary)
+    key = SessionKey(type="cli", channel_id="cli", chat_id="compact-test")
+    session = loop.sessions.get_or_create(key)
+    for i in range(4):
+        session.add_message("user", f"constraint {i}")
+        session.add_message("assistant", f"answer {i}")
+    await loop.sessions.save(session)
+    original = copy.deepcopy(session.messages)
+    response = await loop._process_message(
+        InboundMessage(session_key=key, sender_id="user", content="/compact")
+    )
+    assert response is not None
+    if summary:
+        assert session.messages == original[-2:]
+        assert session.metadata["conversation_summary"] == summary
+        assert list(loop.sessions.sessions_dir.glob("history/*/*.jsonl"))
+    else:
+        assert session.messages == original
+        assert "kept" in response.content
+
+
+@pytest.mark.asyncio
+async def test_new_session_resets_capture_watermark_in_native_mode(make_loop, monkeypatch):
+    loop = make_loop()
+    monkeypatch.setattr(loop, "_check_cmd_auth", lambda _: True)
+    key = SessionKey(type="cli", channel_id="cli", chat_id="new-test")
+    session = loop.sessions.get_or_create(key)
+    session.add_message("user", "old input")
+    session.metadata["openviking"] = {"last_synced_local_index": 8, "last_commit_local_index": 8}
+    await loop.sessions.save(session)
+    await loop._process_message(InboundMessage(session_key=key, sender_id="user", content="/new"))
+    assert session.messages == []
+    assert session.metadata["openviking"]["last_synced_local_index"] == -1

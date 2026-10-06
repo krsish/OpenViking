@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import fnmatch
+import json
 import re
 import uuid
 from collections import defaultdict
@@ -23,7 +24,10 @@ class InMemoryOpenVikingClient:
     LangChain/LangGraph adapters. It is not a replacement for OpenViking.
     """
 
-    def __init__(self, records: dict[str, str] | None = None):
+    def __init__(
+        self, records: dict[str, str] | None = None, *, working_memory_enabled: bool = False
+    ):
+        self.working_memory_enabled = working_memory_enabled
         self.records: dict[str, str] = dict(records or {})
         self.sessions: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self.archives: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -340,11 +344,16 @@ class InMemoryOpenVikingClient:
     def commit_session(
         self,
         session_id: str,
+        working_memory_enabled: bool | None = None,
+        options: dict[str, Any] | None = None,
         **_: Any,
     ) -> dict[str, Any]:
+        enabled = (options or {}).get("working_memory_enabled", working_memory_enabled)
+        if enabled is None:
+            enabled = self.working_memory_enabled
         messages = list(self.sessions.get(session_id, []))
         archive_id = f"archive_{len(self.archives[session_id]) + 1:03d}"
-        overview = "\n".join(_message_text(message) for message in messages)
+        overview = "\n".join(_message_text(message) for message in messages) if enabled else ""
         if messages:
             archive_uri = f"{self._session_uri(session_id)}/history/{archive_id}"
             self.archives[session_id].append(
@@ -358,14 +367,16 @@ class InMemoryOpenVikingClient:
             self.records[f"{archive_uri}/messages.jsonl"] = (
                 "\n".join(_message_text(message) for message in messages) + "\n"
             )
-            self.records[f"{archive_uri}/.abstract.md"] = overview[:240]
-            self.records[f"{archive_uri}/.overview.md"] = overview
-            self.records[f"{archive_uri}/.done"] = "{}"
+            if enabled:
+                self.records[f"{archive_uri}/.abstract.md"] = overview[:240]
+                self.records[f"{archive_uri}/.overview.md"] = overview
+            self.records[f"{archive_uri}/.done"] = json.dumps({"working_memory_enabled": enabled})
         self.sessions[session_id] = []
         self.pending_tokens[session_id] = 0
         return {
             "session_id": session_id,
             "status": "completed",
+            "effective_working_memory_enabled": enabled,
             "archive_id": archive_id if messages else None,
             "archived": bool(messages),
         }

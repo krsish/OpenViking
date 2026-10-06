@@ -285,13 +285,14 @@ export class SyncManager {
   }
 
   async commit(
-    opts: { queueOnFailure?: boolean; keepRecentCount?: number; timeoutMs?: number } = {},
+    opts: { queueOnFailure?: boolean; keepRecentCount?: number; timeoutMs?: number; workingMemoryEnabled?: boolean } = {},
   ): Promise<any | null> {
     if (!this.ovSessionId) return null;
     const response = await this.client.commitSessionResponse(
       this.ovSessionId,
       opts.keepRecentCount,
       opts.timeoutMs,
+      opts.workingMemoryEnabled,
     );
     const result = response.result;
     if (!result) {
