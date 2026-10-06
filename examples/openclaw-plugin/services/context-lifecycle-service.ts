@@ -1004,7 +1004,7 @@ export async function afterTurnOpenVikingSession({
 
     const commitResult = await client.commitSession(ovSessionId, {
       wait: false,
-      ...(cfg.contextManagementMode === "openviking" ? { workingMemoryEnabled: true } : {}),
+      ...(cfg.contextManagementMode === "openviking" ? { enableWorkingMemory: true } : {}),
       ...(cfg.commitRetentionMode === "turn_budget"
         ? { retentionMode: "turn_budget" as const }
         : { keepRecentCount: cfg.commitKeepRecentCount }),
@@ -1016,7 +1016,7 @@ export async function afterTurnOpenVikingSession({
     );
 
     diag("afterTurn_commit", ovSessionId, {
-      effectiveWorkingMemoryEnabled: commitResult.effective_working_memory_enabled,
+      effectiveEnableWorkingMemory: commitResult.effective_enable_working_memory,
       pendingTokens,
       commitTokenThreshold,
       commitTokenThresholdRatio: cfg.commitTokenThresholdRatio,
@@ -1159,7 +1159,7 @@ export async function compactOpenVikingSession({
     const commitResult = await client.commitSession(ovSessionId, {
       wait: true,
       keepRecentCount: 0,
-      workingMemoryEnabled: true,
+      enableWorkingMemory: true,
     });
     const memCount = totalExtractedMemories(commitResult.memories_extracted);
 
@@ -1230,7 +1230,7 @@ export async function compactOpenVikingSession({
       };
     }
 
-    if (commitResult.effective_working_memory_enabled !== true) {
+    if (commitResult.effective_enable_working_memory !== true) {
       return await runtimeCompact?.() ?? compactFailureResult("working_memory_disabled", tokensBefore, { commit: commitResult });
     }
 

@@ -27,7 +27,7 @@ from vikingbot.openviking_mount.session_state import (
     make_openviking_storage_session_id,
     reset_openviking_state,
 )
-from vikingbot.session.manager import Session, SessionManager
+from vikingbot.session.manager import SessionManager
 
 
 class _DummyHTTPClient:
@@ -137,13 +137,14 @@ class _SessionContextClient:
         keep_recent_count=0,
         user_id=None,
         *,
-        working_memory_enabled=None,
+        enable_working_memory=None,
         retention_mode,
         keep_recent_turn_count,
         retained_message_token_budget,
         min_raw_tail_steps,
     ):
         assert retention_mode == "turn_budget"
+        assert enable_working_memory is True
         assert keep_recent_turn_count == 2
         self.commit_calls.append((session_id, keep_recent_count, user_id))
         if self.fail_session_commit:
@@ -151,7 +152,7 @@ class _SessionContextClient:
         return {
             "session_id": session_id,
             "status": "accepted",
-            "effective_working_memory_enabled": working_memory_enabled is True,
+            "effective_enable_working_memory": True,
         }
 
 
@@ -1110,22 +1111,50 @@ async def test_commit_trusted_root_mode_uses_sender_identity_header(monkeypatch)
 async def test_compact_hook_user_mode_commits_once(monkeypatch):
     from vikingbot.hooks.builtins import openviking_hooks as hooks_module
 
-    config = _make_config("user", commit_keep_recent_turn_count=2)
-    client = _SessionContextClient(pending_tokens=7000)
-    client.session_owner_user_id = lambda: None
+    monkeypatch.setattr(hooks_module, "load_config", lambda: _make_config("user"))
+
+    class _FakeClient:
+        def __init__(self):
+            self.calls = []
+
+        def should_sender_fanout(self):
+            return False
+
+        def session_owner_user_id(self):
+            return None
+
+        async def commit(self, session_id, messages, user_id=None):
+            self.calls.append((session_id, user_id, len(messages)))
+            return {"success": "committed"}
+
+    fake_client = _FakeClient()
     hook = OpenVikingCompactHook()
-    monkeypatch.setattr(hook, "_get_client", AsyncMock(return_value=(client, False)))
-    monkeypatch.setattr(hooks_module, "load_config", lambda: config)
-    key = SessionKey(type="cli", channel_id="default", chat_id="chat-1")
-    session = Session(key=key)
-    session.add_message("user", "remember this")
-    context = HookContext(event_type="message.compact", workspace_id="ws", session_key=key)
+
+    async def _fake_get_client(_workspace_id):
+        return fake_client
+
+    monkeypatch.setattr(hook, "_get_client", _fake_get_client)
+
+    context = HookContext(
+        event_type="message.compact",
+        workspace_id="ws",
+        session_key=SessionKey(type="cli", channel_id="default", chat_id="chat-1"),
+    )
+    session = SimpleNamespace(
+        messages=[
+            {"sender_id": "admin", "role": "assistant", "content": "a"},
+            {"sender_id": "u1", "role": "user", "content": "b"},
+            {"sender_id": "u2", "role": "user", "content": "c"},
+        ]
+    )
+
     result = await hook.execute(context, session=session)
+
     assert result["success"] is True
     assert result["users_count"] == 0
-    assert len(client.append_calls) == len(client.commit_calls) == 1
-    assert client.commit_calls[0][2] is None
-    assert session.messages[0]["content"] == "remember this"
+    assert len(fake_client.calls) == 1
+    assert fake_client.calls[0][0] == "cli__default__chat-1"
+    assert fake_client.calls[0][1] is None
 
 
 @pytest.mark.asyncio
@@ -1170,7 +1199,12 @@ async def test_compact_hook_session_context_commits_single_session_with_peer_mes
             **_retention_kwargs,
         ):
             self.commit_calls.append((session_id, keep_recent_count, user_id))
-            return {"session_id": session_id, "status": "accepted"}
+            assert _retention_kwargs["enable_working_memory"] is True
+            return {
+                "session_id": session_id,
+                "status": "accepted",
+                "effective_enable_working_memory": True,
+            }
 
     fake_client = _FakeClient()
     hook = compact_hook(fake_client, commit_token_threshold=100, commit_keep_recent_count=2)

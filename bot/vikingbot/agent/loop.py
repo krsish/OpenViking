@@ -913,13 +913,13 @@ class AgentLoop:
         openviking_connection: dict[str, Any] | None = None,
         actor_peer_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        if (
-            not self._ov_session_context_enabled()
-            or get_openviking_state(session).get("working_memory_confirmed") is False
-        ):
+        if get_openviking_state(session).get("working_memory_confirmed") is False:
+            # A rejected WM request must not replace local history with an OV tail.
             return session.get_history(
                 max_messages=len(session.messages), provider_name=provider_name
             )
+        if not self._ov_session_context_enabled():
+            return session.get_history(provider_name=provider_name)
 
         agents_config = getattr(self.config, "agents", None)
         token_budget = int(getattr(agents_config, "session_context_token_budget", 12000) or 12000)
@@ -944,24 +944,12 @@ class AgentLoop:
                 provider_name=provider_name,
             )
             unsynced_messages = get_unsynced_messages(session)
-            stats = context_payload.get("stats") or {}
-            missing_archive_summary = (
-                int(stats.get("totalArchives", 0) or 0) > 0
-                and not str(context_payload.get("latest_archive_overview") or "").strip()
-            )
-            if missing_archive_summary or (
-                not ov_history and len(unsynced_messages) < len(session.messages)
-            ):
+            if not ov_history and len(unsynced_messages) < len(session.messages):
                 logger.warning(
-                    f"OpenViking returned incomplete session context for {session_id}; "
+                    f"OpenViking returned no session context for {session_id}; "
                     "falling back to complete local session history."
                 )
-                # A retained tail alone cannot replace archived history. Use
-                # the host summary too, and let host compaction handle its size.
-                get_openviking_state(session)["working_memory_confirmed"] = False
-                return session.get_history(
-                    max_messages=len(session.messages), provider_name=provider_name
-                )
+                unsynced_messages = session.messages
             local_tail = self._format_history_messages(
                 session,
                 unsynced_messages,
@@ -991,9 +979,7 @@ class AgentLoop:
                 f"Failed to load OpenViking session context for {session_id}: {e}. "
                 "Falling back to local session history."
             )
-            return session.get_history(
-                max_messages=len(session.messages), provider_name=provider_name
-            )
+            return session.get_history(provider_name=provider_name)
         finally:
             if request_client is not None:
                 await request_client.close()
@@ -1007,7 +993,7 @@ class AgentLoop:
         commit_message_threshold: int | None = None,
         openviking_connection: dict[str, Any] | None = None,
     ) -> bool:
-        if not self._ov_session_context_enabled() and not self.config.ov_server.is_available():
+        if not self._ov_session_context_enabled():
             return False
 
         state = get_openviking_state(session)
@@ -1035,9 +1021,35 @@ class AgentLoop:
             **kwargs,
         )
         await self.sessions.save(session)
-        # An accepted OV commit is not a replacement summary. Keep local
-        # history until host compaction has durably saved its summary and tail.
         return get_openviking_state(session).get("last_sync_status") == "success"
+
+    async def _submit_openviking_session_and_clear_if_committed(
+        self,
+        session: Session,
+        *,
+        force_commit: bool = False,
+        keep_recent_turn_count: int | None = None,
+        commit_message_threshold: int | None = None,
+        openviking_connection: dict[str, Any] | None = None,
+    ) -> bool:
+        success = await self._submit_openviking_session(
+            session,
+            force_commit=force_commit,
+            keep_recent_turn_count=keep_recent_turn_count,
+            commit_message_threshold=commit_message_threshold,
+            openviking_connection=openviking_connection,
+        )
+        if not success:
+            return False
+        if not get_openviking_state(session).get("last_commit_performed"):
+            return True
+
+        session.clear()
+        reset_openviking_state(session, rotate_session_id=False)
+        state = get_openviking_state(session)
+        state["last_sync_status"] = "success"
+        await self.sessions.save(session)
+        return True
 
     async def _maybe_commit_openviking_before_turn(
         self,
@@ -1066,7 +1078,7 @@ class AgentLoop:
         if not should_commit:
             return
 
-        await self._submit_openviking_session(
+        await self._submit_openviking_session_and_clear_if_committed(
             session,
             force_commit=True,
             keep_recent_turn_count=int(
@@ -1075,6 +1087,31 @@ class AgentLoop:
             commit_message_threshold=self.memory_window,
             openviking_connection=getattr(msg, "openviking_connection", None),
         )
+
+    async def _commit_openviking_session(
+        self,
+        session: Session,
+        *,
+        keep_recent_turn_count: int = 0,
+        clear_local_session: bool = False,
+        rotate_session_id: bool = False,
+        openviking_connection: dict[str, Any] | None = None,
+    ) -> bool:
+        success = await self._submit_openviking_session(
+            session,
+            force_commit=True,
+            keep_recent_turn_count=keep_recent_turn_count,
+            openviking_connection=openviking_connection,
+        )
+        if not success:
+            return False
+        if clear_local_session:
+            session.clear()
+            reset_openviking_state(session, rotate_session_id=rotate_session_id)
+            state = get_openviking_state(session)
+            state["last_sync_status"] = "success"
+            await self.sessions.save(session)
+        return True
 
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
@@ -1109,56 +1146,6 @@ class AgentLoop:
         """Stop the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
-
-    async def _compact_local_session(
-        self,
-        session: Session,
-        *,
-        openviking_connection: dict[str, Any] | None = None,
-        keep_recent_count: int | None = None,
-    ) -> bool:
-        """Save a host summary before replacing any persisted conversation text."""
-        snapshot = session.clone()
-        keep_count = (
-            min(10, max(2, self.memory_window // 2))
-            if keep_recent_count is None
-            else max(2, keep_recent_count)
-        )
-        cut = max(0, len(snapshot.messages) - keep_count)
-        # Retain a complete user turn, including any assistant/tool follow-up.
-        while cut > 0 and snapshot.messages[cut].get("role") != "user":
-            cut -= 1
-        if cut == 0:
-            return False
-        try:
-            if self.config.ov_server.is_available():
-                captured = await self._submit_openviking_session(
-                    session, force_commit=True, openviking_connection=openviking_connection
-                )
-                # Leave unsent messages in the live history so the next capture
-                # can retry them before local compaction removes the prefix.
-                if not captured:
-                    return False
-            chunks = _compact_split_chunks(_compact_render_transcript(snapshot.messages[:cut]))
-            previous = str(snapshot.metadata.get("conversation_summary") or "")
-            summaries = [previous] if previous else []
-            for chunk in chunks:
-                summary = await self._summarize_compact_chunk(session.key, chunk)
-                if not summary:
-                    return False
-                summaries.append(summary)
-            summary = (
-                summaries[0]
-                if len(summaries) == 1
-                else await self._merge_compact_summaries(session.key, summaries)
-            )
-            if not summary:
-                return False
-            await self.sessions.save_compacted(session, snapshot.messages, cut, summary)
-            return True
-        except Exception as exc:
-            logger.warning("Session compaction failed; preserving original history: {}", exc)
-            return False
 
     async def _compact_tool_loop(
         self,
@@ -2085,6 +2072,7 @@ class AgentLoop:
             else:
                 cmd = msg.content.strip().lower()
             if cmd == "/new":
+                # Clone session for async consolidation, then immediately clear original
                 if not self._check_cmd_auth(msg):
                     return OutboundMessage(
                         session_key=msg.session_key,
@@ -2092,7 +2080,8 @@ class AgentLoop:
                         metadata=msg.metadata,
                     )
                 session.clear()
-                reset_openviking_state(session, rotate_session_id=True)
+                if self._ov_session_context_enabled():
+                    reset_openviking_state(session, rotate_session_id=True)
                 await self.sessions.save(session)
                 return OutboundMessage(
                     session_key=msg.session_key,
@@ -2100,24 +2089,39 @@ class AgentLoop:
                     metadata=msg.metadata,
                 )
             elif cmd == "/compact":
+                # Clone session for async consolidation, then immediately clear original
                 if not self._check_cmd_auth(msg):
                     return OutboundMessage(
                         session_key=msg.session_key,
                         content="🐈 Sorry, you are not authorized to use this command.",
                         metadata=msg.metadata,
                     )
-                compacted = await self._compact_local_session(
-                    session,
-                    openviking_connection=openviking_connection,
-                    keep_recent_count=2,
-                )
+                if self._ov_session_context_enabled():
+                    committed = await self._commit_openviking_session(
+                        session,
+                        keep_recent_turn_count=0,
+                        clear_local_session=True,
+                        openviking_connection=openviking_connection,
+                    )
+                    if not committed:
+                        return OutboundMessage(
+                            session_key=msg.session_key,
+                            content="🐈 Memory consolidation failed. Session history was kept.",
+                            metadata=msg.metadata,
+                        )
+                else:
+                    session_clone = session.clone()
+                    session.clear()
+                    await self.sessions.save(session)
+                    # Run consolidation in background
+                    await self._safe_consolidate_memory(
+                        session_clone,
+                        archive_all=True,
+                        openviking_connection=openviking_connection,
+                    )
                 return OutboundMessage(
                     session_key=msg.session_key,
-                    content=(
-                        "Conversation compacted. Recent messages and a local summary were saved."
-                        if compacted
-                        else "Could not compact this conversation. Session history was kept."
-                    ),
+                    content="🐈 New session started. Memory consolidated.",
                     metadata=msg.metadata,
                 )
             if cmd == "/remember":
@@ -2127,17 +2131,23 @@ class AgentLoop:
                         content="🐈 Sorry, you are not authorized to use this command.",
                         metadata=msg.metadata,
                     )
-                remembered = await self._submit_openviking_session(
-                    session,
-                    force_commit=True,
-                    keep_recent_turn_count=self.config.agents.commit_keep_recent_turn_count,
-                    openviking_connection=openviking_connection,
-                )
-                if not remembered:
-                    return OutboundMessage(
-                        session_key=msg.session_key,
-                        content="Failed to submit this conversation to memory storage. History was kept.",
-                        metadata=msg.metadata,
+                if self._ov_session_context_enabled():
+                    remembered = await self._commit_openviking_session(
+                        session,
+                        keep_recent_turn_count=self.config.agents.commit_keep_recent_turn_count,
+                        openviking_connection=openviking_connection,
+                    )
+                    if not remembered:
+                        return OutboundMessage(
+                            session_key=msg.session_key,
+                            content="Failed to submit this conversation to memory storage.",
+                            metadata=msg.metadata,
+                        )
+                elif ov_tools_enable:
+                    session_clone = session.clone()
+                    await self._consolidate_viking_memory(
+                        session_clone,
+                        openviking_connection=openviking_connection,
                     )
                 return OutboundMessage(
                     session_key=msg.session_key,
@@ -2147,7 +2157,7 @@ class AgentLoop:
             if cmd == "/help":
                 return OutboundMessage(
                     session_key=msg.session_key,
-                    content="🐈 vikingbot commands:\n/new — Start a new conversation\n/compact — Summarize older conversation locally\n/remember — Submit current session to memories\n/help — Show available commands",
+                    content="🐈 vikingbot commands:\n/new — Start a new conversation\n/remember — Submit current session to memories and start new session\n/help — Show available commands",
                     metadata=msg.metadata,
                 )
 
@@ -2173,23 +2183,20 @@ class AgentLoop:
             await self._evaluate_previous_response_outcome(session, msg)
 
             # Consolidate memory before processing if session is too large
-            if (
-                self._ov_session_context_enabled()
-                and get_openviking_state(session).get("working_memory_confirmed") is not False
-                and not self._eval
-            ):
+            if self._ov_session_context_enabled() and not self._eval:
                 await self._maybe_commit_openviking_before_turn(session, msg)
             elif len(session.messages) > self.memory_window and not self._eval:
-                compacted = await self._compact_local_session(
-                    session, openviking_connection=openviking_connection
+                # Clone session for async consolidation, then immediately trim original
+                session_clone = session.clone()
+                keep_count = min(10, max(2, self.memory_window // 2))
+                session.messages = session.messages[-keep_count:] if keep_count else []
+                await self.sessions.save(session)
+                # Run consolidation in background
+                await self._safe_consolidate_memory(
+                    session_clone,
+                    archive_all=False,
+                    openviking_connection=openviking_connection,
                 )
-                if not compacted:
-                    return OutboundMessage(
-                        session_key=msg.session_key,
-                        content="Could not compact this conversation. Your history is preserved; "
-                        "please retry or start a new session.",
-                        metadata=msg.metadata,
-                    )
 
             if self.sandbox_manager:
                 message_workspace = self.sandbox_manager.get_workspace_path(session_key)
@@ -2339,8 +2346,8 @@ class AgentLoop:
                 )
                 session.metadata.setdefault("response_facts", {})[response_id] = response_completed
                 await self.sessions.save(session)
-                if self.config.ov_server.is_available() and not self._eval:
-                    await self._submit_openviking_session(
+                if self._ov_session_context_enabled() and not self._eval:
+                    await self._submit_openviking_session_and_clear_if_committed(
                         session,
                         commit_message_threshold=self.memory_window,
                         openviking_connection=openviking_connection,

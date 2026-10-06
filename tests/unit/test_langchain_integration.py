@@ -796,7 +796,7 @@ def test_session_context_assembler_uses_archive_active_messages_and_recall():
     )
     client.add_message("assembler-session", "user", content="Earlier user turn")
     client.add_message("assembler-session", "assistant", content="Earlier assistant turn")
-    client.commit_session("assembler-session", working_memory_enabled=True)
+    client.commit_session("assembler-session", enable_working_memory=True)
     client.add_message("assembler-session", "user", content="Active turn")
 
     assembler = OpenVikingSessionContextAssembler(

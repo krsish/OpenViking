@@ -18,7 +18,7 @@ with the new default; there is no server-side workaround for their polling.
 | Claude Code, Codex / TraeCode CLI, OpenCode | No automatic archive injection on resume/compact; host history remains authoritative | `resumeArchiveInject: true` enables supplemental archive injection, not summary generation |
 | Pi official extension | Native Pi compaction; no takeover or resume archive injection | `takeoverEnabled: true`; commits request WM explicitly |
 | OpenClaw | `contextManagementMode: "native"`; keep host messages and delegate compaction to the host | `contextManagementMode: "openviking"`; commits request WM explicitly |
-| VikingBot | `session_context_enabled: false`; retain local history, save a local summary and raw backup before compaction | `session_context_enabled: true`; commits request WM explicitly |
+| VikingBot | `session_context_enabled: true`; OV manages history and compaction, and commits explicitly request WM | Set `session_context_enabled: false` to use VikingBot's existing local mode |
 | LangChain / LangGraph | Middleware captures/recalls without fetching OV session history | Legacy OV history adapters require WM and an explicit application decision |
 
 Existing explicit plugin settings and environment variables still take priority
@@ -49,13 +49,13 @@ upgrade if no post-upgrade WM generation is acceptable.
 
 ## Explicit per-commit generation
 
-`POST /api/v1/sessions/{id}/commit` accepts `working_memory_enabled`:
+`POST /api/v1/sessions/{id}/commit` accepts `enable_working_memory`:
 
 - Omitted or `null`: use the resolved session/user/server policy.
 - `true` or `false`: override **only WM for this commit**, without changing
   `self`, `peer`, `memory_types`, or the saved policy.
 - Strings and numbers are rejected. The response reports
-  `effective_working_memory_enabled` from the actual commit policy.
+  `effective_enable_working_memory` from the actual commit policy.
 
 The updated takeover integrations require a true confirmation before relying on
 a summary. Missing confirmation, disabled WM, or a completed/failed archive with
@@ -89,10 +89,14 @@ watermarks are persisted in graph state. See the runnable
 [native history example](../../../examples/langchain-langgraph/langgraph/middleware/native_history.py)
 and its pinned requirements for LangChain summarization with a SQLite checkpointer.
 
-VikingBot no longer clears local messages on an OV commit acknowledgment. Its
-native compaction saves a raw JSONL backup and a host-generated summary before
-replacing local history. Failed capture, summary generation, concurrent changes,
-or failed persistence leave the original live history available for retry.
+VikingBot is an exception to the host-history default: it still uses OV Working
+Memory for context and compaction. Its session-context commits explicitly send
+`enable_working_memory: true`, including for existing sessions whose saved
+policy disables WM. It keeps the existing commit-and-clear flow; subsequent
+context reads use OV's overview/checkpoints and retained messages, or pending
+archive messages while generation is still running. If the server does not
+confirm WM generation, the commit is treated as unsuccessful and local history
+is kept for retry. This change does not replace VikingBot's local compaction.
 
 Some old OV-managed conversations no longer have a full host transcript. Stop
 writes and use the [history export tool](../../../examples/session-history-export/README.md)

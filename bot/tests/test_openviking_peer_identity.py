@@ -289,7 +289,6 @@ async def test_commit_uses_current_user_key_session_and_sender_peer(monkeypatch)
     assert calls["ensure"]["memory_policy"] == {
         "self": {"enabled": False},
         "peer": {"enabled": True},
-        "working_memory": {"enabled": False},
     }
     assert calls["append"]["session_user_id"] is None
     assert calls["append"]["default_user_peer_id"] == TELEGRAM_ALICE_PEER_ID
@@ -338,7 +337,6 @@ async def test_commit_keeps_root_owner_user_explicit(monkeypatch):
     assert calls["ensure"]["memory_policy"] == {
         "self": {"enabled": False},
         "peer": {"enabled": True},
-        "working_memory": {"enabled": False},
     }
     assert calls["append"]["session_user_id"] == "bot-user"
     assert calls["append"]["default_user_peer_id"] == TELEGRAM_ALICE_PEER_ID
@@ -379,7 +377,6 @@ async def test_commit_session_defaults_to_peer_only_memory(monkeypatch):
     assert calls["ensure"]["memory_policy"] == {
         "self": {"enabled": False},
         "peer": {"enabled": True},
-        "working_memory": {"enabled": False},
     }
     assert calls["commit"] == {
         "session_id": "session-1",
@@ -412,6 +409,7 @@ async def test_commit_session_forwards_turn_budget_retention(monkeypatch):
 
     await client.commit_session(
         "session-1",
+        enable_working_memory=True,
         retention_mode="turn_budget",
         keep_recent_turn_count=3,
         retained_message_token_budget=12_000,
@@ -421,6 +419,7 @@ async def test_commit_session_forwards_turn_budget_retention(monkeypatch):
     assert calls["commit"] == {
         "session_id": "session-1",
         "keep_recent_count": 0,
+        "enable_working_memory": True,
         "retention_mode": "turn_budget",
         "keep_recent_turn_count": 3,
         "retained_message_token_budget": 12_000,

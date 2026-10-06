@@ -99,7 +99,7 @@ function makeCore(overrides = {}) {
       return overrides.commitResult === undefined
         ? {
             status: "accepted",
-            effective_working_memory_enabled: true,
+            effective_enable_working_memory: true,
             archived: true,
             task_id: "t-1",
             archive_uri: "viking://user/x/sessions/s/history/archive_001",
@@ -232,11 +232,11 @@ test("commitOutcome requires this commit's archive URI", () => {
     { accepted: false, reason: "skipped:no_messages" },
   );
   assert.deepEqual(commitOutcome({ status: "accepted",
-            effective_working_memory_enabled: true, archived: false, archive_uri: "viking://x" }), {
+            effective_enable_working_memory: true, archived: false, archive_uri: "viking://x" }), {
     accepted: false, reason: "not_archived",
   });
   assert.deepEqual(commitOutcome({ status: "accepted",
-            effective_working_memory_enabled: true, archived: true }), {
+            effective_enable_working_memory: true, archived: true }), {
     accepted: false, reason: "no_archive_uri",
   });
   assert.deepEqual(commitOutcome({ status: "failed", archived: true, archive_uri: "viking://bad" }), {
@@ -622,9 +622,9 @@ test("skipped, not archived and missing URI results never advance", async () => 
   for (const commitResult of [
     { status: "skipped", archived: false, archive_uri: null, reason: "no_messages" },
     { status: "accepted",
-            effective_working_memory_enabled: true, archived: false, archive_uri: "viking://bad" },
+            effective_enable_working_memory: true, archived: false, archive_uri: "viking://bad" },
     { status: "accepted",
-            effective_working_memory_enabled: true, archived: true },
+            effective_enable_working_memory: true, archived: true },
   ]) {
     const { core, calls } = makeCore({ commitResult });
     assert.equal(await core.onTurnSynced(120, branch), false);
@@ -743,7 +743,7 @@ test("two consecutive archives advance one complete user turn at a time", async 
         calls.lastCommitOpts = opts;
         nextArchive++;
         return { status: "accepted",
-            effective_working_memory_enabled: true, archived: true, archive_uri: `viking://user/x/sessions/s/history/archive_00${nextArchive}` };
+            effective_enable_working_memory: true, archived: true, archive_uri: `viking://user/x/sessions/s/history/archive_00${nextArchive}` };
       },
     },
   });
@@ -1079,12 +1079,12 @@ test("terminal re-read accepts the summary that landed after the first read", as
 for (const enabled of [false, undefined]) {
   test(`takeover requires an explicit WM confirmation (${enabled})`, async () => {
     const { core, calls } = makeCore({ commitResult: {
-      status: "accepted", archived: true, archive_uri: "archive-1", effective_working_memory_enabled: enabled,
+      status: "accepted", archived: true, archive_uri: "archive-1", effective_enable_working_memory: enabled,
     } });
     assert.equal(await core.handleBeforeCompact({ firstKeptEntryId: "one" }, branchOf(user("one"))), undefined);
     assert.equal(calls.overviewCalls, undefined);
     assert.equal(core.state.pendingArchive, null);
-    assert.equal(calls.lastCommitOpts.workingMemoryEnabled, true);
+    assert.equal(calls.lastCommitOpts.enableWorkingMemory, true);
   });
 }
 

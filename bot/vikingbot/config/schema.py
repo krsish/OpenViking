@@ -479,7 +479,7 @@ class AgentsConfig(BaseModel):
         ge=1,
         description="Maximum number of background subagents running at once.",
     )
-    session_context_enabled: bool = False
+    session_context_enabled: bool = True
     session_context_token_budget: int = 3000
     commit_token_threshold: int = 200000
     commit_keep_recent_count: int = Field(

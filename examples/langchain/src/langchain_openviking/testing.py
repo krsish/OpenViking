@@ -25,9 +25,9 @@ class InMemoryOpenVikingClient:
     """
 
     def __init__(
-        self, records: dict[str, str] | None = None, *, working_memory_enabled: bool = False
+        self, records: dict[str, str] | None = None, *, enable_working_memory: bool = False
     ):
-        self.working_memory_enabled = working_memory_enabled
+        self.enable_working_memory = enable_working_memory
         self.records: dict[str, str] = dict(records or {})
         self.sessions: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self.archives: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -344,13 +344,13 @@ class InMemoryOpenVikingClient:
     def commit_session(
         self,
         session_id: str,
-        working_memory_enabled: bool | None = None,
+        enable_working_memory: bool | None = None,
         options: dict[str, Any] | None = None,
         **_: Any,
     ) -> dict[str, Any]:
-        enabled = (options or {}).get("working_memory_enabled", working_memory_enabled)
+        enabled = (options or {}).get("enable_working_memory", enable_working_memory)
         if enabled is None:
-            enabled = self.working_memory_enabled
+            enabled = self.enable_working_memory
         messages = list(self.sessions.get(session_id, []))
         archive_id = f"archive_{len(self.archives[session_id]) + 1:03d}"
         overview = "\n".join(_message_text(message) for message in messages) if enabled else ""
@@ -370,13 +370,13 @@ class InMemoryOpenVikingClient:
             if enabled:
                 self.records[f"{archive_uri}/.abstract.md"] = overview[:240]
                 self.records[f"{archive_uri}/.overview.md"] = overview
-            self.records[f"{archive_uri}/.done"] = json.dumps({"working_memory_enabled": enabled})
+            self.records[f"{archive_uri}/.done"] = json.dumps({"enable_working_memory": enabled})
         self.sessions[session_id] = []
         self.pending_tokens[session_id] = 0
         return {
             "session_id": session_id,
             "status": "completed",
-            "effective_working_memory_enabled": enabled,
+            "effective_enable_working_memory": enabled,
             "archive_id": archive_id if messages else None,
             "archived": bool(messages),
         }

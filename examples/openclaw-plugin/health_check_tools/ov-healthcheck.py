@@ -1352,7 +1352,7 @@ def main() -> int:
                 timeout_seconds=args.commit_wait,
                 verbose=args.verbose,
                 require_overview=bool(
-                    commit_result and commit_result.get("effective_working_memory_enabled") is True
+                    commit_result and commit_result.get("effective_enable_working_memory") is True
                 ),
             )
         except Exception as exc:
@@ -1381,7 +1381,7 @@ def main() -> int:
             overview = latest_context.get("latest_archive_overview")
             if isinstance(overview, str) and overview.strip():
                 recorder.add("PASS", "Context endpoint returned latest_archive_overview")
-            elif commit_result and commit_result.get("effective_working_memory_enabled") is True:
+            elif commit_result and commit_result.get("effective_enable_working_memory") is True:
                 recorder.add(
                     "FAIL", "Context endpoint has no required archive overview after waiting"
                 )

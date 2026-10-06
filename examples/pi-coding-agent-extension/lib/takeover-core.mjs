@@ -670,7 +670,7 @@ export class TakeoverCore {
     }
     const committed = await this.io.commit({
       queueOnFailure: false,
-      workingMemoryEnabled: true,
+      enableWorkingMemory: true,
       keepRecentCount: frozen.keepRecentCount,
       timeoutMs: left - READ_RESERVE_MS,
     });
@@ -692,7 +692,7 @@ export class TakeoverCore {
       return this.fail(`the server returned no archive (${outcome.reason})`);
     }
 
-    if (committed.effective_working_memory_enabled !== true) {
+    if (committed.effective_enable_working_memory !== true) {
       return this.fail("Working Memory was not enabled for this commit; using native context");
     }
 
@@ -942,7 +942,7 @@ export class TakeoverCore {
         return undefined;
       }
       const committed = await this.io.commit({
-        queueOnFailure: false, workingMemoryEnabled: true, keepRecentCount: 0, timeoutMs: left - READ_RESERVE_MS,
+        queueOnFailure: false, enableWorkingMemory: true, keepRecentCount: 0, timeoutMs: left - READ_RESERVE_MS,
       });
       const outcome = commitOutcome(committed);
       if (!outcome.accepted) {
@@ -958,7 +958,7 @@ export class TakeoverCore {
 
       // Older servers may ignore the request field. Never trim native history
       // unless the server confirmed the policy used by this exact commit.
-      if (committed.effective_working_memory_enabled !== true) {
+      if (committed.effective_enable_working_memory !== true) {
         this.log("takeover: Working Memory was not enabled; using pi compaction");
         return undefined;
       }

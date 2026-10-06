@@ -47,7 +47,7 @@ export interface OVCommitResult {
   status?: "accepted" | "skipped" | string;
   /** Whether phase 1 created an archive. */
   archived?: boolean;
-  effective_working_memory_enabled?: boolean;
+  effective_enable_working_memory?: boolean;
   reason?: string;
   task_id?: string;
   /** `null` on a `skipped` commit — the server sends the key either way. */
@@ -124,11 +124,11 @@ export class OVClient {
     sessionId: string,
     keepRecentCount = this.cfg.commitKeepRecentCount,
     timeoutMs = 30000,
-    workingMemoryEnabled?: boolean,
+    enableWorkingMemory?: boolean,
   ): Promise<OVCommitResponse> {
     const res = await this.fetchJSON<OVCommitResult>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/commit`,
-      { method: "POST", body: JSON.stringify({ keep_recent_count: keepRecentCount, working_memory_enabled: workingMemoryEnabled }) },
+      { method: "POST", body: JSON.stringify({ keep_recent_count: keepRecentCount, enable_working_memory: enableWorkingMemory }) },
       { timeoutMs },
     );
     if (res.ok && res.result && !res.result.trace_id && res.traceId) {
@@ -179,7 +179,7 @@ export class OVClient {
    * Terminal state of one archive, from the markers the server itself uses
    * (`Session._archive_terminal_state`): `.done` once commit phase 2 completed
    * — it is written last, after the Working Memory when that is enabled, and
-   * records `working_memory_enabled: false` when it is not — and `.failed.json`
+   * records `enable_working_memory: false` when it is not — and `.failed.json`
    * once phase 2 failed for good. "pending" while neither exists; null when the
    * server could not be asked. Unlike task records, the markers do not expire.
    */

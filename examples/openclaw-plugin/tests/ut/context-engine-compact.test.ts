@@ -35,7 +35,7 @@ function makeEngine(commitResult: unknown, opts?: { throwError?: Error; commitRe
 
   const commitSession = opts?.throwError
     ? vi.fn().mockRejectedValue(opts.throwError)
-    : vi.fn().mockResolvedValue({ effective_working_memory_enabled: true, ...(commitResult as object) });
+    : vi.fn().mockResolvedValue({ effective_enable_working_memory: true, ...(commitResult as object) });
 
   const client = {
     commitSession,
@@ -269,7 +269,7 @@ describe("context-engine compact()", () => {
     expect(result.ok).toBe(true);
     expect(result.compacted).toBe(true);
     expect(result.reason).toBe("commit_completed");
-    expect(client.commitSession.mock.calls[0][1]).toEqual({ wait: true, keepRecentCount: 0, workingMemoryEnabled: true });
+    expect(client.commitSession.mock.calls[0][1]).toEqual({ wait: true, keepRecentCount: 0, enableWorkingMemory: true });
   });
 
   it("returns compacted=false when commit succeeds with archived=false", async () => {
@@ -447,7 +447,7 @@ describe("context-engine compact()", () => {
     expect(client.commitSession).toHaveBeenCalledWith("s1", {
       wait: true,
       keepRecentCount: 0,
-      workingMemoryEnabled: true,
+      enableWorkingMemory: true,
     });
   });
 
@@ -513,7 +513,7 @@ describe("native context management", () => {
   });
 
   it.each([false, undefined])("requires WM confirmation in explicit OV mode (%s)", async (enabled) => {
-    const { engine, client } = makeEngine({ archived: true, status: "completed", effective_working_memory_enabled: enabled });
+    const { engine, client } = makeEngine({ archived: true, status: "completed", effective_enable_working_memory: enabled });
     expect(await engine.compact({ sessionId: "opt-in", sessionFile: "", currentTokenCount: 1000 })).toMatchObject({ ok: false, compacted: false, reason: "working_memory_disabled" });
     expect(client.getSessionContext).not.toHaveBeenCalled();
   });

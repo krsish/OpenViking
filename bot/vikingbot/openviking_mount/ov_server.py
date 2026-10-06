@@ -319,7 +319,6 @@ class VikingClient:
         return {
             "self": {"enabled": False},
             "peer": {"enabled": True},
-            "working_memory": {"enabled": False},
         }
 
     @staticmethod
@@ -1198,7 +1197,7 @@ class VikingClient:
         keep_recent_count: int = 0,
         user_id: Optional[str] = None,
         memory_policy: Optional[Dict[str, Any]] = None,
-        working_memory_enabled: Optional[bool] = None,
+        enable_working_memory: Optional[bool] = None,
         retention_mode: Optional[str] = None,
         keep_recent_turn_count: Optional[int] = None,
         retained_message_token_budget: Optional[int] = None,
@@ -1215,7 +1214,7 @@ class VikingClient:
         retention_kwargs = {
             key: value
             for key, value in {
-                "working_memory_enabled": working_memory_enabled,
+                "enable_working_memory": enable_working_memory,
                 "retention_mode": retention_mode,
                 "keep_recent_turn_count": keep_recent_turn_count,
                 "retained_message_token_budget": retained_message_token_budget,

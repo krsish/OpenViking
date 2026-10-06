@@ -262,7 +262,7 @@ describe("context-engine lifecycle service seam", () => {
       commitSession: vi.fn().mockResolvedValue({
         status: "completed",
         archived: true,
-        effective_working_memory_enabled: true,
+        effective_enable_working_memory: true,
         archive_uri: "ov://archive/archive-9",
         memories_extracted: { core: 4 },
         task_id: "task-9",
@@ -292,7 +292,7 @@ describe("context-engine lifecycle service seam", () => {
     expect(client.commitSession).toHaveBeenCalledWith(ovSessionId, {
       wait: true,
       keepRecentCount: 0,
-      workingMemoryEnabled: true,
+      enableWorkingMemory: true,
     });
     expect(result).toEqual({
       ok: true,
@@ -307,7 +307,7 @@ describe("context-engine lifecycle service seam", () => {
           commit: {
             status: "completed",
             archived: true,
-        effective_working_memory_enabled: true,
+        effective_enable_working_memory: true,
             archive_uri: "ov://archive/archive-9",
             memories_extracted: { core: 4 },
             task_id: "task-9",
