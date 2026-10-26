@@ -98,6 +98,15 @@ describe('conversation policy assemble', () => {
     assert.match(text, /`mention=` says whether one of them is you/);
   });
 
+  it('adds the meeting notes only on the instance that stores them, after OpenViking, leaving the policy as it was otherwise', () => {
+    const off = assembleConversationPolicy({ connectors: ['lark'] });
+    assert.doesNotMatch(off, /## Meeting notes/);
+    const on = assembleConversationPolicy({ connectors: ['lark'], meetingNotes: true });
+    assert.ok(on.indexOf('## Meeting notes') > on.indexOf('## OpenViking memory'));
+    assert.match(on, /`read_meeting_note`/);
+    assert.equal(on.replace(`\n\n${read('meeting-notes.md').trim()}`, ''), off);
+  });
+
   it('adds the mail rules only when a mailbox is connected', () => {
     assert.doesNotMatch(assembleConversationPolicy({ connectors: ['lark'] }), /^## Email$/m);
     for (const connectors of [['lark', 'email'], ['weixin', 'email']]) {
@@ -108,7 +117,7 @@ describe('conversation policy assemble', () => {
   });
 
   it('ships no deployment-specific chats or bots in the release prompts', () => {
-    const files = ['core.md', 'events.md', 'openviking.md', 'natural-writing.md', 'delivery/single.md', 'delivery/staged.md',
+    const files = ['core.md', 'events.md', 'openviking.md', 'meeting-notes.md', 'natural-writing.md', 'delivery/single.md', 'delivery/staged.md',
       ...fs.readdirSync(path.join(DEFAULT_PROMPT_DIR, 'connectors')).map((name) => path.join('connectors', name)),
       ...fs.readdirSync(path.join(DEFAULT_PROMPT_DIR, 'roles')).map((name) => path.join('roles', name))];
     for (const name of files) {

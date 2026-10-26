@@ -10,6 +10,7 @@ import { TelegramClient } from '../telegram/client.mjs';
 import { QQClient } from '../qq/client.mjs';
 import { SlackClient } from '../slack/client.mjs';
 import { EmailClient } from '../email/client.mjs';
+import { MeetingNoteSync, isNoteEvent } from '../meeting/note-sync.mjs';
 import { getConnectorManifest } from './catalog.mjs';
 import { normalizeLarkEvent } from './lark-events.mjs';
 import { invokeOperation } from './operations.mjs';
@@ -73,6 +74,9 @@ const logger = workerLogger(config.logLevel);
 const registry = new ProcessRegistry(logger, { detached: false });
 const Client = { weixin: WeixinClient, email: EmailClient, telegram: TelegramClient, slack: SlackClient, qq: QQClient }[connectorId] ?? LarkClient;
 const client = new Client(config, registry, logger);
+// Lark only: the owner's meeting notes go to OV from here and never reach
+// the Core (see meeting/note-sync.mjs).
+const notes = connectorId === 'lark' ? MeetingNoteSync.forWorker({ config, registry, logger, profile: () => client.profile }) : null;
 let checked = false;
 let started = false;
 let stopping = false;
@@ -93,6 +97,10 @@ async function handleRequest(message) {
       client.startSubscription((line) => {
         try {
           const raw = JSON.parse(line);
+          if (notes && isNoteEvent(raw)) {
+            notes.accept(raw);
+            return;
+          }
           write(connectorId === 'lark' ? normalizeLarkEvent(raw) : parseProtocolLine(line));
         } catch (error) {
           logger.warn('connector_event_rejected', { error: safeError(error) });
@@ -106,6 +114,7 @@ async function handleRequest(message) {
         }));
         setImmediate(() => process.exit(1));
       });
+      notes?.start();
       result = { started: true };
     } else if (message.operation === 'action') {
       if (!checked) throw new Error('connector is not ready');
@@ -117,12 +126,14 @@ async function handleRequest(message) {
       }
       result = await invokeOperation(client, payload.name, payload.input);
     } else if (message.operation === 'pause') {
+      await notes?.stop();
       if (typeof client.stopSubscription === 'function') await client.stopSubscription();
       else await client.stop();
       started = false;
       result = { paused: true };
     } else if (message.operation === 'stop') {
       stopping = true;
+      await notes?.stop();
       await client.stop();
       await registry.stopAll(2_000);
       result = { stopped: true };
@@ -165,6 +176,7 @@ async function shutdown(signal) {
   if (stopping) return;
   stopping = true;
   logger.info('connector_worker_stopping', { signal });
+  try { await notes?.stop(); } catch {}
   try { await client.stop(); } catch {}
   try { await registry.stopAll(2_000); } catch {}
   process.exit(0);

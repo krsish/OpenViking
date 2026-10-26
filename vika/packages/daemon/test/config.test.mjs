@@ -89,6 +89,16 @@ describe('configuration safety', { concurrency: false }, () => {
     assert.throws(() => getConfig(), /VIKA_STAGED_REPLIES must be a boolean/);
     setEnv('VIKA_STAGED_REPLIES', undefined);
   });
+  it('stores meeting notes only on an instance that opts in and has Feishu/Lark', () => {
+    setEnv('VIKA_MEETING_NOTES', undefined);
+    assert.equal(getConfig().meetingNotes, false);
+    setEnv('VIKA_MEETING_NOTES', 'true');
+    setEnv('VIKA_CONNECTORS_JSON', '["lark"]');
+    assert.equal(getConfig().meetingNotes, true);
+    setEnv('VIKA_CHANNEL', 'weixin');
+    setEnv('VIKA_CONNECTORS_JSON', '["weixin"]');
+    assert.equal(getConfig().meetingNotes, false);
+  });
   it('takes mailboxes only with private account files, and never as the primary IM', () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'lark-email-config-'));
     const accountFile = path.join(directory, 'email.json');

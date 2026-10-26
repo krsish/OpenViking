@@ -12,12 +12,19 @@ import { prepareLarkMediaDirectory } from './lark-media.mjs';
 import { MAX_CARD_IMAGE_BYTES, cardImageFormat, checkCardImageTemplate, replaceCardImages, validImageKey } from './card-images.mjs';
 import { readWorkspaceFile } from './workspace-file.mjs';
 import { LarkImageCache } from './lark-image-cache.mjs';
+import { NOTE_EVENT } from './meeting/note-sync.mjs';
 
 export const SUBSCRIBED_EVENT_TYPES = Object.freeze([
   'im.message.receive_v1',
   'card.action.trigger',
   ...MEETING_EVENT_TYPES,
 ]);
+
+// What the long connection listens for: the owner's meeting notes too, on
+// the instance that stores them.
+export function subscribedEventTypes({ meetingNotes = false } = {}) {
+  return meetingNotes ? [...SUBSCRIBED_EVENT_TYPES, NOTE_EVENT] : [...SUBSCRIBED_EVENT_TYPES];
+}
 
 const IMAGE_TYPES = {
   '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
@@ -197,7 +204,7 @@ export class LarkClient {
     const args = [
       '--profile', this.profile,
       'event', '+subscribe',
-      '--event-types', SUBSCRIBED_EVENT_TYPES.join(','),
+      '--event-types', subscribedEventTypes(this.config).join(','),
       '--as', 'bot',
       '--quiet',
       '--format', 'ndjson',
