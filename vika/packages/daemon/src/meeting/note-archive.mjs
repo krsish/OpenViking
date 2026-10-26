@@ -72,6 +72,16 @@ function bodyOf(doc) {
   }).join('\n').trim();
 }
 
+// What the note calls the meeting: its own title ("智能纪要：<what it was
+// about> <date>"), which says more than a default topic such as "X 的视频会议".
+export function noteTitle(doc) {
+  const first = cleanDocMarkdown(doc).split('\n')[0] ?? '';
+  if (!/^#\s/.test(first)) return null;
+  const title = first.replace(/^#\s+/, '').replace(/^(?:智能纪要|文字记录)\s*[:：]\s*/, '')
+    .replace(/\s*\d{4}年\d{1,2}月\d{1,2}日\s*$/, '').trim();
+  return title || null;
+}
+
 function label(value, max = 200) {
   return String(value ?? '').replace(/[\u0000-\u001f\u007f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
 }
@@ -84,8 +94,9 @@ function timeLine({ startMs, endMs }) {
   return `${minute(startMs)} – ${minute(endMs).slice(11)} UTC (${Math.max(1, Math.round((endMs - startMs) / 60_000))} min)`;
 }
 
-function meetingLines(meeting) {
+function meetingLines(meeting, title) {
   const lines = [`- Meeting: ${meeting.id}${meeting.number ? ` (number ${meeting.number})` : ''}`];
+  if (meeting.topic && label(meeting.topic) !== title) lines.push(`- Meeting topic: ${label(meeting.topic)}`);
   const time = timeLine(meeting);
   if (time) lines.push(`- Time: ${time}`);
   if (meeting.host) lines.push(`- Host: ${label(meeting.host, 100)}`);
@@ -100,10 +111,11 @@ function meetingLines(meeting) {
   return lines;
 }
 
-// note.md: the meeting, then the note's own text. `note`: { id, docToken,
+// note.md: the meeting under the note's title, then the note's own text. `note`: { id, docToken,
 // verbatimToken, revision }; `summary`: the note document as fetched.
 export function noteMarkdown({ meeting, note, summary, transcriptUri, storedAtMs }) {
-  const lines = [`# ${label(meeting.topic) || 'Meeting'}`, '', ...meetingLines(meeting)];
+  const title = label(noteTitle(summary) ?? meeting.topic) || 'Meeting';
+  const lines = [`# ${title}`, '', ...meetingLines(meeting, title)];
   lines.push(`- Feishu note: document ${note.docToken ?? 'none'}${note.revision != null ? `, revision ${note.revision}` : ''}; `
     + `stored ${new Date(storedAtMs).toISOString()}. Feishu's own copy may have changed since.`);
   if (transcriptUri) lines.push(`- Transcript: ${transcriptUri}${note.verbatimToken ? ` (Feishu document ${note.verbatimToken})` : ''}`);
@@ -113,10 +125,10 @@ export function noteMarkdown({ meeting, note, summary, transcriptUri, storedAtMs
 }
 
 // transcript.md: what was said, under the meeting it was said in.
-export function transcriptMarkdown({ meeting, transcript, noteUri }) {
+export function transcriptMarkdown({ meeting, transcript, noteUri, title = null }) {
   const time = timeLine(meeting);
   return `${[
-    `# Transcript: ${label(meeting.topic) || 'Meeting'}`, '',
+    `# Transcript: ${label(title ?? noteTitle(transcript) ?? meeting.topic) || 'Meeting'}`, '',
     `- Meeting: ${meeting.id}`,
     ...(time ? [`- Time: ${time}`] : []),
     `- Note: ${noteUri}`,

@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { opaqueRef, redactSensitive, safeError } from '../logger.mjs';
-import { MeetingNoteArchive, meetingFolder, noteMarkdown, transcriptMarkdown } from './note-archive.mjs';
+import { MeetingNoteArchive, meetingFolder, noteMarkdown, noteTitle, transcriptMarkdown } from './note-archive.mjs';
 
 // Meeting notes into OpenViking, run by the Lark Connector of the one
 // instance that has agents[].meetingNotes on. Feishu/Lark sends the owner's
@@ -23,6 +23,7 @@ import { MeetingNoteArchive, meetingFolder, noteMarkdown, transcriptMarkdown } f
 
 export const NOTE_EVENT = 'vc.note.generated_v1';
 const SUBSCRIBE_PATH = '/open-apis/vc/v1/notes/subscription';
+const APP_INFO_PATH = '/open-apis/application/v6/applications/me';
 const UNSUBSCRIBE_PATH = '/open-apis/vc/v1/notes/unsubscription';
 const NOTE_ID = /^[A-Za-z0-9_-]{1,64}$/;
 const MEETING_ID = /^\d{1,32}$/;
@@ -40,7 +41,6 @@ const RETRY_SUBSCRIBE_MS = 1_800_000;
 const TICK_MS = 1_800_000;
 const STOP_WAIT_MS = 2_000;
 const MAX_SEARCH_PAGES = 40;
-const DETAIL_BATCH = 20;
 const NAME_BATCH = 50;
 const DOC_STDOUT_LIMIT = 16_000_000;
 const NOTE_ARTIFACT = 1;
@@ -109,6 +109,11 @@ export class MeetingNoteState {
 
   note(noteId) {
     return this.db.prepare('SELECT * FROM notes WHERE note_id = ?').get(noteId) ?? null;
+  }
+
+  // Whether a note of this meeting is known already, whatever became of it.
+  hasMeeting(meetingId) {
+    return Boolean(this.db.prepare('SELECT 1 FROM notes WHERE meeting_id = ? LIMIT 1').get(meetingId));
   }
 
   // A note to store. A scan only adds notes it has not seen; an event also
@@ -227,6 +232,7 @@ export class MeetingNoteSync {
     const subscribed = Number(this.state.get('subscribed_at_ms')) || 0;
     const failed = Number(this.state.get('subscribe_failed_at_ms')) || 0;
     if (starting || (now - subscribed >= RESUBSCRIBE_EVERY_MS && now - failed >= RETRY_SUBSCRIBE_MS)) await this.subscribe();
+    if (starting) await this.checkAppEvent();
     if (this.stopped) return;
     const scanned = Number(this.state.get('scanned_at_ms')) || 0;
     if (starting || now - scanned >= SCAN_EVERY_MS) await this.scan().catch((error) => {
@@ -268,16 +274,17 @@ export class MeetingNoteSync {
     return queued;
   }
 
-  async cli(args, label, { timeoutMs = 60_000, stdoutLimit, cwd = this.config.projectDir } = {}) {
+  async cli(args, label, { timeoutMs = 60_000, stdoutLimit, cwd = this.config.projectDir, as = 'user' } = {}) {
     const profile = this.profile();
     if (!profile) throw new Error('no lark-cli profile');
-    const result = await this.registry.run(this.config.larkCliBin, ['--profile', profile, ...args, '--as', 'user', '--format', 'json'],
+    const result = await this.registry.run(this.config.larkCliBin, ['--profile', profile, ...args, '--as', as, '--format', 'json'],
       { cwd, timeoutMs, ...(stdoutLimit ? { stdoutLimit } : {}) });
     if (result.timedOut) throw new Error(`lark-cli ${label} timed out`);
-    let parsed = null;
-    try { parsed = JSON.parse(result.stdout); } catch {}
+    const json = (text) => { try { return JSON.parse(text); } catch { return null; } };
+    const parsed = json(result.stdout);
     if (result.code !== 0 || parsed?.ok === false || !parsed) {
-      const error = parsed?.error ?? {};
+      // A refusal (a missing scope, say) comes as a JSON envelope on stderr.
+      const error = parsed?.error ?? json(result.stderr.slice(result.stderr.indexOf('{')))?.error ?? {};
       const detail = error.message || result.stderr.trim().split('\n').at(-1) || `exit ${result.code}`;
       throw Object.assign(new Error(`lark-cli ${label} failed${error.code ? ` (${error.code})` : ''}: ${detail}`),
         { code: error.code ?? null, subtype: error.subtype ?? null });
@@ -306,6 +313,31 @@ export class MeetingNoteSync {
     this.state.set('subscribed_at_ms', at);
     this.state.set('subscribed', '1');
     return true;
+  }
+
+  // The subscription is accepted whether or not the app has the event, but
+  // Feishu/Lark sends only what the app's live version subscribes to. Read as
+  // the app's bot; an app whose settings cannot be read is not judged.
+  async checkAppEvent() {
+    let events;
+    try {
+      const { app = {} } = await this.cli(['api', 'GET', APP_INFO_PATH, '--params', JSON.stringify({ lang: 'zh_cn' })], 'app info', { as: 'bot' });
+      if (!app.app_id || !app.online_version_id) return null;
+      const { app_version: version = {} } = await this.cli(['api', 'GET',
+        `/open-apis/application/v6/applications/${encodeURIComponent(app.app_id)}/app_versions/${encodeURIComponent(app.online_version_id)}`,
+        '--params', JSON.stringify({ lang: 'zh_cn', user_id_type: 'open_id' })], 'app version', { as: 'bot' });
+      events = (version.event_infos ?? []).map((event) => event?.event_type);
+    } catch (error) {
+      this.logger.info('meeting_notes_app_unreadable', { error: failure(error) });
+      return null;
+    }
+    const enabled = events.includes(NOTE_EVENT);
+    if (!enabled) {
+      this.logger.warn('meeting_notes_event_not_enabled', {
+        hint: 'the app\'s live version does not subscribe vc.note.generated_v1, so notes come only from the scan every 6 hours; vika setup completes the app with one scan',
+      });
+    }
+    return enabled;
   }
 
   // With the switch off, an instance that subscribed before (the switch
@@ -340,23 +372,34 @@ export class MeetingNoteSync {
       if (!data.has_more || !data.page_token) break;
       pageToken = data.page_token;
     }
+    // A meeting names its note itself (vc +detail would need vc:record:readonly
+    // as well). One that cannot be read is passed over, unless none can.
     let notes = 0;
     let queued = 0;
-    const ids = [...new Set(meetings)];
-    for (let index = 0; index < ids.length && !this.stopped; index += DETAIL_BATCH) {
-      const data = await this.cli(['vc', '+detail', '--meeting-ids', ids.slice(index, index + DETAIL_BATCH).join(',')],
-        'meeting detail', { timeoutMs: 180_000 });
-      for (const meeting of data.meetings ?? []) {
-        const noteId = String(meeting?.note_id ?? '');
-        if (!NOTE_ID.test(noteId)) continue;
-        notes += 1;
-        if (this.state.enqueue(noteId, { meetingId: String(meeting.meeting_id ?? '') || null, source: 'scan', atMs: now })) queued += 1;
+    let unreadable = 0;
+    let firstError = null;
+    const ids = [...new Set(meetings)].filter((id) => !this.state.hasMeeting(id));
+    for (const meetingId of ids) {
+      if (this.stopped) return;
+      let meeting;
+      try {
+        ({ meeting = {} } = await this.cli(['vc', 'meeting', 'get', '--params', JSON.stringify({ meeting_id: meetingId })], 'meeting get'));
+      } catch (error) {
+        unreadable += 1;
+        firstError ??= error;
+        continue;
       }
+      const noteId = String(meeting.note_id ?? '');
+      if (!NOTE_ID.test(noteId)) continue;
+      notes += 1;
+      if (this.state.enqueue(noteId, { meetingId, source: 'scan', atMs: now })) queued += 1;
     }
-    if (this.stopped) return;
+    if (firstError && unreadable === ids.length) throw firstError;
     this.state.set('scanned_until_ms', now);
     this.state.set('scanned_at_ms', now);
-    this.logger.info('meeting_notes_scanned', { since: iso(from), meetings: ids.length, notes, queued });
+    this.logger.info('meeting_notes_scanned', {
+      since: iso(from), meetings: ids.length, notes, queued, ...(unreadable ? { unreadable, error: failure(firstError) } : {}),
+    });
   }
 
   arm() {
@@ -439,7 +482,8 @@ export class MeetingNoteSync {
       meeting, summary: summary?.content ?? null, transcriptUri, storedAtMs: this.now(),
       note: { id: row.note_id, docToken, verbatimToken, revision: summary?.revision ?? null },
     });
-    const transcriptText = transcript ? transcriptMarkdown({ meeting, transcript, noteUri: `${folder}/note.md` }) : null;
+    const title = noteTitle(summary?.content) ?? null;
+    const transcriptText = transcript ? transcriptMarkdown({ meeting, transcript, noteUri: `${folder}/note.md`, title }) : null;
     const stored = await this.archive.store(meetingId, { note: noteText, transcript: transcriptText });
     return {
       meetingId, revision: summary?.revision ?? null, chunked: stored.chunked,

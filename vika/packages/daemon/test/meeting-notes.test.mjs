@@ -9,7 +9,7 @@ import { describe, it } from 'node:test';
 import { ActionService } from '../src/actions/service.mjs';
 import { ConnectorProcess } from '../src/connectors/process.mjs';
 import { subscribedEventTypes } from '../src/lark.mjs';
-import { MeetingNoteArchive, cleanDocMarkdown, meetingReadTarget, noteMarkdown } from '../src/meeting/note-archive.mjs';
+import { MeetingNoteArchive, cleanDocMarkdown, meetingReadTarget, noteMarkdown, noteTitle } from '../src/meeting/note-archive.mjs';
 import { MeetingNoteState, MeetingNoteSync, NOTE_EVENT, isNoteEvent, noteIdOf } from '../src/meeting/note-sync.mjs';
 import { OVConnection } from '../src/ov-connection.mjs';
 import { OVSessionClient } from '../src/ov-session-context.mjs';
@@ -43,8 +43,12 @@ const SUMMARY = [
 ].join('\n');
 const TRANSCRIPT = '# 文字记录：飞书接入评审 2026年10月23日\n\n> 会议主题：飞书接入评审\n\nAmy 00:00:05  \n大家好，今天评审接入方案。\n';
 
-// A lark-cli that answers what the note sync asks, as scripted per test.
-function lark({ note = {}, documents = {}, search = [[]], meetings = [], fail = {} } = {}) {
+// A lark-cli that answers what the note sync asks, as scripted per test:
+// `notes` is each meeting's note id (none for a meeting without one), `fail`
+// a refusal for the commands that contain a key, as lark-cli prints it on
+// stderr, and `appEvents` the events of the app's live version.
+function lark({ note = {}, documents = {}, search = [[]], notes = { [MEETING]: NOTE }, fail = {},
+  appEvents = ['im.message.receive_v1', NOTE_EVENT] } = {}) {
   const calls = [];
   let searches = 0;
   const ok = (data) => ({ code: 0, timedOut: false, stdout: JSON.stringify({ ok: true, data }), stderr: '' });
@@ -53,9 +57,13 @@ function lark({ note = {}, documents = {}, search = [[]], meetings = [], fail = 
       calls.push(args);
       const command = args.slice(2, args.indexOf('--as')).join(' ');
       for (const [pattern, error] of Object.entries(fail)) {
-        if (command.includes(pattern)) return { code: 1, timedOut: false, stdout: JSON.stringify({ ok: false, error: { message: error } }), stderr: '' };
+        if (command.includes(pattern)) {
+          return { code: 3, timedOut: false, stdout: '', stderr: `[note] progress\n${JSON.stringify({ ok: false, error: { type: 'authorization', message: error } }, null, 2)}\n` };
+        }
       }
       if (command.startsWith('api POST')) return ok({});
+      if (command.startsWith('api GET /open-apis/application/v6/applications/me')) return ok({ app: { app_id: 'cli_test', online_version_id: 'oav_1' } });
+      if (command.includes('/app_versions/')) return ok({ app_version: { event_infos: appEvents.map((type) => ({ event_type: type })) } });
       if (command.startsWith('api GET /open-apis/vc/v1/notes/')) {
         return ok({ note: {
           artifacts: [{ artifact_type: 1, doc_token: 'docNote' }, { artifact_type: 2, doc_token: 'docVerb' }],
@@ -63,7 +71,8 @@ function lark({ note = {}, documents = {}, search = [[]], meetings = [], fail = 
         } });
       }
       if (command.startsWith('vc meeting get')) {
-        return ok({ meeting: { topic: '飞书接入评审', meeting_no: '333333333', start_time: '1792742359', end_time: '1792743899',
+        const meetingId = JSON.parse(args[args.indexOf('--params') + 1]).meeting_id;
+        return ok({ meeting: { ...(notes[meetingId] ? { note_id: notes[meetingId] } : {}), topic: '飞书接入评审', meeting_no: '333333333', start_time: '1792742359', end_time: '1792743899',
           host_user: { id: 'ou_host12345678' }, participant_count: '3', calendar_event_id: 'cal-1_0',
           participants: [{ id: 'ou_host12345678', user_type: 1 }, { id: 'ou_amy12345678', user_type: 1 }, { id: 'room-1', user_type: 0 }] } });
       }
@@ -80,7 +89,6 @@ function lark({ note = {}, documents = {}, search = [[]], meetings = [], fail = 
         searches += 1;
         return ok({ items: items.map((id) => ({ id })), has_more: false });
       }
-      if (command.startsWith('vc +detail')) return ok({ meetings });
       return ok({});
     },
   };
@@ -132,6 +140,15 @@ describe('meeting notes in OpenViking', () => {
     ].join('\n'));
   });
 
+  it('heads a note with what the AI note says the meeting was about, over a default topic', () => {
+    assert.equal(noteTitle(SUMMARY), '飞书接入评审');
+    assert.equal(noteTitle('# 文字记录：Vika后续工作安排同步会议 2026年10月26日\n'), 'Vika后续工作安排同步会议');
+    assert.equal(noteTitle('no heading'), null);
+    const text = noteMarkdown({ meeting: { id: MEETING, topic: '刘维汉的视频会议' }, note: { docToken: 'd' },
+      summary: '# 智能纪要：Vika后续工作安排同步会议 2026年10月26日\n# 总结\n安排', storedAtMs: 0 });
+    assert.match(text, /^# Vika后续工作安排同步会议\n\n- Meeting: 734000000000000301\n- Meeting topic: 刘维汉的视频会议\n/);
+  });
+
   it('reads back only what is a stored meeting', () => {
     assert.deepEqual(meetingReadTarget(ROOT, `${ROOT}/${MEETING}`), { target: `${ROOT}/${MEETING}/note.md` });
     assert.deepEqual(meetingReadTarget(ROOT, `${ROOT}/${MEETING}/transcript.md`), { target: `${ROOT}/${MEETING}/transcript.md` });
@@ -158,7 +175,9 @@ describe('meeting notes in OpenViking', () => {
     await notes.running;
     assert.deepEqual(cli.calls[0], ['--profile', 'vika-test', 'api', 'POST', '/open-apis/vc/v1/notes/subscription',
       '--data', JSON.stringify({ event_type: NOTE_EVENT }), '--as', 'user', '--format', 'json']);
-    assert.ok(cli.calls.every((args) => args.at(-3) === 'user'), 'every call is the owner\'s');
+    const app = (args) => args.some((arg) => String(arg).startsWith('/open-apis/application/'));
+    assert.ok(cli.calls.every((args) => args.at(-3) === (app(args) ? 'bot' : 'user')), 'the owner\'s, but for reading the app itself');
+    assert.equal(log.named('meeting_notes_event_not_enabled').length, 0);
     assert.equal(log.named('meeting_notes_subscribed').length, 1);
 
     assert.equal(notes.accept(event()), true);
@@ -205,16 +224,14 @@ describe('meeting notes in OpenViking', () => {
   });
 
   it('scans the meetings since the last scan for notes it has not seen; the first scan reaches back 30 days', async (t) => {
-    const { notes, cli, clock, dataDir, log } = await sync(t, { script: {
-      search: [[MEETING, '734000000000000302'], [MEETING]],
-      meetings: [{ meeting_id: MEETING, note_id: NOTE }, { meeting_id: '734000000000000302', hint: 'note_id not found' }],
-    } });
+    const { notes, cli, clock, dataDir, log } = await sync(t, { script: { search: [[MEETING, '734000000000000302'], [MEETING]] } });
     const started = clock.now;
     notes.start();
     await notes.running;
     const searches = () => cli.calls.filter((args) => args.includes('+search'));
     assert.equal(searches()[0][searches()[0].indexOf('--start') + 1], new Date(started - 30 * 86_400_000).toISOString());
-    assert.equal(cli.calls.find((args) => args.includes('+detail'))[5], `${MEETING},734000000000000302`);
+    const looked = (args) => args.includes('meeting') && args.includes('get') && !args.at(args.indexOf('--params') + 1).includes('with_participants');
+    assert.deepEqual(cli.calls.filter(looked).map((args) => JSON.parse(args[args.indexOf('--params') + 1]).meeting_id), [MEETING, '734000000000000302']);
     assert.equal(log.named('meeting_notes_scanned')[0].queued, 1);
     assert.equal(log.named('meeting_note_stored')[0].source, 'scan', 'a scanned note is stored at once');
 
@@ -223,7 +240,30 @@ describe('meeting notes in OpenViking', () => {
     await notes.running;
     assert.equal(searches()[1][searches()[1].indexOf('--start') + 1], new Date(started - 6 * HOUR).toISOString());
     assert.equal(log.named('meeting_notes_scanned')[1].queued, 0, 'a stored note is not queued again');
+    assert.equal(cli.calls.filter(looked).length, 2, 'nor is its meeting looked up again');
     assert.equal(new MeetingNoteState(dataDir).counts().stored, 1);
+  });
+
+  it('says so when the app\'s live version does not have the note event, and reads the refusal lark-cli prints', async (t) => {
+    const { notes, log } = await sync(t, { script: { appEvents: ['im.message.receive_v1'], search: [[MEETING]], fail: { 'vc meeting get': 'missing required scope(s): vc:meeting:readonly' } } });
+    notes.start();
+    await notes.running;
+    assert.match(log.named('meeting_notes_event_not_enabled')[0].hint, /vika setup/);
+    assert.match(log.named('meeting_notes_scan_failed')[0].error, /meeting get failed: missing required scope\(s\): vc:meeting:readonly/,
+      'every meeting unreadable: the scan fails, and says why');
+  });
+
+  it('a scan passes over a meeting it cannot read and queues the others', async (t) => {
+    const other = '734000000000000302';
+    const { notes, log, cli } = await sync(t, { script: { search: [[other, MEETING]], notes: { [MEETING]: NOTE } } });
+    const run = cli.registry.run;
+    cli.registry.run = async (bin, args) => (args.includes(JSON.stringify({ meeting_id: other }))
+      ? { code: 1, timedOut: false, stdout: '', stderr: '{"ok":false,"error":{"message":"no permission"}}' } : run(bin, args));
+    notes.start();
+    await notes.running;
+    const [scanned] = log.named('meeting_notes_scanned');
+    assert.deepEqual([scanned.meetings, scanned.notes, scanned.queued, scanned.unreadable], [2, 1, 1, 1]);
+    assert.match(scanned.error, /no permission/);
   });
 
   it('an existing subscription is fine; a refused one is tried again half an hour later', async (t) => {
