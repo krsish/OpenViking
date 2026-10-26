@@ -1458,7 +1458,7 @@ test('meeting notes: on for the first assistant or colleague on Feishu, off for 
   assert.equal(qa.manifest().agents[0].meetingNotes, false);
 });
 
-test('会议纪要入库 is one instance\'s: refused while another has it; switching it on checks the app before the restart', async (t) => {
+test('会议纪要入库 is one instance\'s: refused while another has it, switched on like any other setting', async (t) => {
   //                    change asd  other  notes  done  discard
   const h = harness(t, ['2',        '10',  '5',   '6',  '12']);
   const asd = existing(h, {});
@@ -1474,41 +1474,39 @@ test('会议纪要入库 is one instance\'s: refused while another has it; switc
   //                     change asd  other  notes  done  save
   const on = harness(t, ['2',        '10',  '5',   '6',  '11']);
   const before = existing(on, {});
-  on.options.connect.larkApp = async ({ agent }) => { on.calls.push(['larkApp', agent.id, agent.meetingNotes]); return true; };
   assert.equal(await setupCommand(on.options), 0);
   assert.deepEqual(on.manifest().agents, [{ ...before, meetingNotes: true }]);
-  assert.deepEqual(on.calls, [['larkApp', 'asd', true], ['restart', 'asd']]);
-  assert.match(on.written(), /会议纪要入库：关 → 开（模型会开一次新的会话；保存时核对飞书应用，缺纪要事件就扫码补上）/);
+  assert.deepEqual(on.calls, [['restart', 'asd']], 'the app needs nothing more for it');
+  assert.match(on.written(), /会议纪要入库：关 → 开（模型会开一次新的会话）\n/);
 });
 
-test('an instance whose Feishu app lacks what this release needs comes first, and one scan completes it', async (t) => {
-  const h = harness(t, ['1']);
-  const before = existing(h, { meetingNotes: true });
-  h.options.detect.larkApps = async ({ manifest }) => [{ agent: manifest.agents[0], count: 2 }];
-  h.options.connect.larkApp = async ({ agent }) => { h.calls.push(['larkApp', agent.id, agent.meetingNotes]); return true; };
+test('an instance whose Feishu app lacks what this release needs says so; its 飞书应用 setting completes it on saving', async (t) => {
+  //                   change asd  feishu app  add what is missing  save
+  const h = harness(t, ['2',        '6',        '1',                 '11']);
+  const before = existing(h, {});
+  const needs = (agent) => ({ agent, count: 2, missing: { scopes: { tenant: ['im:message'], user: [] }, events: ['im.message.receive_v1'], callbacks: [] }, login: [] });
+  h.options.detect.larkApps = async ({ manifest }) => [needs(manifest.agents[0])];
+  h.options.connect.larkApp = async ({ agent }) => { h.calls.push(['larkApp', agent.id]); return true; };
   assert.equal(await setupCommand(h.options), 0);
-  assert.match(h.written(), /1\) 补齐 ASD（asd）的飞书权限\s+缺 2 项，扫码补上\n  2\) 新建一个实例\n  3\) 修改 ASD（asd）/);
-  assert.deepEqual(h.calls, [['larkApp', 'asd', true], ['restart', 'asd']]);
-  assert.deepEqual(h.manifest().agents, [before], 'the manifest is untouched');
-
-  // An app the owner left unchanged needs no restart.
-  const kept = harness(t, ['1']);
-  existing(kept, {});
-  kept.options.detect.larkApps = async ({ manifest }) => [{ agent: manifest.agents[0], count: 1 }];
-  kept.options.connect.larkApp = async ({ agent }) => { kept.calls.push(['larkApp', agent.id]); return false; };
-  assert.equal(await setupCommand(kept.options), 0);
-  assert.deepEqual(kept.calls, [['larkApp', 'asd']]);
+  const text = h.written();
+  assert.match(text, /1\) 新建一个实例\n  2\) 修改 ASD（asd）\s+飞书 · 飞书应用缺 2 项\n/);
+  assert.match(text, /6\) 飞书应用\s+现在的应用（缺 2 项：1 个权限、接收消息事件）\n/);
+  assert.match(text, /1\) 扫码补齐缺的 2 项\s+1 个权限、接收消息事件；保存时扫码，你要是这个应用的所有者或管理员\n  2\) 不换，用现在的应用/);
+  assert.match(text, /6\) 飞书应用\s+现在的应用，保存时扫码补齐缺的 2 项（已改）/);
+  assert.match(text, /将修改 ASD（asd）：\n  补齐飞书应用缺的权限和事件（需要扫码）\n/);
+  assert.deepEqual(h.calls, [['larkApp', 'asd'], ['restart', 'asd']], 'completed before the instance restarts');
+  assert.deepEqual(h.manifest().agents, [before], 'the manifest is as it was');
 });
 
-test('what an instance lacks: the app\'s settings for it, and scopes the owner\'s login does not carry yet', async (t) => {
-  const scopes = { tenant: ['im:message'], user: ['search:message', 'vc:note:read'] };
-  const larkCli = (login) => ({
+test('what an instance lacks: the app\'s scopes, events and callback, and scopes the owner\'s login does not carry yet', async (t) => {
+  const scopes = { tenant: ['im:message', 'im:chat:read'], user: ['search:message', 'vc:note:read'] };
+  const larkCli = (login, tenant = scopes.tenant) => ({
     calls: [],
     async get({ pathname }) {
       this.calls.push(pathname);
       if (pathname.endsWith('/applications/me')) {
         return { code: 0, data: { app: { app_id: 'cli_1', online_version_id: 'v1',
-          scopes: [{ scope: 'im:message', token_types: ['tenant'] }, ...scopes.user.map((scope) => ({ scope, token_types: ['user'] }))],
+          scopes: [...tenant.map((scope) => ({ scope, token_types: ['tenant'] })), ...scopes.user.map((scope) => ({ scope, token_types: ['user'] }))],
           callback_info: { callback_type: 'websocket', subscribed_callbacks: ['card.action.trigger'] } } } };
       }
       if (pathname.includes('/app_versions/')) return { code: 0, data: { app_version: { event_infos: [{ event_type: 'im.message.receive_v1' }] } } };
@@ -1519,12 +1517,12 @@ test('what an instance lacks: the app\'s settings for it, and scopes the owner\'
     async finishUserLogin() { this.calls.push('finished'); },
   });
   const { larkNeeds, updateLarkApp } = await import('../src/setup.mjs');
-  const plain = await larkNeeds({ agent: { profile: 'vika-asd' }, larkCli: larkCli(scopes.user), scopes });
-  assert.equal(plain.count, 0);
-  const notes = await larkNeeds({ agent: { profile: 'vika-asd', meetingNotes: true }, larkCli: larkCli(['search:message']), scopes });
-  assert.deepEqual(notes.missing.events, ['vc.note.generated_v1']);
-  assert.deepEqual(notes.login, ['vc:note:read']);
-  assert.equal(notes.count, 2);
+  const complete = await larkNeeds({ agent: { profile: 'vika-asd', meetingNotes: true }, larkCli: larkCli(scopes.user), scopes });
+  assert.equal(complete.count, 0, 'storing meeting notes needs nothing of the app beyond the permission list');
+  const short = await larkNeeds({ agent: { profile: 'vika-asd' }, larkCli: larkCli(['search:message'], ['im:message']), scopes });
+  assert.deepEqual(short.missing.scopes.tenant, ['im:chat:read']);
+  assert.deepEqual(short.login, ['vc:note:read']);
+  assert.equal(short.count, 2);
 
   // Declining the scan still renews the owner's login for what the app has.
   const input = new PassThrough();
@@ -1532,11 +1530,11 @@ test('what an instance lacks: the app\'s settings for it, and scopes the owner\'
   const output = new PassThrough();
   let written = '';
   output.on('data', (chunk) => { written += chunk; });
-  const cli = larkCli(['search:message']);
-  const updated = await updateLarkApp({ agent: { id: 'asd', displayName: 'ASD', profile: 'vika-asd', meetingNotes: true },
+  const cli = larkCli(['search:message'], ['im:message']);
+  const updated = await updateLarkApp({ agent: { id: 'asd', displayName: 'ASD', profile: 'vika-asd' },
     prompter: new Prompter({ input, output }), larkCli: cli, scopes, register: async () => { throw new Error('not asked for'); } });
   assert.equal(updated, false);
-  assert.match(written, /没有订阅会议纪要事件（vc\.note\.generated_v1）/);
+  assert.match(written, /有 1 个权限没开通，相关功能会不可用：im:chat:read/);
   assert.match(written, /你给 ASD 的授权还缺 1 个权限（vc:note:read），再扫码授权一次/);
   assert.deepEqual(cli.calls.filter((call) => Array.isArray(call)), [['login', scopes.user]]);
   assert.ok(cli.calls.includes('finished'));

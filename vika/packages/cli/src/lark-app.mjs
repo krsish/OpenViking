@@ -16,15 +16,7 @@ import { registerApp } from '@larksuiteoapi/node-sdk';
 // scopes with the request.
 
 export const EVENTS = Object.freeze(['im.message.receive_v1']);
-// User-identity events: the owner's meeting notes, for the instance that
-// stores them (agents[].meetingNotes).
-export const NOTE_EVENTS = Object.freeze(['vc.note.generated_v1']);
 export const CALLBACKS = Object.freeze(['card.action.trigger']);
-
-// The events an instance's app needs, per identity.
-export function larkEvents({ meetingNotes = false } = {}) {
-  return { tenant: [...EVENTS], user: meetingNotes ? [...NOTE_EVENTS] : [] };
-}
 
 export class LarkRegistrationError extends Error {
   constructor(code, message) {
@@ -57,7 +49,6 @@ export async function scanApp({
   name,
   description,
   scopes,
-  events = larkEvents(),
   onQRCode,
   onStatus = () => {},
   signal = undefined,
@@ -71,7 +62,7 @@ export async function scanApp({
       ...(mode === 'update' ? { appId } : { appPreset: { ...(name ? { name } : {}), ...(description ? { desc: description } : {}) } }),
       addons: {
         scopes: { tenant: [...scopes.tenant], user: [...scopes.user] },
-        events: { items: { tenant: [...events.tenant], ...(events.user.length ? { user: [...events.user] } : {}) } },
+        events: { items: { tenant: [...EVENTS] } },
         callbacks: { items: [...CALLBACKS] },
       },
       signal,
@@ -167,14 +158,14 @@ export function missingScopes(scopes, granted) {
   };
 }
 
-// What the app lacks of the request: scopes per token type, the events
-// (null when the online version could not be read) and the card callback,
-// which counts only on the long connection.
-export function missingConfig(scopes, inspected, events = larkEvents()) {
+// What the app lacks of the request: scopes per token type, the message
+// event (null when the online version could not be read) and the card
+// callback, which counts only on the long connection.
+export function missingConfig(scopes, inspected) {
   const { type, items } = inspected.callbacks;
   return {
     scopes: missingScopes(scopes, inspected.granted),
-    events: inspected.events ? [...events.tenant, ...events.user].filter((event) => !inspected.events.includes(event)) : null,
+    events: inspected.events ? EVENTS.filter((event) => !inspected.events.includes(event)) : null,
     callbacks: CALLBACKS.filter((callback) => type !== 'websocket' || !items.includes(callback)),
   };
 }

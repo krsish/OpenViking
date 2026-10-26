@@ -201,10 +201,10 @@ the future `sync` capability.
 
 The Lark Connector of the one instance that stores meeting notes
 (`agents[].meetingNotes`) likewise writes each AI note of the owner's meetings
-to OpenViking (`viking://user/<user>/resources/meetings/<meeting_id>/`) from
-the `vc.note.generated_v1` events of the owner's subscription and a periodic
-scan. Those events never become protocol EVENTs: nothing reaches the Core, and
-the Core's `read_meeting_note` tool reads the stored notes.
+to OpenViking (`viking://user/<user>/resources/meetings/<meeting_id>/`), found
+by scanning the owner's meetings every 15 minutes. Nothing of it becomes a
+protocol EVENT or reaches the Core; the Core's `read_meeting_note` tool reads
+the stored notes.
 
 An optional `instance=` is included when it differs from
 `source=`. Tag values percent-encode whitespace, brackets and `%`, so an id

@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  CALLBACKS, EVENTS, NOTE_EVENTS, grantedUserScopes, inspectApp, lacksAny, larkEvents, missingConfig, missingScopes, scanApp,
+  CALLBACKS, EVENTS, grantedUserScopes, inspectApp, lacksAny, missingConfig, missingScopes, scanApp,
 } from '../src/lark-app.mjs';
 
 const SCOPES = { tenant: ['im:message:send_as_bot', 'im:message.group_msg'], user: ['search:message'] };
@@ -50,21 +50,6 @@ test('picking an existing app leaves the page its app list; updating one names i
   for (const given of seen) {
     assert.deepEqual(given.addons, { scopes: SCOPES, events: { items: { tenant: EVENTS } }, callbacks: { items: CALLBACKS } });
   }
-});
-
-test('the instance that stores meeting notes asks for the owner\'s note event too, as a user event', async () => {
-  assert.deepEqual(larkEvents(), { tenant: EVENTS, user: [] });
-  assert.deepEqual(larkEvents({ meetingNotes: true }), { tenant: EVENTS, user: NOTE_EVENTS });
-  let given;
-  await scanApp({ mode: 'update', appId: 'cli_old', scopes: SCOPES, events: larkEvents({ meetingNotes: true }), onQRCode() {},
-    register: async (options) => { given = options; return { client_id: 'cli_old', client_secret: 's', user_info: {} }; } });
-  assert.deepEqual(given.addons.events, { items: { tenant: EVENTS, user: ['vc.note.generated_v1'] } });
-  const inspected = { granted: [], callbacks: { type: 'websocket', items: CALLBACKS }, events: ['im.message.receive_v1'] };
-  assert.deepEqual(missingConfig({ tenant: [], user: [] }, inspected).events, []);
-  assert.deepEqual(missingConfig({ tenant: [], user: [] }, inspected, larkEvents({ meetingNotes: true })).events, ['vc.note.generated_v1']);
-  // A user event shows among the version's events like any other.
-  const subscribed = { ...inspected, events: ['im.message.receive_v1', 'vc.note.generated_v1'] };
-  assert.equal(lacksAny(missingConfig({ tenant: [], user: [] }, subscribed, larkEvents({ meetingNotes: true }))), false);
 });
 
 test('a Lark tenant is recognised, and platform refusals keep their code', async () => {

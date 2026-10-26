@@ -6,7 +6,6 @@ import { chatEvent } from './event-fixture.mjs';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 import { createLogger } from '../src/logger.mjs';
 import { PersonalAgentDaemon } from '../src/daemon.mjs';
@@ -140,28 +139,21 @@ describe('daemon event path (mock env)', { concurrency: false }, () => {
     }
   });
 
-  it('a meeting note event goes to the note queue of the Lark Connector, never to the agent', async () => {
+  it('the Lark Connector of the instance that stores meeting notes scans for them as the owner, and nothing reaches the agent', async () => {
     const env = await startMockEnv({
       config: { meetingNotes: true },
-      // Nothing is fetched within the test: a note waits a minute for its documents.
       prepare: (dir) => fs.writeFileSync(path.join(dir, 'ov-config.json'), JSON.stringify({ url: 'http://127.0.0.1:9', user: 'e2e-user' })),
     });
     try {
-      const subscribing = (args) => args.includes('/open-apis/vc/v1/notes/subscription') && args.includes('user');
-      await env.waitFor(() => env.larkCalls().some(subscribing));
+      const searching = (args) => args.includes('+search') && args.includes('vc') && args.includes('user');
+      await env.waitFor(() => env.larkCalls().some(searching));
+      await env.waitFor(() => fs.existsSync(path.join(env.config.dataDir, 'meeting-notes', 'meetings.sqlite3')));
       const listening = env.larkCalls().find((args) => args.includes('+subscribe') && !args.includes('--help'));
-      assert.match(listening[listening.indexOf('--event-types') + 1], /vc\.note\.generated_v1/);
-      env.receive({ schema: '2.0', header: { event_id: 'ev-note-1', event_type: 'vc.note.generated_v1' }, event: { note_id: '734000000000000901' } });
-      env.receive(textMessage({ messageId: 'om-after-note', text: 'after the note' }));
-      await env.waitForCodexInput(/om-after-note/);
-      const statePath = path.join(env.config.dataDir, 'meeting-notes', 'state.sqlite3');
-      await env.waitFor(() => {
-        if (!fs.existsSync(statePath)) return false;
-        const db = new DatabaseSync(statePath, { readOnly: true });
-        try { return db.prepare("SELECT status FROM notes WHERE note_id = '734000000000000901'").get()?.status === 'pending'; } finally { db.close(); }
-      });
-      assert.ok(!env.codexInput().some(({ text }) => /734000000000000901|vc\.note/.test(text)), 'the agent never sees it');
-      assert.equal(env.activities('message.received').length, 1, 'only the chat message reached the Core');
+      assert.doesNotMatch(listening[listening.indexOf('--event-types') + 1], /vc\.note|vc\.meeting\./, 'no meeting event is asked for');
+      assert.ok(!env.larkCalls().some((args) => args.some((arg) => String(arg).includes('subscription'))), 'nothing is subscribed');
+      env.receive(textMessage({ messageId: 'om-after-scan', text: 'after the scan' }));
+      await env.waitForCodexInput(/om-after-scan/);
+      assert.ok(!env.codexInput().some(({ text }) => /meeting/.test(text)), 'the agent hears nothing of it');
     } finally { await env.stop(); }
   });
 

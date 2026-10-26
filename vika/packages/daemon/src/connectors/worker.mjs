@@ -10,7 +10,7 @@ import { TelegramClient } from '../telegram/client.mjs';
 import { QQClient } from '../qq/client.mjs';
 import { SlackClient } from '../slack/client.mjs';
 import { EmailClient } from '../email/client.mjs';
-import { MeetingNoteSync, isNoteEvent } from '../meeting/note-sync.mjs';
+import { MeetingNoteSync } from '../meeting/note-sync.mjs';
 import { getConnectorManifest } from './catalog.mjs';
 import { normalizeLarkEvent } from './lark-events.mjs';
 import { invokeOperation } from './operations.mjs';
@@ -74,9 +74,11 @@ const logger = workerLogger(config.logLevel);
 const registry = new ProcessRegistry(logger, { detached: false });
 const Client = { weixin: WeixinClient, email: EmailClient, telegram: TelegramClient, slack: SlackClient, qq: QQClient }[connectorId] ?? LarkClient;
 const client = new Client(config, registry, logger);
-// Lark only: the owner's meeting notes go to OV from here and never reach
-// the Core (see meeting/note-sync.mjs).
-const notes = connectorId === 'lark' ? MeetingNoteSync.forWorker({ config, registry, logger, profile: () => client.profile }) : null;
+// The Lark Connector of the instance that stores meeting notes scans for
+// them and stores them in OV; nothing of it reaches the Core (see
+// meeting/note-sync.mjs).
+const notes = connectorId === 'lark' && config.meetingNotes
+  ? MeetingNoteSync.forWorker({ config, registry, logger, profile: () => client.profile }) : null;
 let checked = false;
 let started = false;
 let stopping = false;
@@ -97,10 +99,6 @@ async function handleRequest(message) {
       client.startSubscription((line) => {
         try {
           const raw = JSON.parse(line);
-          if (notes && isNoteEvent(raw)) {
-            notes.accept(raw);
-            return;
-          }
           write(connectorId === 'lark' ? normalizeLarkEvent(raw) : parseProtocolLine(line));
         } catch (error) {
           logger.warn('connector_event_rejected', { error: safeError(error) });
