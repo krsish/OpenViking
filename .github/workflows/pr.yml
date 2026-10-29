@@ -16,6 +16,7 @@ on:
       - '**.svg'
       - '.gitignore'
       - '.editorconfig'
+      - 'vika/**'
 
 jobs:
   plugin-tests:
