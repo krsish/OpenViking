@@ -246,7 +246,7 @@ export const BANNER_ROWS = SCENE_HEIGHT;
 const MINI_BOAT = ['...sm....', '..ssmj...', '.sssmjj..', 'hhhhhhhhh'];
 
 export function miniLines(t, { depth = 24, columns = 80 } = {}) {
-  const strip = Math.max(20, Math.min(columns, 72) - 7);
+  const strip = Math.max(20, Math.min(columns - 1, 72) - 7);
   const pixels = canvas(strip, 4);
   [[3, 0], [17, 1], [30, 0], [44, 1], [58, 0]].forEach(([x, y], index) => {
     if (x < strip && Math.sin(t * (1.2 + index * 0.4) + index) > -0.2) dot(pixels, x, y, scale(COLORS.star, 0.7));
@@ -318,9 +318,9 @@ function pinHeader({ output, frame, fps = 14 }) {
 // first row of the questions' region while a header is pinned.
 export async function openingBanner({ output = process.stdout, input = process.stdin, env = process.env, version = '', durationMs } = {}) {
   const idle = { release() {}, resume() {}, top: () => null };
-  const depth = colorDepth(output, env);
+  const depth = Math.min(colorDepth(output, env), 8);
   const still = env.VIKA_NO_ANIMATION === '1' || Boolean(env.CI);
-  if (depth < 8 || still || (output.columns ?? 0) < SCENE_WIDTH || (output.rows ?? 0) <= SCENE_HEIGHT + 2) {
+  if (depth < 8 || still || (output.columns ?? 0) <= SCENE_WIDTH || (output.rows ?? 0) <= SCENE_HEIGHT + 2) {
     await playBanner({ output, input, env, version });
     return idle;
   }
@@ -337,7 +337,7 @@ export async function openingBanner({ output = process.stdout, input = process.s
     },
     resume() {
       if (pinned?.released) pinned = null;
-      if (pinned || (output.columns ?? 0) < SCENE_WIDTH) return;
+      if (pinned || (output.columns ?? 0) <= SCENE_WIDTH) return;
       const columns = output.columns;
       if (fits(SCENE_HEIGHT)) pinned = pinHeader({ output, frame: (t) => bannerLines(t, { depth, version, columns }) });
       else if (fits(2)) pinned = pinHeader({ output, frame: (t) => miniLines(t, { depth, columns }) });
@@ -359,9 +359,9 @@ export async function playBanner({
   loop = false,
   fps = 14,
 } = {}) {
-  const depth = colorDepth(output, env);
+  const depth = Math.min(colorDepth(output, env), 8);
   const columns = output.columns ?? 80;
-  const animate = depth >= 8 && columns >= SCENE_WIDTH && (output.rows ?? 24) > SCENE_HEIGHT + 2;
+  const animate = depth >= 8 && columns > SCENE_WIDTH && (output.rows ?? 24) > SCENE_HEIGHT + 2;
   if (!animate) {
     const s = styler(output, env);
     output.write(`\n${s.bold(s.gradient('VIKA', PALETTE.sail))}  ${tagline()}${version ? s.gray(`  v${version}`) : ''}\n\n`);
