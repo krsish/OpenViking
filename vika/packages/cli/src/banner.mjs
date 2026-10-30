@@ -194,13 +194,23 @@ export function sceneFrame(t) {
   return toCells(pixels);
 }
 
+// A fixed 12-level RGB grid preserves shading between ANSI-256 colours while
+// limiting new glyph/foreground/background combinations across animation frames.
+// Unrestricted truecolor churn can trigger WebGL glyph-atlas corruption in
+// terminals; keep the palette stable over time, including half-block backgrounds.
+function bannerColor(rgb, depth) {
+  if (!rgb || depth < 24) return rgb;
+  const steps = 11;
+  return rgb.map((channel) => Math.round(Math.round(channel * steps / 255) * 255 / steps));
+}
+
 // Cell rows as strings, a colour change only where the colour changes.
 function render(rows, depth) {
   return rows.map((row) => {
     let line = '';
     let open = '';
     for (const cell of row) {
-      const code = `${cell.rgb ? fgCode(cell.rgb, depth) : ''}${cell.bg ? bgCode(cell.bg, depth) : ''}`;
+      const code = `${fgCode(bannerColor(cell.rgb, depth), depth)}${bgCode(bannerColor(cell.bg, depth), depth)}`;
       if (code !== open) {
         line += `${open ? RESET : ''}${code}`;
         open = code;
@@ -318,7 +328,7 @@ function pinHeader({ output, frame, fps = 14 }) {
 // first row of the questions' region while a header is pinned.
 export async function openingBanner({ output = process.stdout, input = process.stdin, env = process.env, version = '', durationMs } = {}) {
   const idle = { release() {}, resume() {}, top: () => null };
-  const depth = Math.min(colorDepth(output, env), 8);
+  const depth = colorDepth(output, env);
   const still = env.VIKA_NO_ANIMATION === '1' || Boolean(env.CI);
   if (depth < 8 || still || (output.columns ?? 0) <= SCENE_WIDTH || (output.rows ?? 0) <= SCENE_HEIGHT + 2) {
     await playBanner({ output, input, env, version });
@@ -359,7 +369,7 @@ export async function playBanner({
   loop = false,
   fps = 14,
 } = {}) {
-  const depth = Math.min(colorDepth(output, env), 8);
+  const depth = colorDepth(output, env);
   const columns = output.columns ?? 80;
   const animate = depth >= 8 && columns > SCENE_WIDTH && (output.rows ?? 24) > SCENE_HEIGHT + 2;
   if (!animate) {
