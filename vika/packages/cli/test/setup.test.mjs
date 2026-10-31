@@ -1092,7 +1092,7 @@ test('Feishu is offered with the account it needs; a scan by one that cannot run
   };
   assert.equal(await setupCommand(h.options), 0);
   const output = h.written();
-  assert.match(output, /1\) 飞书 {2}个人版（手机号注册）或公司的飞书账号；用豆包账号登录的飞书接不了\n/);
+  assert.match(output, /1\) 飞书 {2}手机号注册的飞书账号（注册时会建一个免费企业，你是管理员）或公司的飞书账号；用豆包账号登录的飞书不行\n/);
   // Said after the screen comes back to the confirmation, then asked again.
   assert.match(output, new RegExp(`⚠ ${notice}\\n[\\s\\S]*将添加实例 primary[\\s\\S]*开始扫码？`));
   assert.equal(h.manifest().agents[0].displayName, '小V');
@@ -1116,7 +1116,7 @@ test('an App ID typed in whose account cannot run bots is told so, not called wr
   h.options.fetchImpl = async () => ({ json: async () => ({ code: 21001, msg: 'access denied by access control policy' }) });
   await assert.rejects(setupCommand(h.options), { name: 'PromptAborted' });
   const output = h.written();
-  assert.match(output, /平台不给这个应用发访问凭证\n  ⚠ 飞书不给应用 cli_doubao 发访问凭证（tenant_access_token failed: code=21001 access denied by access control policy）：它所在的飞书账号不能运行机器人，用豆包账号登录的飞书就是这样。换一个个人版（手机号注册）或公司飞书账号下的应用/);
+  assert.match(output, /平台不给这个应用发访问凭证\n  ⚠ 飞书不给应用 cli_doubao 发访问凭证（tenant_access_token failed: code=21001 access denied by access control policy）：它所在的飞书账号不能运行机器人，用豆包账号登录的飞书就是这样。换一个手机号注册的飞书账号（注册时会建一个免费企业，你是管理员）或公司的飞书账号下的应用/);
   assert.doesNotMatch(output, /App ID 或 App Secret 不对/);
 });
 
@@ -1323,7 +1323,7 @@ test('an app made by an account that cannot run bots goes back to the questions,
   const error = await connectLark({ plan: { displayName: 'Vika' }, prompter, larkCli, fetchImpl: policyRefused, profile: 'vika-new',
     source: 'create', register }).then(() => null, (rejected) => rejected);
   assert.equal(error?.name, 'GoBack');
-  assert.match(error.notice, /飞书不给应用 cli_doubao 发访问凭证（tenant_access_token failed: code=21001 access denied by access control policy）：它所在的飞书账号不能运行机器人，用豆包账号登录的飞书就是这样。这个应用已经建好但用不了，可以在开放平台删掉。换个人版（手机号注册）或公司的飞书账号重新扫码，或者回去不接飞书/);
+  assert.match(error.notice, /飞书不给应用 cli_doubao 发访问凭证（tenant_access_token failed: code=21001 access denied by access control policy）：它所在的飞书账号不能运行机器人，用豆包账号登录的飞书就是这样。这个应用已经建好但用不了，可以在开放平台删掉。用手机号注册的飞书账号（注册时会建一个免费企业，你是管理员）或公司的飞书账号重新扫码，或者回去不接飞书/);
   assert.match(written(), /已创建应用 cli_doubao/);
   assert.deepEqual(larkCli.calls, [], 'no profile, no owner authorization');
 

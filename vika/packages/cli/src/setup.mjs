@@ -153,19 +153,24 @@ const webhookRefusal = () => t(
 // Feishu signed in with a Doubao account makes and publishes an app, but the
 // platform never gives the app a token (LarkPolicyError): it cannot run a
 // bot. Said where Feishu is first offered, and again when it happens.
-const larkAccountNote = () => t('个人版（手机号注册）或公司的飞书账号；用豆包账号登录的飞书接不了',
-  'a personal Feishu/Lark account (registered with a phone number) or a company one; Feishu signed in with a Doubao account cannot be connected');
+// Registering with a phone number makes an organization (Feishu's help
+// center: 注册即视为你创建了一个企业), so that is what the owner is told.
+const larkAccounts = () => t('手机号注册的飞书账号（注册时会建一个免费企业，你是管理员）或公司的飞书账号',
+  'a Feishu/Lark account registered with a phone number (registering makes a free organization you administer) or a company one');
+
+const larkAccountNote = () => t(`${larkAccounts()}；用豆包账号登录的飞书不行`,
+  `${larkAccounts()}; Feishu signed in with a Doubao account will not do`);
 
 // Why the platform gives the app no token, and what to do instead. `made`:
 // the scan has just made the app, which stays there unusable; `typed`: the
 // App ID was typed in, so another app is what to try.
 const policyRefusal = (appId, error, { made = false, typed = false } = {}) => t(
   `飞书不给应用 ${appId} 发访问凭证（${error.message}）：它所在的飞书账号不能运行机器人，用豆包账号登录的飞书就是这样。${made ? '这个应用已经建好但用不了，可以在开放平台删掉。' : ''}${typed
-    ? '换一个个人版（手机号注册）或公司飞书账号下的应用，或者不接飞书，先用微信等其他渠道。'
-    : '换个人版（手机号注册）或公司的飞书账号重新扫码，或者回去不接飞书，先用微信等其他渠道。'}`,
+    ? `换一个${larkAccounts()}下的应用，或者不接飞书，先用微信等其他渠道。`
+    : `用${larkAccounts()}重新扫码，或者回去不接飞书，先用微信等其他渠道。`}`,
   `Feishu/Lark gives the app ${appId} no token (${error.message}): the account it belongs to cannot run bots, as with Feishu signed in with a Doubao account. ${made ? 'The app was made but cannot be used; you may delete it in the developer console. ' : ''}${typed
-    ? 'Use an app of a personal account (registered with a phone number) or a company one, or connect another IM such as WeChat instead.'
-    : 'Scan again with a personal account (registered with a phone number) or a company one, or go back and connect another IM such as WeChat instead.'}`,
+    ? `Use an app of ${larkAccounts()}, or connect another IM such as WeChat instead.`
+    : `Scan again with ${larkAccounts()}, or go back and connect another IM such as WeChat instead.`}`,
 );
 
 const ims = (state) => state.connectors.filter((connector) => connector !== 'email');
