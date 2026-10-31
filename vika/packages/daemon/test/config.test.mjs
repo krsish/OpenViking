@@ -217,6 +217,16 @@ describe('configuration safety', { concurrency: false }, () => {
     assert.throws(() => getConfig(), /VIKA_PI_EFFORT/);
   });
 
+  it('accepts the durable runtime model and thinking-level effort', () => {
+    setEnv('VIKA_DURABLE_MODEL', 'anthropic/claude-sonnet-4');
+    setEnv('VIKA_DURABLE_EFFORT', 'low');
+    const config = getConfig();
+    assert.equal(config.durableModel, 'anthropic/claude-sonnet-4');
+    assert.equal(config.durableEffort, 'low');
+    setEnv('VIKA_DURABLE_EFFORT', 'turbo');
+    assert.throws(() => getConfig(), /VIKA_DURABLE_EFFORT/);
+  });
+
   it('loads the managed-agent seed session without exposing the API key publicly', () => {
     setEnv('ARK_API_KEY', 'secret-test-key');
     setEnv('VIKA_MODEL', 'ark');

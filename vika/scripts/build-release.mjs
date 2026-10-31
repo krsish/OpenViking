@@ -119,6 +119,7 @@ async function buildPlatform({ stage, platformId, version, commit, nodeVersion, 
       + `${run(path.join(root, 'node', 'bin', 'node'), [path.join(root, 'packages', 'cli', 'bin', 'vika.mjs'), '--version'])}, `
       + `${run(path.join(root, 'node_modules', '@larksuite', 'cli', 'bin', 'lark-cli'), ['--version'])}`);
     run(path.join(root, 'node', 'bin', 'node'), [path.join(root, 'packages', 'daemon', 'scripts', 'check-pi.mjs')]);
+    run(path.join(root, 'node', 'bin', 'node'), [path.join(root, 'packages', 'daemon', 'scripts', 'check-durable.mjs')]);
     run(slack.bin, ['version', '--skip-update', '--no-color']);
     say(run(path.join(root, 'node', 'bin', 'node'), [path.join(root, 'packages', 'daemon', 'scripts', 'check-agent-clis.mjs')]));
   }

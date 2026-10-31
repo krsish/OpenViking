@@ -612,7 +612,7 @@ export class PiAgent {
           summary: `extension ${message.method}`, metadata: { runtime: 'pi', method: message.method },
         });
         if (this.onMcpStartup) {
-          // Pi 1.2.0 installs its stdin reader only after session_start handlers
+          // Pi 1.4.0 installs its stdin reader only after session_start handlers
           // finish. A startup dialog cannot consume our cancellation response.
           this.onMcpStartup(false, new Error('Pi extension requested an interactive dialog during startup; disable its startup prompt for this unattended daemon'));
           return;

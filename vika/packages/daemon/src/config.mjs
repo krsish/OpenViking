@@ -235,6 +235,15 @@ export function getConfig() {
       'medium',
       ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
     ),
+    // Durable harness (built-in @earendil-works/pi-durable host). The model is
+    // spoken as provider/modelId; the effort set matches pi-durable thinking
+    // levels.
+    durableModel: process.env.VIKA_DURABLE_MODEL || '',
+    durableEffort: enumEnv(
+      'VIKA_DURABLE_EFFORT',
+      'medium',
+      ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+    ),
     volcApiKey: process.env.ARK_API_KEY || '',
     volcSessionId: process.env.VIKA_VOLC_SESSION_ID
       || process.env.ARK_SESSION_ID
