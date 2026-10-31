@@ -8,7 +8,7 @@ _Avoid_: putting provider polling, webhooks, or long connections in Core
 
 **Core**:
 The process that owns the shared AgentRuntime session, OpenViking session, inbox pipeline, and the outbound ActionService with its outbox.
-_Avoid_: Lark daemon when discussing provider-neutral behavior
+_Avoid_: naming Core after one provider (a Lark or Weixin bot) when discussing provider-neutral behavior
 
 ## Language
 
