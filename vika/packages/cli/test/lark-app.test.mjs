@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-  CALLBACKS, EVENTS, grantedUserScopes, inspectApp, lacksAny, missingConfig, missingScopes, scanApp,
+  CALLBACKS, EVENTS, LarkCredentialsError, LarkPolicyError, grantedUserScopes, inspectApp, lacksAny, missingConfig, missingScopes, scanApp,
 } from '../src/lark-app.mjs';
 
 const SCOPES = { tenant: ['im:message:send_as_bot', 'im:message.group_msg'], user: ['search:message'] };
@@ -129,6 +129,16 @@ test('refused credentials are told apart from an app whose settings cannot be re
     ? { code: 0, tenant_access_token: 't' } : { code: 99991672, msg: 'no permission' }) });
   await assert.rejects(inspectApp({ appId: 'cli_1', appSecret: 's', brand: 'lark' }, { fetchImpl }),
     (error) => error.name === 'Error' && /code=99991672/.test(error.message));
+});
+
+test('a token the account\'s policy refuses is told apart from wrong credentials', async () => {
+  const policy = platform({ token: { code: 21001, msg: 'access denied by access control policy' } });
+  await assert.rejects(inspectApp({ appId: 'cli_1', appSecret: 's', brand: 'feishu' }, { fetchImpl: policy.fetchImpl }),
+    (error) => error instanceof LarkPolicyError && error instanceof LarkCredentialsError && error.code === 21001
+      && /code=21001 access denied by access control policy/.test(error.message));
+  const wrong = platform({ token: { code: 10014, msg: 'app secret invalid' } });
+  await assert.rejects(inspectApp({ appId: 'cli_1', appSecret: 'bad', brand: 'feishu' }, { fetchImpl: wrong.fetchImpl }),
+    (error) => error instanceof LarkCredentialsError && !(error instanceof LarkPolicyError));
 });
 
 test('the owner is asked only for user scopes the app has, unless it has none of them', async () => {

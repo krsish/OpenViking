@@ -9,7 +9,7 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { Prompter } from '../src/prompt.mjs';
+import { GoBack, Prompter } from '../src/prompt.mjs';
 import { connectLark, larkMessageListener, larkScopes, registerApp, setupCommand } from '../src/setup.mjs';
 import { stripAnsi } from '../src/ui.mjs';
 import { connectTelegram } from '../src/telegram.mjs';
@@ -1079,6 +1079,47 @@ test('typing the App ID and App Secret is a question like the others: checked at
   assert.doesNotMatch(JSON.stringify(h.manifest()), /sec"/);
 });
 
+test('Feishu is offered with the account it needs; a scan by one that cannot run bots comes back to the confirmation with the answers kept', async (t) => {
+  //                   name    role ws  runtime IMs  feishu  confirm  confirm again
+  const h = harness(t, ['小V', '',  '', '1',    '1', '',     'y',     'y']);
+  const notice = '飞书不给应用 cli_doubao 发访问凭证：豆包账号';
+  let tries = 0;
+  h.options.connect.lark = async ({ plan, profile }) => {
+    tries += 1;
+    h.calls.push(['lark', plan.id, profile]);
+    if (tries === 1) throw new GoBack(notice);
+    return { profile, ownerOpenId: 'ou_owner' };
+  };
+  assert.equal(await setupCommand(h.options), 0);
+  const output = h.written();
+  assert.match(output, /1\) 飞书 {2}个人版（手机号注册）或公司的飞书账号；用豆包账号登录的飞书接不了\n/);
+  // Said after the screen comes back to the confirmation, then asked again.
+  assert.match(output, new RegExp(`⚠ ${notice}\\n[\\s\\S]*将添加实例 primary[\\s\\S]*开始扫码？`));
+  assert.equal(h.manifest().agents[0].displayName, '小V');
+  assert.deepEqual(h.calls.map((call) => call[0]), ['lark', 'lark', 'start', 'restart', 'start', 'greet']);
+});
+
+test('changing the app to one whose account cannot run bots comes back to the list, saying why, with nothing saved', async (t) => {
+  //                    change asd  飞书应用  create  save  discard
+  const h = harness(t, ['2',        '6',      '2',    '11', '12']);
+  const before = existing(h, {});
+  h.options.connect.lark = async () => { throw new GoBack('飞书不给应用 cli_doubao 发访问凭证'); };
+  assert.equal(await setupCommand(h.options), 0);
+  assert.match(h.written(), /⚠ 飞书不给应用 cli_doubao 发访问凭证\n[\s\S]*6\) 飞书应用\s+扫码新建一个机器人（已改）/);
+  assert.match(h.written(), /已放弃，没有保存任何改动/);
+  assert.deepEqual(h.manifest().agents, [before]);
+});
+
+test('an App ID typed in whose account cannot run bots is told so, not called wrong', async (t) => {
+  //                   name role ws  runtime IMs  by hand  App ID        secret  tenant  again?
+  const h = harness(t, ['', '',  '', '1',    '1', '3',     'cli_doubao', 's',    '',     'n']);
+  h.options.fetchImpl = async () => ({ json: async () => ({ code: 21001, msg: 'access denied by access control policy' }) });
+  await assert.rejects(setupCommand(h.options), { name: 'PromptAborted' });
+  const output = h.written();
+  assert.match(output, /平台不给这个应用发访问凭证\n  ⚠ 飞书不给应用 cli_doubao 发访问凭证（tenant_access_token failed: code=21001 access denied by access control policy）：它所在的飞书账号不能运行机器人，用豆包账号登录的飞书就是这样。换一个个人版（手机号注册）或公司飞书账号下的应用/);
+  assert.doesNotMatch(output, /App ID 或 App Secret 不对/);
+});
+
 test('an instance with Feishu can switch to another app; the bot takes the app\'s name unless the owner keeps theirs', async (t) => {
   //                    change asd  飞书应用  pick existing  save  call it 小助手
   const h = harness(t, ['2',        '6',      '3',           '11', 'y']);
@@ -1258,15 +1299,39 @@ test('connecting a picked app: another instance on it is a warning, what it lack
     fetchImpl: pickedApp(granted), profile: 'vika-new', source: 'select', others, register }), { name: 'GoBack' });
   assert.deepEqual(declined.calls, []);
 
-  // A bot on a webhook is refused before anything is asked or written.
+  // A bot on a webhook is refused before anything is asked or written; why
+  // goes back with it, for setup to say where it comes back to.
   const hooked = fakeLarkCli([{ name: 'vika-other', appId: 'cli_old' }]);
   const refused = pipePrompter([]);
   await assert.rejects(connectLark({ plan: { displayName: 'Vika' }, prompter: refused.prompter, larkCli: hooked,
     fetchImpl: pickedApp(granted, { callbacks: { callback_type: 'webhook', subscribed_callbacks: ['card.action.trigger'] } }),
-    profile: 'vika-new', source: 'select', others, register }), { name: 'GoBack' });
-  assert.match(refused.written(), /这个机器人的卡片回调走 webhook，事件多半也是，Vika 接不了/);
+    profile: 'vika-new', source: 'select', others, register }),
+  (error) => error.name === 'GoBack' && /这个机器人的卡片回调走 webhook，事件多半也是，Vika 接不了/.test(error.notice));
   assert.doesNotMatch(refused.written(), /仍然用这个应用/);
   assert.deepEqual(hooked.calls, []);
+});
+
+// The platform as an app of a Doubao-account Feishu sees it: the app is
+// there, its token never is.
+const policyRefused = async (url) => ({ json: async () => (url.endsWith('/tenant_access_token/internal')
+  ? { code: 21001, msg: 'access denied by access control policy' } : { code: 0 }) });
+
+test('an app made by an account that cannot run bots goes back to the questions, saying why; nothing is written', async () => {
+  const larkCli = fakeLarkCli();
+  const { prompter, written } = pipePrompter([]);
+  const register = async () => ({ client_id: 'cli_doubao', client_secret: 's', user_info: { open_id: 'ou_doubao', tenant_brand: 'feishu' } });
+  const error = await connectLark({ plan: { displayName: 'Vika' }, prompter, larkCli, fetchImpl: policyRefused, profile: 'vika-new',
+    source: 'create', register }).then(() => null, (rejected) => rejected);
+  assert.equal(error?.name, 'GoBack');
+  assert.match(error.notice, /飞书不给应用 cli_doubao 发访问凭证（tenant_access_token failed: code=21001 access denied by access control policy）：它所在的飞书账号不能运行机器人，用豆包账号登录的飞书就是这样。这个应用已经建好但用不了，可以在开放平台删掉。换个人版（手机号注册）或公司的飞书账号重新扫码，或者回去不接飞书/);
+  assert.match(written(), /已创建应用 cli_doubao/);
+  assert.deepEqual(larkCli.calls, [], 'no profile, no owner authorization');
+
+  // Picked, not made: there is nothing new to delete.
+  const picked = await connectLark({ plan: { displayName: 'Vika' }, prompter: pipePrompter([]).prompter, larkCli: fakeLarkCli(),
+    fetchImpl: policyRefused, profile: 'vika-new', source: 'select', register }).then(() => null, (rejected) => rejected);
+  assert.equal(picked?.name, 'GoBack');
+  assert.doesNotMatch(picked.notice, /已经建好/);
 });
 
 test('connecting an app typed in: no scan for it, and how its events arrive is left to check', async () => {

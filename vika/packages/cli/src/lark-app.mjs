@@ -35,6 +35,19 @@ export class LarkCredentialsError extends Error {
   }
 }
 
+// The App ID and App Secret are right, but the access policy of the account
+// the app belongs to refuses it a token (21001, as lark-cli classifies it).
+// Feishu signed in with a Doubao account is refused so: it can make and
+// publish an app, never run it.
+export class LarkPolicyError extends LarkCredentialsError {
+  constructor(code, message) {
+    super(code, message);
+    this.name = 'LarkPolicyError';
+  }
+}
+
+const POLICY_REFUSED = 21001;
+
 export function openApiBase(brand) {
   return brand === 'lark' ? 'https://open.larksuite.com' : 'https://open.feishu.cn';
 }
@@ -95,7 +108,8 @@ export async function tenantToken({ appId, appSecret, brand }, { fetchImpl = glo
   });
   const token = await response.json().catch(() => ({ code: -1, msg: `HTTP ${response.status} without JSON` }));
   if (token.code !== 0 || !token.tenant_access_token) {
-    throw new LarkCredentialsError(token.code, `tenant_access_token failed: code=${token.code} ${token.msg ?? ''}`.trim());
+    const Refused = token.code === POLICY_REFUSED ? LarkPolicyError : LarkCredentialsError;
+    throw new Refused(token.code, `tenant_access_token failed: code=${token.code} ${token.msg ?? ''}`.trim());
   }
   return token.tenant_access_token;
 }
