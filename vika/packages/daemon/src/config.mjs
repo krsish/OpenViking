@@ -271,6 +271,9 @@ export function getConfig() {
     // Opt-in per instance (agents[].stagedReplies): a longer task may get an
     // OnIt and interim findings before its final delivery.
     stagedReplies: boolEnv('VIKA_STAGED_REPLIES', false),
+    // Opt-in per instance (agents[].meetingNotes), on one instance at most:
+    // the owner's Feishu/Lark meeting notes are stored in OV.
+    meetingNotes: boolEnv('VIKA_MEETING_NOTES', false) && connectors.includes('lark'),
     historyLimit: intEnv('VIKA_HISTORY_LIMIT', 30, { min: 0, max: 200 }),
     // Replies to bot messages in one chat/thread with no person writing there
     // before the safety fuse holds further ones; 0 turns the fuse off.

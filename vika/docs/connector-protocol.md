@@ -199,6 +199,13 @@ the extension field `data.archive` records where, and the Core's `read_email`
 tool reads it back. This is the email Connector's own use of OpenViking, not
 the future `sync` capability.
 
+The Lark Connector of the one instance that stores meeting notes
+(`agents[].meetingNotes`) likewise writes each AI note of the owner's meetings
+to OpenViking (`viking://user/<user>/resources/meetings/<meeting_id>/`), found
+by scanning the owner's meetings every 15 minutes. Nothing of it becomes a
+protocol EVENT or reaches the Core; the Core's `read_meeting_note` tool reads
+the stored notes.
+
 An optional `instance=` is included when it differs from
 `source=`. Tag values percent-encode whitespace, brackets and `%`, so an id
 copied from a tag decodes back to the exact id. Untrusted content is

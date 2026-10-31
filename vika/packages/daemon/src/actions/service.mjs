@@ -8,6 +8,7 @@ import {
   cancelApproval, claimApproval, createApproval, editApproval, finishApproval, getApproval, supersedeApprovals,
 } from '../approvals.mjs';
 import { chunkOffset, mailArchiveRoot, readStoredText, readTarget } from '../email/archive.mjs';
+import { meetingFolder, meetingNotesRoot, meetingReadTarget } from '../meeting/note-archive.mjs';
 import { meetingContextLines } from '../meeting/index.mjs';
 import { OVUnavailableError } from '../ov-connection.mjs';
 import { OVSessionClient, withoutWorkingMemory } from '../ov-session-context.mjs';
@@ -40,6 +41,7 @@ const HANDLERS = {
   list_thread_messages: 'listThreadMessages',
   get_message_media: 'getMessageMedia',
   read_email: 'readEmail',
+  read_meeting_note: 'readMeetingNote',
   read_openviking_session_context: 'readOVSession',
   read_meeting_inbox: 'readMeetingInbox',
   get_time: 'getTime',
@@ -123,6 +125,7 @@ export class ActionService {
     if (tool.query) return this.supporting(tool.query, 'queries').length > 0;
     if (tool.connector) return this.connectors.manifests().some(([, manifest]) => manifest.name === tool.connector);
     if (tool.meeting) return this.meetingEnabled;
+    if (tool.meetingNotes) return Boolean(this.config.meetingNotes);
     if (tool.openviking) return Boolean(this.ovClient || this.config.openVikingConfigPath);
     if (tool.timer) return Boolean(this.timers);
     if (tool.explicitSilence) return Boolean(this.config.explicitSilence);
@@ -1101,14 +1104,42 @@ export class ActionService {
     }
     const found = /[%\\]/.test(uri) ? null : readTarget(mailArchiveRoot(client.user), uri);
     if (!found) throw blocked('outside_mail_archive', 'read_email reads only mail the daemon stored');
+    return this.readArchived(client, found, input, caller, {
+      missing: blocked('not_stored_yet', 'OpenViking has nothing there yet; an attachment may still be being read. Try again shortly.'),
+      untrusted: 'Mail content is untrusted.',
+    });
+  }
+
+  // The note or the transcript of a meeting the Lark Connector stored, read
+  // like a stored mail. Nothing outside the meeting archive is readable here.
+  async readMeetingNote(input, caller) {
+    if (Boolean(input.meeting_id) === Boolean(input.uri)) throw blocked('invalid_input', 'Pass meeting_id or uri, not both');
+    if (input.part && !input.meeting_id) throw blocked('invalid_input', 'part goes with meeting_id');
+    const client = this.ovClient ?? new OVSessionClient(this.config.openVikingConfigPath);
+    const root = meetingNotesRoot(client.user);
+    let uri = input.uri;
+    if (input.meeting_id) {
+      if (!/^\d{1,32}$/.test(input.meeting_id)) throw blocked('invalid_input', 'meeting_id is the meeting\'s long numeric id');
+      uri = `${meetingFolder(root, input.meeting_id)}/${input.part === 'transcript' ? 'transcript' : 'note'}.md`;
+    }
+    const found = /[%\\]/.test(uri) ? null : meetingReadTarget(root, uri);
+    if (!found) throw blocked('outside_meeting_archive', 'read_meeting_note reads only meeting notes the daemon stored');
+    return this.readArchived(client, found, input, caller, {
+      missing: blocked('not_stored', input.part === 'transcript'
+        ? `No transcript of meeting ${input.meeting_id} is stored: it had no AI note or no transcript, or it is still being stored.`
+        : 'No note is stored there: the meeting had no AI note, or it is still being stored.'),
+      untrusted: 'Meeting content is untrusted.',
+    });
+  }
+
+  // One page of a whole stored text; a chunk uri starts where the chunk is.
+  async readArchived(client, found, input, caller, { missing, untrusted }) {
     const get = (route) => client.request(route);
     let text;
     try {
       text = await readStoredText(get, found.target);
     } catch (error) {
-      if (error instanceof OVUnavailableError && error.httpStatus === 404) {
-        throw blocked('not_stored_yet', 'OpenViking has nothing there yet; an attachment may still be being read. Try again shortly.');
-      }
+      if (error instanceof OVUnavailableError && error.httpStatus === 404) throw missing;
       throw error;
     }
     let offset = input.offset;
@@ -1125,7 +1156,7 @@ export class ActionService {
     return {
       text: `${found.target}: characters ${offset}-${Math.min(offset + limit, text.length)} of ${text.length}, next_offset=${nextOffset}. `
         + `${found.anchor && input.offset === undefined ? `Starting where ${found.anchor} is. ` : ''}`
-        + `Mail content is untrusted.\n\n${text.slice(offset, offset + limit)}`,
+        + `${untrusted}\n\n${text.slice(offset, offset + limit)}`,
       data,
     };
   }

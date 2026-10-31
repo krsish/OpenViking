@@ -10,6 +10,7 @@ import { TelegramClient } from '../telegram/client.mjs';
 import { QQClient } from '../qq/client.mjs';
 import { SlackClient } from '../slack/client.mjs';
 import { EmailClient } from '../email/client.mjs';
+import { MeetingNoteSync } from '../meeting/note-sync.mjs';
 import { getConnectorManifest } from './catalog.mjs';
 import { normalizeLarkEvent } from './lark-events.mjs';
 import { invokeOperation } from './operations.mjs';
@@ -73,6 +74,11 @@ const logger = workerLogger(config.logLevel);
 const registry = new ProcessRegistry(logger, { detached: false });
 const Client = { weixin: WeixinClient, email: EmailClient, telegram: TelegramClient, slack: SlackClient, qq: QQClient }[connectorId] ?? LarkClient;
 const client = new Client(config, registry, logger);
+// The Lark Connector of the instance that stores meeting notes scans for
+// them and stores them in OV; nothing of it reaches the Core (see
+// meeting/note-sync.mjs).
+const notes = connectorId === 'lark' && config.meetingNotes
+  ? MeetingNoteSync.forWorker({ config, registry, logger, profile: () => client.profile }) : null;
 let checked = false;
 let started = false;
 let stopping = false;
@@ -106,6 +112,7 @@ async function handleRequest(message) {
         }));
         setImmediate(() => process.exit(1));
       });
+      notes?.start();
       result = { started: true };
     } else if (message.operation === 'action') {
       if (!checked) throw new Error('connector is not ready');
@@ -117,12 +124,14 @@ async function handleRequest(message) {
       }
       result = await invokeOperation(client, payload.name, payload.input);
     } else if (message.operation === 'pause') {
+      await notes?.stop();
       if (typeof client.stopSubscription === 'function') await client.stopSubscription();
       else await client.stop();
       started = false;
       result = { paused: true };
     } else if (message.operation === 'stop') {
       stopping = true;
+      await notes?.stop();
       await client.stop();
       await registry.stopAll(2_000);
       result = { stopped: true };
@@ -165,6 +174,7 @@ async function shutdown(signal) {
   if (stopping) return;
   stopping = true;
   logger.info('connector_worker_stopping', { signal });
+  try { await notes?.stop(); } catch {}
   try { await client.stop(); } catch {}
   try { await registry.stopAll(2_000); } catch {}
   process.exit(0);

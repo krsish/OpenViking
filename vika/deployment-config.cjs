@@ -74,6 +74,7 @@ const AGENT_FIELDS = Object.freeze([
   'model',
   'volcSessionId',
   'volcEnvironmentId',
+  'meetingNotes',
   'emailAccounts',
 ]);
 // The roles shipped with the release (packages/daemon/agent/roles/<name>.md).
@@ -272,6 +273,12 @@ function parseAgent(value, index, ignored) {
   if (value.stagedReplies !== undefined && typeof value.stagedReplies !== 'boolean') {
     throw new Error(`${label}.stagedReplies must be a boolean`);
   }
+  if (value.meetingNotes !== undefined && typeof value.meetingNotes !== 'boolean') {
+    throw new Error(`${label}.meetingNotes must be a boolean`);
+  }
+  if (value.meetingNotes && !connectors.includes('lark')) {
+    throw new Error(`${label}.meetingNotes requires the lark connector`);
+  }
   return Object.freeze({
     id,
     displayName: manifestString(value.displayName, `${label}.displayName`, { maxLength: 40 }),
@@ -291,6 +298,7 @@ function parseAgent(value, index, ignored) {
     model,
     volcSessionId,
     volcEnvironmentId,
+    meetingNotes: value.meetingNotes ?? false,
     emailAccounts: Object.freeze(emailAccounts),
   });
 }
@@ -341,6 +349,11 @@ function assertUniqueAgentFields(agents) {
   for (const { config } of agents.flatMap((agent) => agent.emailAccounts)) {
     if (accountFiles.has(config)) throw new Error(`duplicate email account file: ${config}`);
     accountFiles.add(config);
+  }
+  // Each would store every meeting note of the owner again.
+  const storingNotes = agents.filter((agent) => agent.meetingNotes).map((agent) => agent.id);
+  if (storingNotes.length > 1) {
+    throw new Error(`only one instance can store meeting notes; ${storingNotes.join(' and ')} both do`);
   }
 }
 
@@ -483,6 +496,7 @@ function applyDeploymentAgentEnv(env, deployment, requestedId) {
   env.VIKA_EXPLICIT_SILENCE = agent.explicitSilence ? 'true' : 'false';
   env.VIKA_NATURAL_WRITING = agent.naturalWriting ? 'true' : 'false';
   env.VIKA_STAGED_REPLIES = agent.stagedReplies ? 'true' : 'false';
+  env.VIKA_MEETING_NOTES = agent.meetingNotes ? 'true' : 'false';
   if (agent.role) env.VIKA_ROLE = agent.role;
   else delete env.VIKA_ROLE;
   env.VIKA_CHANNEL = agent.channel;

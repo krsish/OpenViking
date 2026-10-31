@@ -75,13 +75,16 @@ function writeExecutable(file, source) {
 // env.receive) from the start until SIGTERM; +messages-reply
 // and +messages-send append their argv to REPLIES. Everything else gets a
 // generic ok JSON so best-effort lookups (roster, chat names) degrade quietly.
+// Every call's argv goes to CALLS.
 function fakeLarkSource(dir) {
   return `
     import fs from 'node:fs';
     const EVENTS = ${JSON.stringify(path.join(dir, 'events.ndjson'))};
     const REPLIES = ${JSON.stringify(path.join(dir, 'replies.ndjson'))};
     const SUBSCRIBER = ${JSON.stringify(path.join(dir, 'subscriber.pid'))};
+    const CALLS = ${JSON.stringify(path.join(dir, 'lark-calls.ndjson'))};
     const args = process.argv.slice(2);
+    fs.appendFileSync(CALLS, JSON.stringify(args) + '\\n');
     if (args.includes('--version')) { console.log('lark-cli 1.0.56'); process.exit(0); }
     if (args.includes('--help')) {
       console.log('--event-types --quiet +messages-reply +messages-send +chat-list');
@@ -286,6 +289,11 @@ export async function startMockEnv({
     // argv of every outbound lark-cli reply/send call.
     replies() {
       return readLines(path.join(dir, 'replies.ndjson')).map((line) => JSON.parse(line));
+    },
+
+    // argv of every lark-cli call.
+    larkCalls() {
+      return readLines(path.join(dir, 'lark-calls.ndjson')).map((line) => JSON.parse(line));
     },
 
     // Drop the live Lark subscription, as a lost long connection would.

@@ -456,6 +456,37 @@ test('staged replies are opt-in per instance and always pinned in the daemon env
   });
 });
 
+test('meeting notes are opt-in for one Feishu/Lark instance at most, and always pinned in the daemon env', () => {
+  const manifest = validManifest();
+  manifest.agents[1].meetingNotes = true;
+  withManifest(manifest, (manifestPath) => {
+    const env = { VIKA_CONFIG: manifestPath, VIKA_MEETING_NOTES: 'true' };
+    const deployment = loadDeploymentManifest(env);
+    assert.equal(selectDeploymentAgent(deployment, 'alpha').meetingNotes, false);
+    applyDeploymentAgentEnv(env, deployment, 'alpha');
+    assert.equal(env.VIKA_MEETING_NOTES, 'false');
+    applyDeploymentAgentEnv(env, deployment, 'beta');
+    assert.equal(env.VIKA_MEETING_NOTES, 'true');
+  });
+  const two = validManifest();
+  two.agents[0].meetingNotes = true;
+  two.agents[2].meetingNotes = true;
+  withManifest(two, (manifestPath) => {
+    assert.throws(() => loadDeploymentManifest({ VIKA_CONFIG: manifestPath }), /only one instance can store meeting notes; alpha and gamma both do/);
+  });
+  const weixin = validManifest();
+  Object.assign(weixin.agents[1], { channel: 'weixin', connectors: ['weixin'], meetingNotes: true });
+  delete weixin.agents[1].profile;
+  withManifest(weixin, (manifestPath) => {
+    assert.throws(() => loadDeploymentManifest({ VIKA_CONFIG: manifestPath }), /agents\[1\]\.meetingNotes requires the lark connector/);
+  });
+  const broken = validManifest();
+  broken.agents[0].meetingNotes = 'yes';
+  withManifest(broken, (manifestPath) => {
+    assert.throws(() => loadDeploymentManifest({ VIKA_CONFIG: manifestPath }), /agents\[0\]\.meetingNotes must be a boolean/);
+  });
+});
+
 test('an instance names a shipped role or its own role file, and keeps natural writing unless it turns it off', () => {
   const manifest = validManifest();
   manifest.agents[0].role = 'assistant';

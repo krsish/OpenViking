@@ -139,6 +139,24 @@ describe('daemon event path (mock env)', { concurrency: false }, () => {
     }
   });
 
+  it('the Lark Connector of the instance that stores meeting notes scans for them as the owner, and nothing reaches the agent', async () => {
+    const env = await startMockEnv({
+      config: { meetingNotes: true },
+      prepare: (dir) => fs.writeFileSync(path.join(dir, 'ov-config.json'), JSON.stringify({ url: 'http://127.0.0.1:9', user: 'e2e-user' })),
+    });
+    try {
+      const searching = (args) => args.includes('+search') && args.includes('vc') && args.includes('user');
+      await env.waitFor(() => env.larkCalls().some(searching));
+      await env.waitFor(() => fs.existsSync(path.join(env.config.dataDir, 'meeting-notes', 'meetings.sqlite3')));
+      const listening = env.larkCalls().find((args) => args.includes('+subscribe') && !args.includes('--help'));
+      assert.doesNotMatch(listening[listening.indexOf('--event-types') + 1], /vc\.note|vc\.meeting\./, 'no meeting event is asked for');
+      assert.ok(!env.larkCalls().some((args) => args.some((arg) => String(arg).includes('subscription'))), 'nothing is subscribed');
+      env.receive(textMessage({ messageId: 'om-after-scan', text: 'after the scan' }));
+      await env.waitForCodexInput(/om-after-scan/);
+      assert.ok(!env.codexInput().some(({ text }) => /meeting/.test(text)), 'the agent hears nothing of it');
+    } finally { await env.stop(); }
+  });
+
   it('batches an idle group burst into a single model turn', async () => {
     const env = await startMockEnv();
     try {

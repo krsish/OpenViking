@@ -125,6 +125,7 @@ export function assembleConversationPolicy(config = {}) {
     renderPrompt(config, 'events.md'),
     ...connectorSections(config),
     renderPrompt(config, 'openviking.md'),
+    config.meetingNotes ? renderPrompt(config, 'meeting-notes.md') : '',
     roleSection(config),
     naturalWritingSection(config),
     explicitSilencePromptSection(config),

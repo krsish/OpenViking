@@ -12,7 +12,7 @@ import { managedPiBin } from '../../daemon/src/pi-runtime.mjs';
 import { resolveRolePromptPath } from '../../daemon/src/conversation-policy.mjs';
 import { LarkCli } from './lark-cli.mjs';
 import {
-  LarkCredentialsError, grantedUserScopes, inspectApp, lacksAny, missingConfig, scanApp, tenantToken,
+  LarkCredentialsError, LarkRegistrationError, grantedUserScopes, inspectApp, lacksAny, missingConfig, readApp, scanApp, tenantToken,
 } from './lark-app.mjs';
 import {
   ROLE_PRESETS, WEB_PORT, allocatePort, availableInstanceOvConfig, instanceIdProblem, readManifest, suggestInstanceId, validateManifest, vikaCommand,
@@ -102,12 +102,27 @@ function larkSource(state, current) {
   return current && connectorsOf(current).includes('lark') ? 'keep' : 'create';
 }
 
-// The app as the settings list and the summaries show it.
-function larkAppShown(state, current) {
+// The app as the settings list and the summaries show it; `needs` is what
+// the current app lacks of this release (larkNeeds), when it lacks anything.
+function larkAppShown(state, current, needs = null) {
   const source = larkSource(state, current);
   if (source === 'manual' && state.larkApp?.app) return t(`应用 ${state.larkApp.app.appId}`, `the app ${state.larkApp.app.appId}`);
-  if (source === 'keep') return t('现在的应用', 'the current app');
+  if (source === 'keep' && state.larkRepair) {
+    return t(`现在的应用，保存时扫码补齐缺的 ${needs.count} 项`, `the current app; saving adds the ${needs.count} missing with a scan`);
+  }
+  if (source === 'keep') return needs ? t(`现在的应用（缺 ${needs.count} 项：${needsShown(needs)}）`, `the current app (${needs.count} missing: ${needsShown(needs)})`) : t('现在的应用', 'the current app');
   return larkSources().find(({ value }) => value === source)?.label ?? t('没有接', 'none');
+}
+
+// What larkNeeds found missing, in a few words.
+function needsShown({ missing, login }) {
+  const scopes = missing.scopes.tenant.length + missing.scopes.user.length;
+  return list([
+    ...(scopes ? [t(`${scopes} 个权限`, `${scopes} ${scopes === 1 ? 'permission' : 'permissions'}`)] : []),
+    ...(missing.events?.length ? [t('接收消息事件', 'the message event')] : []),
+    ...(missing.callbacks.length ? [t('卡片回调', 'the card callback')] : []),
+    ...(login.length ? [t('你的授权', 'your authorization')] : []),
+  ]);
 }
 
 // An app made elsewhere may already be someone's receiver. Picking one by
@@ -137,14 +152,18 @@ const webhookRefusal = () => t(
 
 const ims = (state) => state.connectors.filter((connector) => connector !== 'email');
 
-// Which instance to change, or a new one.
-async function chooseTarget(prompter, manifest) {
+// Which instance to change, or a new one. An instance whose Feishu/Lark app
+// lacks what this release needs says so; its 飞书应用 setting completes it.
+async function chooseTarget(prompter, manifest, lacking = []) {
   const agents = manifest?.agents ?? [];
   if (agents.length === 0) return null;
+  const needsOf = (agent) => lacking.find((needs) => needs.agent.id === agent.id);
   return prompter.select(t('要做什么', 'What to do'), [
     { label: t('新建一个实例', 'Add an instance'), value: null },
     ...agents.map((agent) => ({
-      label: t(`修改 ${agent.displayName}（${agent.id}）`, `Change ${agent.displayName} (${agent.id})`), hint: imList(connectorsOf(agent), agent.emailAccounts?.length), value: agent,
+      label: t(`修改 ${agent.displayName}（${agent.id}）`, `Change ${agent.displayName} (${agent.id})`),
+      hint: `${imList(connectorsOf(agent), agent.emailAccounts?.length)}${needsOf(agent) ? t(` · 飞书应用缺 ${needsOf(agent).count} 项`, ` · its Feishu/Lark app lacks ${needsOf(agent).count}`) : ''}`,
+      value: agent,
     })),
     { label: t('删除一个实例', 'Remove an instance'), value: 'remove' },
   ], { back: false });
@@ -360,6 +379,10 @@ async function askIms(ctx, state) {
   state.connectors = connectors;
   if (hadEmail && !connectors.includes('email')) dropMailboxes(state);
   if (!connectors.includes('lark')) state.larkApp = null;
+  if (!connectors.includes('lark') && state.switches.meetingNotes) {
+    state.switches.meetingNotes = false;
+    note(ctx, t('不再接飞书，会议纪要入库随之关掉', 'Without Feishu/Lark, meeting notes are switched off'));
+  }
   // When changing an instance, a newly ticked mailbox is connected right away,
   // and a newly ticked Feishu asks where its app comes from.
   if (ctx.menu && !hadEmail && connectors.includes('email')) await addMailboxes(ctx, state);
@@ -377,16 +400,21 @@ async function askLarkApp(ctx, state) {
     return;
   }
   const connected = Boolean(current && connectorsOf(current).includes('lark'));
+  const needs = connected ? ctx.larkNeeds : null;
   const choices = [
+    ...(needs ? [{ value: 'repair', label: t(`扫码补齐缺的 ${needs.count} 项`, `Add the ${needs.count} missing with a scan`),
+      hint: t(`${needsShown(needs)}；保存时扫码，你要是这个应用的所有者或管理员`, `${needsShown(needs)}; scanned on saving, by an owner or administrator of the app`) }] : []),
     ...(connected ? [{ value: 'keep', label: t('不换，用现在的应用', 'Keep the current app') }] : []),
     ...larkSources(),
   ];
+  const chosen = state.larkRepair ? 'repair' : larkSource(state, current);
   const mark = prompter.mark();
   for (;;) {
     const source = await prompter.select(t('飞书机器人', 'Feishu/Lark bot'), choices,
-      { initial: Math.max(0, choices.findIndex(({ value }) => value === larkSource(state, current))) });
+      { initial: Math.max(0, choices.findIndex(({ value }) => value === chosen)) });
+    state.larkRepair = source === 'repair';
     if (source !== 'manual') {
-      state.larkApp = source === 'keep' ? null : { source };
+      state.larkApp = ['keep', 'repair'].includes(source) ? null : { source };
       break;
     }
     try {
@@ -462,9 +490,27 @@ async function askMailboxes(ctx, state) {
 
 // The instance's on/off settings, under 其他设置, and what each is when the
 // manifest does not say.
-const SWITCH_DEFAULTS = Object.freeze({ stagedReplies: false, naturalWriting: true, explicitSilence: false, ovAutoRecall: false });
+const SWITCH_DEFAULTS = Object.freeze({ stagedReplies: false, naturalWriting: true, explicitSilence: false, ovAutoRecall: false, meetingNotes: false });
 // Switching one of these changes the model's policy: a new session.
-const POLICY_SWITCHES = new Set(['stagedReplies', 'naturalWriting', 'explicitSilence']);
+const POLICY_SWITCHES = new Set(['stagedReplies', 'naturalWriting', 'explicitSilence', 'meetingNotes']);
+
+// A new personal assistant or AI colleague on Feishu/Lark stores the owner's
+// meeting notes, unless another instance here already does; a Q&A bot, which
+// serves other people, does not.
+function defaultMeetingNotes(state, agents) {
+  return ['colleague', 'assistant'].includes(state.role) && state.connectors.includes('lark')
+    && !agents.some((agent) => agent.id !== state.id && agent.meetingNotes);
+}
+
+// Why meeting notes cannot be switched on here, or null.
+function meetingNotesRefusal(ctx, state) {
+  if (!state.connectors.includes('lark')) {
+    return t('会议纪要来自飞书：先在「接入的 IM」里接上飞书', 'Meeting notes come from Feishu/Lark: connect it under Connected IMs first');
+  }
+  const holder = (ctx.agents ?? []).find((agent) => agent.id !== state.id && agent.meetingNotes);
+  return holder ? t(`会议纪要已经由 ${holder.displayName}（${holder.id}）入库：一台机器上只有一个实例能开，先修改 ${holder.id} 把它关掉`,
+    `${holder.displayName} (${holder.id}) stores the meeting notes already: only one instance on a machine can; switch it off there first`) : null;
+}
 
 const SWITCHES = () => [
   { key: 'stagedReplies', label: t('分段回复', 'Staged replies'),
@@ -475,6 +521,9 @@ const SWITCHES = () => [
     hint: t('每条消息都要模型表态：回复，或记下不回；漏了提醒一次', 'the model decides on every message: a reply, or a note that it stays silent; a miss gets one reminder') },
   { key: 'ovAutoRecall', label: t('OpenViking 自动召回', 'OpenViking auto-recall'),
     hint: t('每轮自动召回 OpenViking 里的相关记忆', 'recalls related OpenViking memory on every turn') },
+  { key: 'meetingNotes', label: t('会议纪要入库', 'Meeting notes'),
+    hint: t('你参加的飞书会议，智能纪要和文字记录存进 OpenViking；一台机器上只有一个实例能开',
+      'the Feishu/Lark AI notes and transcripts of your meetings go into OpenViking; one instance per machine') },
 ];
 
 const onOff = (value) => (value ? t('开', 'on') : t('关', 'off'));
@@ -486,13 +535,17 @@ function switchesShown(state) {
 
 // Each switch with what it does, flipped where it is until Done; ← leaves
 // them all as they were.
-async function askSwitches({ prompter }, state) {
+async function askSwitches(ctx, state) {
+  const { prompter } = ctx;
   const before = { ...state.switches };
   const mark = prompter.mark();
   let cursor = 0;
+  let notice = null;
   try {
     for (;;) {
       prompter.rewind(mark);
+      if (notice) prompter.warn(notice);
+      notice = null;
       const switches = SWITCHES();
       const labelWidth = Math.max(...switches.map(({ label }) => width(label))) + 2;
       const choice = await prompter.select(t('其他设置（选一项就切换开关）', 'Other settings (pick one to switch it)'), [
@@ -501,8 +554,9 @@ async function askSwitches({ prompter }, state) {
       ], { initial: cursor, label: t('其他设置', 'Other settings') });
       if (choice === 'done') return;
       const { key } = switches[choice];
-      state.switches[key] = !state.switches[key];
       cursor = choice;
+      notice = key === 'meetingNotes' && !state.switches[key] ? meetingNotesRefusal(ctx, state) : null;
+      if (!notice) state.switches[key] = !state.switches[key];
     }
   } catch (error) {
     if (error instanceof GoBack) Object.assign(state.switches, before);
@@ -518,7 +572,7 @@ const SETTINGS = [
     shown: (state) => (state.runtime.kept ? state.runtime.model : state.runtime.label) },
   { key: 'ims', label: () => t('接入的 IM', 'Connected IMs'), ask: askIms, shown: (state) => imList(state.connectors) },
   { key: 'larkApp', label: () => t('飞书应用', 'Feishu/Lark app'), ask: askLarkApp,
-    shown: (state, { current }) => larkAppShown(state, current) },
+    shown: (state, { current, larkNeeds }) => larkAppShown(state, current, larkNeeds) },
   { key: 'channel', label: () => t('主渠道', 'Primary channel'), ask: askChannel, shown: (state) => IM_LABELS[state.channel] },
   { key: 'mailboxes', label: () => t('邮箱', 'Mailboxes'), ask: askMailboxes,
     shown: (state) => (mailboxList(state).length ? list(mailboxList(state).map(addressOf)) : t('没有接', 'none')) },
@@ -846,9 +900,9 @@ export async function connectLark({
   await confirmUnshared({ prompter, larkCli, appId: app.appId, others });
   if (inspected && lacksAny(reportApp(prompter, scopes, inspected, { manual }))) {
     prompter.info(manual
-      ? t('缺的在飞书开放平台给应用补上；你是应用的所有者或管理员的话，也可以之后运行 vika login lark 扫码补齐',
-        'Add what is missing in the developer console; if you own or administer the app, vika login lark can add it with a scan later')
-      : t('之后运行 vika login lark 可以扫码补齐', 'vika login lark can add it with a scan later'));
+      ? t('缺的在飞书开放平台给应用补上；你是应用的所有者或管理员的话，也可以之后运行 vika setup 扫码补齐',
+        'Add what is missing in the developer console; if you own or administer the app, vika setup can add it with a scan later')
+      : t('之后运行 vika setup 可以扫码补齐', 'vika setup can add it with a scan later'));
   }
   await larkCli.configureProfile({ profile, ...app });
   const login = await larkCli.beginUserLogin({ profile, scopes: grantedUserScopes(scopes, inspected) });
@@ -871,6 +925,126 @@ export async function connectLark({
   }
   prompter.success(t('飞书已接好', 'Feishu/Lark is connected'));
   return { profile, ownerOpenId, name: inspected?.botName ?? inspected?.name ?? null };
+}
+
+// The app as its bot reads it, through the instance's profile.
+const readInstanceApp = (larkCli, agent) => readApp((pathname, query) => larkCli.get({ profile: agent.profile, pathname, query }));
+
+// The user scopes the app has that the owner's login does not carry yet: a
+// release that asks for more needs the owner to authorize again. None when
+// the login cannot be read (`vika login lark` is for that).
+async function loginLacks(larkCli, agent, scopes, inspected) {
+  const granted = await larkCli.userScopes({ profile: agent.profile }).catch(() => null);
+  if (!granted || !inspected) return [];
+  return grantedUserScopes(scopes, inspected).filter((scope) => !granted.includes(scope));
+}
+
+// What a Feishu/Lark instance lacks of what this release asks for: the
+// app's scopes, events and card callback, and the owner's login. Rejects
+// when the app cannot be read.
+export async function larkNeeds({ agent, larkCli, scopes = larkScopes() }) {
+  const inspected = await readInstanceApp(larkCli, agent);
+  const missing = missingConfig(scopes, inspected);
+  const login = await loginLacks(larkCli, agent, scopes, inspected);
+  const count = missing.scopes.tenant.length + missing.scopes.user.length + (missing.events?.length ?? 0) + missing.callbacks.length;
+  return { inspected, missing, login, count: count + (login.length ? 1 : 0) };
+}
+
+// The app checked against what Vika needs; one `update` scan adds what it
+// lacks, the platform's confirm page showing the change. Resolves with
+// { inspected, updated }: what was read last (null when the app's settings
+// cannot be read) and whether the platform confirmed a change.
+export async function completeLarkApp({ agent, prompter, larkCli, scopes = larkScopes(), register = null }) {
+  const read = async () => {
+    const spinning = prompter.spin(t('核对应用的权限和事件', 'Checking the app\'s permissions and events'));
+    try {
+      const app = await readInstanceApp(larkCli, agent);
+      spinning.succeed(t(`应用 ${app.appId} 已读取`, `Read the app ${app.appId}`));
+      return app;
+    } catch (error) {
+      spinning.warn(t(`读不到应用的配置，跳过核对：${error.message}`, `The app's settings could not be read, so they are not checked: ${error.message}`));
+      return null;
+    }
+  };
+  const inspected = await read();
+  if (!inspected || !lacksAny(reportApp(prompter, scopes, inspected))) return { inspected, updated: false };
+  // The confirm page withdraws a version under review before publishing its
+  // own, and the approval starts over: not by default.
+  if (inspected.pendingReview) {
+    prompter.warn(t('应用有一个版本正在审核：扫码补齐时，飞书会先撤回它再提交新版本，审批要重新排队。',
+      'A version of the app is under review: adding what is missing withdraws it first and submits a new one, so the approval starts over.'));
+  }
+  if (!await prompter.confirm(t('扫码把缺的补上？要你是这个应用的所有者或管理员', 'Scan to add what is missing? You need to own or administer the app'),
+    !inspected.pendingReview)) {
+    return { inspected, updated: false };
+  }
+  let updated;
+  try {
+    updated = await registerApp({ plan: agent, prompter, scopes, mode: 'update', appId: inspected.appId, ...(register ? { register } : {}) });
+  } catch (error) {
+    if (!(error instanceof LarkRegistrationError)) throw error;
+    prompter.warn(t(`应用没有更新（${error.code}）：${error.message}`, `The app was not updated (${error.code}): ${error.message}`));
+    return { inspected, updated: false };
+  }
+  if (!updated) {
+    prompter.info(t('跳过了，应用没有改动', 'Skipped; the app is unchanged'));
+    return { inspected, updated: false };
+  }
+  prompter.success(t('平台已确认', 'The platform confirmed it'));
+  const after = await read();
+  if (after) reportApp(prompter, scopes, after);
+  return { inspected: after ?? inspected, updated: true };
+}
+
+// The owner authorizes Vika as a user again (a scan), for the user scopes
+// the app has.
+export async function reauthorizeOwner({ agent, prompter, larkCli, scopes = larkScopes(), inspected = null }) {
+  const login = await larkCli.beginUserLogin({ profile: agent.profile, scopes: grantedUserScopes(scopes, inspected) });
+  const scan = showScan(prompter, {
+    url: login.url, where: IM_LABELS.lark, label: t('等待授权', 'Waiting for authorization'),
+    title: t(`扫码重新授权 ${agent.displayName}（${agent.profile}）以你的身份读消息`, `Scan to let ${agent.displayName} (${agent.profile}) read messages as you again`),
+  });
+  try {
+    await larkCli.finishUserLogin({ profile: agent.profile, deviceCode: login.deviceCode });
+  } finally {
+    scan.stop();
+  }
+  prompter.success(t(`${agent.profile} 已重新授权；运行中的实例会自动用上新的登录`, `${agent.profile} is authorized again; the running instance picks it up by itself`));
+}
+
+// After an upgrade: the app gets what it lacks with one scan, then the owner authorizes again if their
+// login lacks scopes the app now has. Resolves with whether the app changed.
+export async function updateLarkApp({ agent, prompter, larkCli, scopes = larkScopes(), register = null }) {
+  const { inspected, updated } = await completeLarkApp({ agent, prompter, larkCli, scopes, register });
+  const lacking = await loginLacks(larkCli, agent, scopes, inspected);
+  if (lacking.length) {
+    prompter.info(t(`你给 ${agent.displayName} 的授权还缺 ${lacking.length} 个权限（${list(lacking.slice(0, 5))}${lacking.length > 5 ? ' 等' : ''}），再扫码授权一次`,
+      `Your authorization of ${agent.displayName} lacks ${lacking.length} ${lacking.length === 1 ? 'permission' : 'permissions'} (${list(lacking.slice(0, 5))}${lacking.length > 5 ? ', …' : ''}); scan once more to authorize`));
+    await reauthorizeOwner({ agent, prompter, larkCli, scopes, inspected });
+  }
+  return updated;
+}
+
+// Every Feishu/Lark instance checked at once, for setup's first menu and the
+// instance's 飞书应用 setting: the ones that lack something this release asks for. An app that cannot be
+// read is left out.
+export async function checkLarkApps({ prompter, env, manifest }) {
+  const agents = (manifest?.agents ?? []).filter((agent) => connectorsOf(agent).includes('lark') && agent.profile);
+  const bin = agents.length ? env.LARK_CLI_BIN || manifest.env?.LARK_CLI_BIN || resolveLarkCli(env) : null;
+  if (!bin) return [];
+  const larkCli = new LarkCli(bin);
+  const scopes = larkScopes();
+  const spinning = prompter.spin(t('核对飞书应用的权限和事件', 'Checking the Feishu/Lark apps\' permissions and events'));
+  const checked = await Promise.all(agents.map((agent) => larkNeeds({ agent, larkCli, scopes }).then(
+    (needs) => (needs.count ? { agent, ...needs } : null), () => null)));
+  const lacking = checked.filter(Boolean);
+  if (lacking.length) {
+    spinning.warn(t(`${list(lacking.map(({ agent }) => `${agent.displayName}（${agent.id}）`))} 的飞书应用缺这个版本要的权限或事件：修改实例 →「飞书应用」里扫码补齐`,
+      `The Feishu/Lark app of ${list(lacking.map(({ agent }) => `${agent.displayName} (${agent.id})`))} lacks permissions or events this release needs: change the instance and complete it under Feishu/Lark app`));
+  } else {
+    spinning.succeed(t('飞书应用的权限和事件都齐了', 'The Feishu/Lark apps have every permission and event they need'));
+  }
+  return lacking;
 }
 
 // canGoBack: ← while the code waits stops the login before anything is bound
@@ -1171,7 +1345,7 @@ async function setupFlow({
   env = process.env,
   homeDir = os.homedir(),
   fetchImpl = globalThis.fetch,
-  detect = { runtimes: detectRuntimes, openViking: detectOpenViking },
+  detect = { runtimes: detectRuntimes, openViking: detectOpenViking, larkApps: checkLarkApps },
   configureOV = configureOpenViking,
   connect = { lark: connectLark, weixin: connectWeixin, telegram: connectTelegram, slack: connectSlack, qq: connectQQ, email: askEmail, greet, pi: loginPi },
   control = { start: startCommand, restart: restartCommand, autostart: autostartCommand },
@@ -1198,9 +1372,12 @@ async function setupFlow({
   const { path: configPath, value: manifest, ignored } = readManifest(env);
   const notice = ignoredFieldsNotice(ignored, configPath);
   if (notice) prompter.warn(notice);
+  // Before anything is asked: which Feishu/Lark apps lack what this release
+  // needs (after an upgrade, say), to say so and complete them.
+  if (detect.larkApps && manifest?.agents?.length) memo.lacking ??= await detect.larkApps({ prompter, env, manifest });
   // ← and → move between the questions, until the scans begin.
   prompter.navigable = prompter.tty;
-  const current = await chooseTarget(prompter, manifest);
+  const current = await chooseTarget(prompter, manifest, memo.lacking ?? []);
   if (current === 'remove') {
     try {
       return await removeInstance({ prompter, manifest, configPath, env, control });
@@ -1216,7 +1393,11 @@ async function setupFlow({
   }
   const kept = keptRuntime(current, runtimes);
   const others = manifest?.agents?.length > 0;
-  const ctx = { prompter, out, env, homeDir, fetchImpl, runtimes, current, connect, kept, menu: Boolean(current), startOver: others, notes: [] };
+  const ctx = {
+    prompter, out, env, homeDir, fetchImpl, runtimes, current, connect, kept, menu: Boolean(current), startOver: others, notes: [],
+    agents: manifest?.agents ?? [],
+    larkNeeds: (memo.lacking ?? []).find((needs) => needs.agent.id === current?.id) ?? null,
+  };
   const state = initialState({ id: current?.id ?? suggestInstanceId(manifest), env, homeDir, current, runtimes, kept });
   const port = current ? current.port : await allocate(manifest);
   ctx.editOV = async () => {
@@ -1327,6 +1508,7 @@ async function setupFlow({
     if (late) throw new Error(late);
   };
   const confirmNew = async () => {
+    state.switches.meetingNotes = defaultMeetingNotes(state, ctx.agents);
     const addresses = mailPlan(state).added;
     const channels = ims(state).length > 1
       ? t(`${imList(ims(state))}，主渠道：${IM_LABELS[state.channel]}`, `${imList(ims(state))}; primary: ${IM_LABELS[state.channel]}`)
@@ -1434,6 +1616,12 @@ async function setupFlow({
       if (current) prompter.rewind(page.mark, { whole: true });
       else returnToLast(prompter, steps, run);
     }
+  }
+  // The app the instance keeps gets what it lacks (a scan) before the
+  // instance restarts, so it starts with it.
+  if (current && state.larkRepair && !newIms.includes('lark')) {
+    live?.release();
+    await (connect.larkApp ?? updateLarkApp)({ agent, prompter, larkCli: new LarkCli(larkCliBin), register: connect.register });
   }
   live?.resume();
   const id = state.id;
@@ -1579,6 +1767,9 @@ function describeChanges(before, after, mailboxes, homeDir, state) {
           : t(`接入${IM_LABELS[im]}（需要扫码）`, `Connect ${IM_LABELS[im]} (needs a scan)`));
     }
     if (was.includes(im) && !after.connectors.includes(im)) changes.push(t(`不再接${IM_LABELS[im]}`, `Disconnect ${IM_LABELS[im]}`));
+  }
+  if (state.larkRepair && larkSource(state, before) === 'keep') {
+    changes.push(t('补齐飞书应用缺的权限和事件（需要扫码）', 'Complete the Feishu/Lark app (needs a scan)'));
   }
   if (was.includes('lark') && !['keep', null].includes(larkSource(state, before))) {
     changes.push(t(`换飞书应用：${larkAppShown(state, before)}（需要扫码）`, `Another Feishu/Lark app: ${larkAppShown(state, before)} (needs a scan)`));

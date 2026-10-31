@@ -103,6 +103,8 @@ test('a first setup: Feishu + Weixin, Codex, OpenViking; scans run only after ev
     stagedReplies: false,
     naturalWriting: true,
     explicitSilence: false,
+    // The first AI colleague on Feishu stores the owner's meeting notes.
+    meetingNotes: true,
     role: 'colleague',
     model: 'codex:',
   }]);
@@ -511,7 +513,7 @@ function existing(h, agent) {
   fs.mkdirSync(path.join(h.home, '.vika'), { recursive: true });
   const full = { id: 'asd', displayName: 'ASD', channel: 'lark', connectors: ['lark'], profile: 'vika-asd', port: 3738,
     dataDir: path.join(h.home, '.vika', 'data', 'asd'), workspace: path.join(h.home, 'ws'), ovConfig: path.join(h.home, '.vika', 'ov', 'asd.json'), ovAutoRecall: false,
-    stagedReplies: false, naturalWriting: true, explicitSilence: false, model: 'codex:', ...agent };
+    stagedReplies: false, naturalWriting: true, explicitSilence: false, meetingNotes: false, model: 'codex:', ...agent };
   fs.writeFileSync(path.join(h.home, '.vika', 'config.json'),
     JSON.stringify({ version: 1, defaultInstance: full.id, env: {}, agents: [full] }));
   return full;
@@ -603,12 +605,12 @@ test('changing an instance runtime saves the setup selector before restarting it
 
 test('其他设置 switches each setting where it is, says what changes, and saves it in the manifest', async (t) => {
   //                    change  other  staged  natural  staged  silence  done  save
-  const h = harness(t, ['2',    '10',  '1',    '2',     '1',    '3',     '5',  '11']);
+  const h = harness(t, ['2',    '10',  '1',    '2',     '1',    '3',     '6',  '11']);
   const before = existing(h, {});
   assert.equal(await setupCommand(h.options), 0);
   assert.deepEqual(h.manifest().agents, [{ ...before, naturalWriting: false, explicitSilence: true }]);
   const text = h.written();
-  assert.match(text, /1\) 分段回复\s+关 · 复杂任务先表态，做的过程中发阶段性结论；简单问题仍只回一条\n  2\) 自然写作\s+开 · [^\n]+\n  3\) 显式不回复\s+关 · [^\n]+\n  4\) OpenViking 自动召回\s+关 · [^\n]+\n  5\) 完成/);
+  assert.match(text, /1\) 分段回复\s+关 · 复杂任务先表态，做的过程中发阶段性结论；简单问题仍只回一条\n  2\) 自然写作\s+开 · [^\n]+\n  3\) 显式不回复\s+关 · [^\n]+\n  4\) OpenViking 自动召回\s+关 · [^\n]+\n  5\) 会议纪要入库\s+关 · [^\n]+\n  6\) 完成/);
   assert.match(text, /1\) 分段回复\s+开 · /, 'a switch shows its new value at once');
   assert.match(text, /10\) 其他设置\s+开着：显式不回复（已改）/);
   assert.match(text, /将修改 ASD（asd）：\n  自然写作：开 → 关（模型会开一次新的会话）\n  显式不回复：关 → 开（模型会开一次新的会话）\n/);
@@ -616,7 +618,7 @@ test('其他设置 switches each setting where it is, says what changes, and sav
   assert.deepEqual(h.calls, [['restart', 'asd']]);
 
   // A switch the manifest never had starts from its default; recall is not a policy change.
-  const recall = harness(t, ['2', '10', '4', '5', '11']);
+  const recall = harness(t, ['2', '10', '4', '6', '11']);
   const old = existing(recall, {});
   for (const key of ['stagedReplies', 'naturalWriting', 'explicitSilence']) delete old[key];
   fs.writeFileSync(path.join(recall.home, '.vika', 'config.json'), JSON.stringify({ version: 1, defaultInstance: old.id, env: {}, agents: [old] }));
@@ -1245,7 +1247,7 @@ test('connecting a picked app: another instance on it is a warning, what it lack
   assert.match(output, /应用有一个新版本在等管理员审核：下面缺的可能就在里面，审核通过后生效。\n.*有 \d+ 个权限没开通/);
   assert.match(output, /没有订阅接收消息事件（im\.message\.receive_v1）：机器人收不到消息/);
   assert.match(output, /卡片回调（card\.action\.trigger）没有用长连接订阅/);
-  assert.match(output, /之后运行 vika login lark 可以扫码补齐/);
+  assert.match(output, /之后运行 vika setup 可以扫码补齐/);
   assert.doesNotMatch(output, /事件走长连接还是 webhook 读不到/, 'a scanned app had its events set by the platform');
   assert.deepEqual(larkCli.calls, [['profile', 'vika-new', 'cli_old'], ['login', scopes.user.slice(0, 2)]]);
 
@@ -1280,7 +1282,7 @@ test('connecting an app typed in: no scan for it, and how its events arrive is l
   assert.match(output, /用应用 cli_old/);
   assert.match(output, /权限核对通过/);
   assert.match(output, /事件走长连接还是 webhook 读不到/);
-  assert.match(output, /缺的在飞书开放平台给应用补上；你是应用的所有者或管理员的话，也可以之后运行 vika login lark 扫码补齐/);
+  assert.match(output, /缺的在飞书开放平台给应用补上；你是应用的所有者或管理员的话，也可以之后运行 vika setup 扫码补齐/);
   assert.match(output, /扫码授权 Vika 以你的身份读消息/);
   assert.doesNotMatch(output, /第 1 次扫码|第 2 次扫码/);
 });
@@ -1434,4 +1436,106 @@ test('in English, changing an instance: the list, what a setting says, the chang
   assert.match(text, /11\) Save \(2 changes\)/);
   assert.match(text, /Changing ASD \(asd\):\n  Connect WeChat \(needs a scan\)\n  Primary channel: Feishu\/Lark → WeChat\n/);
   assert.match(text, /ASD \(asd\) is updated\.\n  WeChat: Say "hi" to it first/);
+});
+
+test('meeting notes: on for the first assistant or colleague on Feishu, off for a Q&A bot and for a second instance', async (t) => {
+  //                   name role workspace runtime IMs feishu confirm
+  const h = harness(t, ['', '',  '',       '3',    '1', '',    'y']);
+  assert.equal(await setupCommand(h.options), 0);
+  assert.equal(h.manifest().agents[0].meetingNotes, true);
+  assert.match(h.written(), /其他设置\s+开着：自然写作、会议纪要入库（以后在修改实例里调）/);
+
+  const second = harness(t, ['1', '', 'Second', '', '', '3', '1', '', 'y']);
+  fs.mkdirSync(path.join(second.home, '.vika'), { recursive: true });
+  fs.copyFileSync(path.join(h.home, '.vika', 'config.json'), path.join(second.home, '.vika', 'config.json'));
+  second.options.allocate = async () => 3739;
+  assert.equal(await setupCommand(second.options), 0);
+  assert.deepEqual(second.manifest().agents.map(({ id, meetingNotes }) => [id, meetingNotes]), [['primary', true], ['agent2', false]]);
+
+  //                    name role:qa workspace runtime IMs feishu confirm
+  const qa = harness(t, ['', '3',    '',       '3',    '1', '',    'y']);
+  assert.equal(await setupCommand(qa.options), 0);
+  assert.equal(qa.manifest().agents[0].meetingNotes, false);
+});
+
+test('会议纪要入库 is one instance\'s: refused while another has it, switched on like any other setting', async (t) => {
+  //                    change asd  other  notes  done  discard
+  const h = harness(t, ['2',        '10',  '5',   '6',  '12']);
+  const asd = existing(h, {});
+  const bee = { ...asd, id: 'bee', displayName: 'BEE', profile: 'vika-bee', port: 3739, dataDir: path.join(h.home, '.vika', 'data', 'bee'),
+    workspace: path.join(h.home, 'ws-bee'), ovConfig: path.join(h.home, '.vika', 'ov', 'bee.json'), meetingNotes: true };
+  const two = { version: 1, defaultInstance: 'asd', env: {}, agents: [asd, bee] };
+  fs.writeFileSync(path.join(h.home, '.vika', 'config.json'), JSON.stringify(two));
+  assert.equal(await setupCommand(h.options), 0);
+  assert.match(h.written(), /会议纪要已经由 BEE（bee）入库：一台机器上只有一个实例能开，先修改 bee 把它关掉\n[\s\S]*5\) 会议纪要入库\s+关 · /);
+  assert.deepEqual(h.manifest(), two);
+  assert.deepEqual(h.calls, []);
+
+  //                     change asd  other  notes  done  save
+  const on = harness(t, ['2',        '10',  '5',   '6',  '11']);
+  const before = existing(on, {});
+  assert.equal(await setupCommand(on.options), 0);
+  assert.deepEqual(on.manifest().agents, [{ ...before, meetingNotes: true }]);
+  assert.deepEqual(on.calls, [['restart', 'asd']], 'the app needs nothing more for it');
+  assert.match(on.written(), /会议纪要入库：关 → 开（模型会开一次新的会话）\n/);
+});
+
+test('an instance whose Feishu app lacks what this release needs says so; its 飞书应用 setting completes it on saving', async (t) => {
+  //                   change asd  feishu app  add what is missing  save
+  const h = harness(t, ['2',        '6',        '1',                 '11']);
+  const before = existing(h, {});
+  const needs = (agent) => ({ agent, count: 2, missing: { scopes: { tenant: ['im:message'], user: [] }, events: ['im.message.receive_v1'], callbacks: [] }, login: [] });
+  h.options.detect.larkApps = async ({ manifest }) => [needs(manifest.agents[0])];
+  h.options.connect.larkApp = async ({ agent }) => { h.calls.push(['larkApp', agent.id]); return true; };
+  assert.equal(await setupCommand(h.options), 0);
+  const text = h.written();
+  assert.match(text, /1\) 新建一个实例\n  2\) 修改 ASD（asd）\s+飞书 · 飞书应用缺 2 项\n/);
+  assert.match(text, /6\) 飞书应用\s+现在的应用（缺 2 项：1 个权限、接收消息事件）\n/);
+  assert.match(text, /1\) 扫码补齐缺的 2 项\s+1 个权限、接收消息事件；保存时扫码，你要是这个应用的所有者或管理员\n  2\) 不换，用现在的应用/);
+  assert.match(text, /6\) 飞书应用\s+现在的应用，保存时扫码补齐缺的 2 项（已改）/);
+  assert.match(text, /将修改 ASD（asd）：\n  补齐飞书应用缺的权限和事件（需要扫码）\n/);
+  assert.deepEqual(h.calls, [['larkApp', 'asd'], ['restart', 'asd']], 'completed before the instance restarts');
+  assert.deepEqual(h.manifest().agents, [before], 'the manifest is as it was');
+});
+
+test('what an instance lacks: the app\'s scopes, events and callback, and scopes the owner\'s login does not carry yet', async (t) => {
+  const scopes = { tenant: ['im:message', 'im:chat:read'], user: ['search:message', 'vc:note:read'] };
+  const larkCli = (login, tenant = scopes.tenant) => ({
+    calls: [],
+    async get({ pathname }) {
+      this.calls.push(pathname);
+      if (pathname.endsWith('/applications/me')) {
+        return { code: 0, data: { app: { app_id: 'cli_1', online_version_id: 'v1',
+          scopes: [...tenant.map((scope) => ({ scope, token_types: ['tenant'] })), ...scopes.user.map((scope) => ({ scope, token_types: ['user'] }))],
+          callback_info: { callback_type: 'websocket', subscribed_callbacks: ['card.action.trigger'] } } } };
+      }
+      if (pathname.includes('/app_versions/')) return { code: 0, data: { app_version: { event_infos: [{ event_type: 'im.message.receive_v1' }] } } };
+      return { code: 0, data: { activate_status: 2 } };
+    },
+    async userScopes() { return login; },
+    async beginUserLogin(options) { this.calls.push(['login', options.scopes]); return { url: 'https://accounts.feishu.cn/x', deviceCode: 'dc' }; },
+    async finishUserLogin() { this.calls.push('finished'); },
+  });
+  const { larkNeeds, updateLarkApp } = await import('../src/setup.mjs');
+  const complete = await larkNeeds({ agent: { profile: 'vika-asd', meetingNotes: true }, larkCli: larkCli(scopes.user), scopes });
+  assert.equal(complete.count, 0, 'storing meeting notes needs nothing of the app beyond the permission list');
+  const short = await larkNeeds({ agent: { profile: 'vika-asd' }, larkCli: larkCli(['search:message'], ['im:message']), scopes });
+  assert.deepEqual(short.missing.scopes.tenant, ['im:chat:read']);
+  assert.deepEqual(short.login, ['vc:note:read']);
+  assert.equal(short.count, 2);
+
+  // Declining the scan still renews the owner's login for what the app has.
+  const input = new PassThrough();
+  input.end('n\n');
+  const output = new PassThrough();
+  let written = '';
+  output.on('data', (chunk) => { written += chunk; });
+  const cli = larkCli(['search:message'], ['im:message']);
+  const updated = await updateLarkApp({ agent: { id: 'asd', displayName: 'ASD', profile: 'vika-asd' },
+    prompter: new Prompter({ input, output }), larkCli: cli, scopes, register: async () => { throw new Error('not asked for'); } });
+  assert.equal(updated, false);
+  assert.match(written, /有 1 个权限没开通，相关功能会不可用：im:chat:read/);
+  assert.match(written, /你给 ASD 的授权还缺 1 个权限（vc:note:read），再扫码授权一次/);
+  assert.deepEqual(cli.calls.filter((call) => Array.isArray(call)), [['login', scopes.user]]);
+  assert.ok(cli.calls.includes('finished'));
 });
