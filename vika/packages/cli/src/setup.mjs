@@ -12,7 +12,7 @@ import { managedPiBin } from '../../daemon/src/pi-runtime.mjs';
 import { resolveRolePromptPath } from '../../daemon/src/conversation-policy.mjs';
 import { LarkCli } from './lark-cli.mjs';
 import {
-  LarkCredentialsError, LarkRegistrationError, grantedUserScopes, inspectApp, lacksAny, missingConfig, readApp, scanApp, tenantToken,
+  LarkCredentialsError, LarkPolicyError, LarkRegistrationError, grantedUserScopes, inspectApp, lacksAny, missingConfig, readApp, scanApp, tenantToken,
 } from './lark-app.mjs';
 import {
   ROLE_PRESETS, WEB_PORT, allocatePort, availableInstanceOvConfig, instanceIdProblem, readManifest, suggestInstanceId, validateManifest, vikaCommand,
@@ -65,7 +65,7 @@ export function larkScopes() {
 }
 
 const imChoices = () => [
-  { label: IM_LABELS.lark, value: 'lark' },
+  { label: IM_LABELS.lark, value: 'lark', hint: larkAccountNote() },
   { label: IM_LABELS.weixin, value: 'weixin' },
   { label: IM_LABELS.email, value: 'email',
     hint: t('IMAP/SMTP；新邮件提醒和回信确认发到主渠道', 'IMAP/SMTP; new-mail alerts and reply approvals go to the primary channel') },
@@ -148,6 +148,24 @@ function existingAppNotes(source) {
 const webhookRefusal = () => t(
   '这个机器人的卡片回调走 webhook，事件多半也是，Vika 接不了：在开放平台「事件与回调」把事件和回调都改成长连接（原来用 webhook 的服务就收不到了）再来接它，或者换一个机器人。',
   'This bot\'s card callbacks go to a webhook, and its events most likely do too, so Vika cannot take it: switch both to the long connection under Events & Callbacks in the developer console (the webhook service then stops getting them) and connect it again, or pick another bot.',
+);
+
+// Feishu signed in with a Doubao account makes and publishes an app, but the
+// platform never gives the app a token (LarkPolicyError): it cannot run a
+// bot. Said where Feishu is first offered, and again when it happens.
+const larkAccountNote = () => t('个人版（手机号注册）或公司的飞书账号；用豆包账号登录的飞书接不了',
+  'a personal Feishu/Lark account (registered with a phone number) or a company one; Feishu signed in with a Doubao account cannot be connected');
+
+// Why the platform gives the app no token, and what to do instead. `made`:
+// the scan has just made the app, which stays there unusable; `typed`: the
+// App ID was typed in, so another app is what to try.
+const policyRefusal = (appId, error, { made = false, typed = false } = {}) => t(
+  `飞书不给应用 ${appId} 发访问凭证（${error.message}）：它所在的飞书账号不能运行机器人，用豆包账号登录的飞书就是这样。${made ? '这个应用已经建好但用不了，可以在开放平台删掉。' : ''}${typed
+    ? '换一个个人版（手机号注册）或公司飞书账号下的应用，或者不接飞书，先用微信等其他渠道。'
+    : '换个人版（手机号注册）或公司的飞书账号重新扫码，或者回去不接飞书，先用微信等其他渠道。'}`,
+  `Feishu/Lark gives the app ${appId} no token (${error.message}): the account it belongs to cannot run bots, as with Feishu signed in with a Doubao account. ${made ? 'The app was made but cannot be used; you may delete it in the developer console. ' : ''}${typed
+    ? 'Use an app of a personal account (registered with a phone number) or a company one, or connect another IM such as WeChat instead.'
+    : 'Scan again with a personal account (registered with a phone number) or a company one, or go back and connect another IM such as WeChat instead.'}`,
 );
 
 const ims = (state) => state.connectors.filter((connector) => connector !== 'email');
@@ -588,11 +606,13 @@ const mailChanged = (state) => state.mail.added.length + state.mail.updated.size
 // The list stays in one place: before it is drawn again, the screen goes
 // back to where it first was, so what a setting asked or said is gone and
 // its new value shows in the list instead. `page` keeps that place, and the
-// cursor, when the list is come back to from a code waiting to be scanned.
+// cursor, when the list is come back to from a code waiting to be scanned,
+// and `page.notice`, why the scans came back, when they said.
 async function editInstance(ctx, state, { describe, check, before, page }) {
   const { prompter, out, current } = ctx;
   page.mark ??= prompter.mark();
-  let notice = null;
+  let notice = page.notice ?? null;
+  page.notice = null;
   for (;;) {
     prompter.rewind(page.mark);
     if (notice) prompter.warn(notice);
@@ -718,10 +738,15 @@ async function enterApp({ prompter, fetchImpl = globalThis.fetch }, { previous =
       token = await tenantToken(app, { fetchImpl });
       spinning.succeed(t('App ID 和 App Secret 没问题', 'The App ID and App Secret check out'));
     } catch (error) {
-      spinning.fail(!(error instanceof LarkCredentialsError)
-        ? t(`连不上飞书开放平台：${error.message}`, `Could not reach the developer platform: ${error.message}`)
-        : t(`平台不认这组凭证（${error.message}）：App ID 或 App Secret 不对，或者租户选错了`,
-          `The platform refused them (${error.message}): the App ID or App Secret is wrong, or the tenant is`));
+      if (error instanceof LarkPolicyError) {
+        spinning.fail(t('平台不给这个应用发访问凭证', 'The platform gives this app no token'));
+        prompter.warn(policyRefusal(appId, error, { typed: true }));
+      } else {
+        spinning.fail(!(error instanceof LarkCredentialsError)
+          ? t(`连不上飞书开放平台：${error.message}`, `Could not reach the developer platform: ${error.message}`)
+          : t(`平台不认这组凭证（${error.message}）：App ID 或 App Secret 不对，或者租户选错了`,
+            `The platform refused them (${error.message}): the App ID or App Secret is wrong, or the tenant is`));
+      }
       last = app;
       if (!await prompter.confirm(t('重新输入？', 'Try again?'))) throw new GoBack();
       continue;
@@ -889,14 +914,16 @@ export async function connectLark({
     inspected = await step(prompter, t('核对应用的权限、事件和版本', 'Checking the app\'s permissions, events and version'),
       () => inspectApp(app, { fetchImpl }), t('应用信息已读取', 'App checked'));
   } catch (error) {
+    // The account cannot run the bot, whatever is scanned next with it:
+    // back to the questions, saying so, before anything is written.
+    if (error instanceof LarkPolicyError) {
+      throw new GoBack(policyRefusal(app.appId, error, { made: source === 'create' && !typed, typed: Boolean(typed) }));
+    }
     if (error instanceof LarkCredentialsError) throw error;
     prompter.warn(t(`读不到应用的配置，跳过核对：${error.message}`, `The app's settings could not be read, so they are not checked: ${error.message}`));
   }
   // Refused before anything is written: back to the questions, for another bot.
-  if (inspected?.callbacks.type === 'webhook') {
-    prompter.warn(webhookRefusal());
-    throw new GoBack();
-  }
+  if (inspected?.callbacks.type === 'webhook') throw new GoBack(webhookRefusal());
   await confirmUnshared({ prompter, larkCli, appId: app.appId, others });
   if (inspected && lacksAny(reportApp(prompter, scopes, inspected, { manual }))) {
     prompter.info(manual
@@ -1613,8 +1640,15 @@ async function setupFlow({
     } catch (error) {
       if (!(error instanceof GoBack)) throw error;
       live?.resume();
-      if (current) prompter.rewind(page.mark, { whole: true });
-      else returnToLast(prompter, steps, run);
+      // What sent the scans back is said where they come back to, after the
+      // screen is taken back there.
+      if (current) {
+        page.notice = error.notice;
+        prompter.rewind(page.mark, { whole: true });
+      } else {
+        returnToLast(prompter, steps, run);
+        if (error.notice) prompter.warn(error.notice);
+      }
     }
   }
   // The app the instance keeps gets what it lacks (a scan) before the

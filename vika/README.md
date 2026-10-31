@@ -197,6 +197,8 @@ Codex/TraeX/Claude/Pi（MCP）的发消息、回复、reaction、撤回都经 Co
 
 ## 飞书前置条件
 
+机器人应用要建在个人版（手机号注册）或公司的飞书账号下。用豆包账号登录的飞书能建应用、能发布，但开放平台不给应用发 `tenant_access_token`（`code=21001`，访问控制策略拒绝），机器人收发不了消息；`vika setup` 遇到时会说明原因，不写配置。
+
 仓库根目录的 [`permission.json`](./permission.json) 是完整功能权限清单。首次配置应用时，在飞书开放平台进入「开发配置 → 权限管理 → 批量开通」，导入该文件；具体格式和审核规则见 [官方权限申请说明](https://open.feishu.cn/document/server-docs/application-scope/introduction?lang=zh-CN)。清单覆盖 daemon 可调用的文档、消息、任务、会议等完整能力，并非最小权限集；正式环境应按实际用途删减权限、限制应用可见范围。新增的需审核权限只有在创建应用版本、发布并经管理员审核后才会生效。
 
 只运行基础消息链路至少需要：
