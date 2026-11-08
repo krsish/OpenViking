@@ -333,11 +333,14 @@ describe('TaskManager', () => {
   });
 
   for (const stage of ['start', 'check', 'ended', 'insert', 'commit', 'publish']) {
-    it(`recovers after SIGKILL at ${stage}`, { skip: process.platform === 'win32' }, (t) => {
+    it(`recovers after forced termination at ${stage}`, (t) => {
       const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'task-crash-'));
       const child = spawnSync(process.execPath, [fileURLToPath(new URL('./task-crash-fixture.mjs', import.meta.url)), stage, workspace],
         { encoding: 'utf8', timeout: 15_000 });
-      assert.equal(child.signal, 'SIGKILL', child.stderr);
+      assert.ifError(child.error);
+      assert.equal(fs.readFileSync(path.join(workspace, 'fault-reached'), 'utf8'), stage);
+      if (process.platform === 'win32') assert.equal(child.status, 1, child.stderr);
+      else assert.equal(child.signal, 'SIGKILL', child.stderr);
       const db = new DatabaseSync(path.join(workspace, 'state.sqlite3'));
       const inbox = new MessageInbox({ db, runtime: { snapshot: () => ({ work: { turnInProgress: true } }) } });
       const executor = fakeExecutor();

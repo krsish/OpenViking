@@ -14,7 +14,7 @@ test('pipe identity is stable, case insensitive and scoped to the instance direc
   assert.ok(windows.isNamedPipe(one));
   assert.equal(one, windows.localSocketPath('c:\\users\\alice\\.vika\\primary', 'actions'));
   assert.notEqual(one, windows.localSocketPath('C:\\Users\\Alice\\.vika\\other', 'actions'));
-  assert.equal(posix.localSocketPath('/tmp/vika', 'actions'), '/tmp/vika/actions.sock');
+  assert.equal(posix.localSocketPath('/tmp/vika', 'actions'), path.join('/tmp/vika', 'actions.sock'));
 });
 
 test('POSIX invocation preserves argv and executable', () => {

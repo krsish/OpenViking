@@ -19,10 +19,10 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { getConfig, projectDir } from '../src/config.mjs';
 import { createLogger } from '../src/logger.mjs';
 import { PersonalAgentDaemon } from '../src/daemon.mjs';
+import { localSocketPath } from '../src/platform/index.mjs';
 
 // Raw Lark im.message.receive_v1 envelope with test defaults. Every field the
 // normalizer reads can be overridden; `text` becomes the JSON content body.
@@ -192,7 +192,7 @@ function fakeLarkSource(dir) {
 // logged to INPUT_LOG with the turn id as text) | 'reply-loop' (the same with
 // the identical reply_message "mock reply" in place of stay_silent, for an
 // instance without explicitSilence).
-const ACTION_CLIENT = fileURLToPath(new URL('../src/actions/client.mjs', import.meta.url));
+const ACTION_CLIENT = new URL('../src/actions/client.mjs', import.meta.url).href;
 
 function fakeCodexSource(dir, { behavior, failBlob }) {
   return `
@@ -204,25 +204,10 @@ function fakeCodexSource(dir, { behavior, failBlob }) {
     const BEHAVIOR = ${JSON.stringify(behavior)};
     const FAIL_BLOB = ${JSON.stringify(failBlob)};
     fs.appendFileSync(SPAWN_LOG, JSON.stringify(process.argv.slice(2)) + '\\n');
-    // 'codex exec' is a worker turn (workers scheduler): it reports the
-    // request's text back as its draft, then ends the turn.
-    if (process.argv[2] === 'exec') {
-      const prompt = process.argv.at(-1);
-      fs.appendFileSync(INPUT_LOG, JSON.stringify({ method: 'exec', text: prompt }) + '\\n');
-      const request = /\\] (TASK[^\\n]*)/.exec(prompt)?.[1] ?? 'no request';
-      const emit = (payload) => process.stdout.write(JSON.stringify(payload) + '\\n');
-      callTool(actionEndpoint('fake-codex-worker'), 'task_report', { state: 'done', summary: 'checked', draft: 'worker result for: ' + request })
-        .catch((error) => fs.appendFileSync(INPUT_LOG, JSON.stringify({ method: 'tool-error', text: String(error.message) }) + '\\n'))
-        .finally(() => {
-          emit({ type: 'thread.started', thread_id: 'th-worker' });
-          emit({ type: 'item.completed', item: { type: 'agent_message', text: 'done' } });
-          emit({ type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1 } });
-          process.exit(0);
-        });
-    }
     const send = (payload) => process.stdout.write(JSON.stringify(payload) + '\\n');
     const rl = readline.createInterface({ input: process.stdin });
     let turnSeq = 0;
+    let workerThread = false;
     const interrupted = new Set();
     const steered = new Set();
     // 'inbox': a turn whose input says LONG stays open; an inbox notice makes
@@ -245,8 +230,10 @@ function fakeCodexSource(dir, { behavior, failBlob }) {
       if (msg.method === 'initialized') { return; }
       if (msg.method === 'thread/start' || msg.method === 'thread/resume') {
         fs.appendFileSync(SPAWN_LOG + '.threads', JSON.stringify(msg.params) + '\\n');
-        send({ id: msg.id, result: { thread: { id: 'thread-mock' } } });
-        send({ method: 'thread/started', params: { thread: { id: 'thread-mock' } } });
+        workerThread = (msg.params.developerInstructions ?? '').startsWith('## Worker');
+        const threadId = workerThread ? 'th-worker' : 'thread-mock';
+        send({ id: msg.id, result: { thread: { id: threadId } } });
+        send({ method: 'thread/started', params: { thread: { id: threadId } } });
         return;
       }
       if (msg.method === 'model/list') {
@@ -258,10 +245,19 @@ function fakeCodexSource(dir, { behavior, failBlob }) {
       if (msg.method === 'turn/start') {
         const text = msg.params.input.map((part) => part.text).join('');
         fs.appendFileSync(INPUT_LOG, JSON.stringify({ method: 'turn/start', text }) + '\\n');
-        send({ id: msg.id, result: {} });
         const turnId = 'turn-' + (++turnSeq);
+        send({ id: msg.id, result: { turn: { id: turnId } } });
         send({ method: 'turn/started', params: { turn: { id: turnId } } });
-        if (BEHAVIOR === 'complete') {
+        if (workerThread) {
+          const request = /\\] (TASK[^\\n]*)/.exec(text)?.[1] ?? 'no request';
+          callTool(actionEndpoint('fake-codex-worker'), 'task_report', { state: 'done', summary: 'checked', draft: 'worker result for: ' + request })
+            .catch(logError)
+            .then(() => {
+              send({ method: 'item/completed', params: { threadId: 'th-worker', turnId,
+                item: { type: 'agentMessage', id: 'worker-message', text: 'done' } } });
+              complete(turnId);
+            });
+        } else if (BEHAVIOR === 'complete') {
           send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });
         } else if (BEHAVIOR === 'silent' || BEHAVIOR === 'reply') {
           const decision = [...text.matchAll(/ event=(\\S+)/g)].at(-1)?.[1];
@@ -385,7 +381,7 @@ export async function startMockEnv({
     lockPath: path.join(dir, 'data', 'daemon.lock'),
     // getConfig() derives the socket from the live dataDir; binding it would
     // unlink a running daemon's socket.
-    actionSocketPath: path.join(dir, 'data', 'actions.sock'),
+    actionSocketPath: localSocketPath(path.join(dir, 'data'), 'actions'),
     tempDir: path.join(dir, 'data', 'tmp'),
     workspace: path.join(dir, 'workspace'),
     larkCliBin: fakeLark,

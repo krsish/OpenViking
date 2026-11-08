@@ -1,0 +1,44 @@
+name: Vika Windows scheduler
+
+on:
+  pull_request:
+    paths:
+      - "vika/**"
+      - ".github/workflows/vika-windows.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vika-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scheduler:
+    name: Scheduler and worker processes
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: vika
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: vika/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      # Real subprocesses and SQLite, fake model/connector CLIs; no credentials.
+      # Keep explicit file arguments so this also runs from PowerShell.
+      - name: Test platform, schedulers, workers and crash recovery
+        run: >-
+          node --test --test-concurrency=2
+          packages/daemon/test/platform.test.mjs
+          packages/daemon/test/inbox.test.mjs
+          packages/daemon/test/tasks.test.mjs
+          packages/daemon/test/worker-executor.test.mjs
+          packages/daemon/test/worker-codex.test.mjs
+          packages/daemon/test/inbox.integration.test.mjs
+          packages/daemon/test/workers.integration.test.mjs

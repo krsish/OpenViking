@@ -4,12 +4,18 @@
 // Subprocess used by tasks.test.mjs: real SQLite, fake worker, hard process
 // termination at the durable handoff boundaries. No model or connector calls.
 import path from 'node:path';
+import fs from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 import { TaskManager } from '../src/tasks.mjs';
 import { MessageInbox } from '../src/inbox.mjs';
 
 const [stage, workspace] = process.argv.slice(2);
-const kill = () => process.kill(process.pid, 'SIGKILL');
+const kill = () => {
+  // Distinguish reaching the fault from a startup/import failure on Windows,
+  // where forced termination is reported as an exit code, not a signal.
+  fs.writeFileSync(path.join(workspace, 'fault-reached'), stage);
+  process.kill(process.pid, 'SIGKILL');
+};
 const db = new DatabaseSync(path.join(workspace, 'state.sqlite3'));
 const inbox = new MessageInbox({ db, runtime: { snapshot: () => ({ work: { turnInProgress: true } }) } });
 const executor = { start() {

@@ -7,7 +7,7 @@ import { startMockEnv, textMessage } from './mock-env.mjs';
 
 // The fake codex's 'workers' behavior: as the router it turns a TASK line
 // into task_create and relays a [task report] with reply_message; as
-// `codex exec` (a worker turn) it reports the request back as its draft.
+// a worker app-server thread it reports the request back as its draft.
 describe('workers scheduler end to end', () => {
   it('hands a request to a worker and relays its report where the request was made', async () => {
     const env = await startMockEnv({ codex: { behavior: 'workers' }, config: { scheduler: 'workers' } });
@@ -16,7 +16,7 @@ describe('workers scheduler end to end', () => {
       await env.waitForReply(/worker result for: TASK: look into the slowness/, 20_000);
 
       const input = env.codexInput();
-      const brief = input.find((entry) => entry.method === 'exec');
+      const brief = input.find((entry) => entry.method === 'turn/start' && entry.text.startsWith('[task t1]'));
       assert.match(brief.text, /^\[task t1\] mock task\nRequested by .* in chat=oc-a \(source=lark\)\./);
       assert.match(brief.text, /msg=om-task .*TASK: look into the slowness/);
       const reports = input.filter((entry) => /\[task report\]/.test(entry.text));

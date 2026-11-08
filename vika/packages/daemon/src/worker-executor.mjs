@@ -13,10 +13,11 @@ import { sanitizeCodexEnv } from './codex.mjs';
 import { PI_MCP_EXTENSION, piCommand } from './pi-runtime.mjs';
 import { claudeIsolationSettings, codexConfigFile, codexIsolationArgs, piIsolationArgs } from './ov-isolation.mjs';
 import { safeError } from './logger.mjs';
+import { createCodexWorkerProtocol } from './worker-codex.mjs';
 
 // One worker turn is one run of the router's own runtime CLI in its
 // non-interactive mode, resuming the task's own session: `pi --mode json -p`,
-// `codex exec --json [resume]`, `claude --print --resume`. Nothing runs
+// `codex app-server` (one turn over stdio), `claude --print --resume`. Nothing runs
 // between turns, so an idle task holds no process, and a crash or restart
 // loses at most the turn in flight. The worker reaches the Core through the
 // same MCP adapter as the router, with an authority that allows only its task
@@ -32,13 +33,20 @@ function tail(text, chars = 1_500) {
 }
 
 // Read a CLI's JSON-lines stdout as it arrives.
-function jsonLines(stream, onLine) {
+function jsonLines(stream, onLine, onOverflow) {
   let buffer = '';
   let bytes = 0;
+  let overflowed = false;
   stream.setEncoding('utf8');
   stream.on('data', (chunk) => {
+    if (overflowed) return;
     bytes += Buffer.byteLength(chunk);
-    if (bytes > MAX_OUTPUT_BYTES) return;
+    if (bytes > MAX_OUTPUT_BYTES) {
+      overflowed = true;
+      buffer = '';
+      onOverflow();
+      return;
+    }
     buffer += chunk;
     let index;
     while ((index = buffer.indexOf('\n')) >= 0) {
@@ -70,7 +78,6 @@ const RUNTIMES = {
         ...isolation,
         '--extension', PI_MCP_EXTENSION,
         ...(model ? ['--model', model] : []),
-        prompt,
       ];
       const command = piCommand(config.piBin, args);
       return { ...command, env };
@@ -93,40 +100,18 @@ const RUNTIMES = {
     },
   },
   codex: {
-    async command({ config, task, prompt, authority, model, effort, policy }) {
+    async command({ config, authority }) {
       const tools = agentToolServer(config, authority);
       const args = [
-        'exec', '--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox', '-C', task.workdir,
-        '-c', `developer_instructions=${JSON.stringify(policy)}`,
+        'app-server', '--listen', 'stdio://',
         '-c', 'features.plugins=false', '-c', 'features.tool_suggest=false', '-c', 'features.apps=false',
         ...codexIsolationArgs(codexConfigFile(process.env)),
         '-c', `mcp_servers.personal_agent.command=${JSON.stringify(tools.command)}`,
         '-c', `mcp_servers.personal_agent.args=${JSON.stringify(tools.args)}`,
         '-c', 'mcp_servers.personal_agent.startup_timeout_sec=10',
         '-c', `mcp_servers.personal_agent.tool_timeout_sec=${Math.max(10, Math.ceil(config.sendTimeoutMs / 1_000) + 5)}`,
-        ...(model ? ['-m', model] : []),
-        ...(effort ? ['-c', `model_reasoning_effort=${JSON.stringify(effort)}`] : []),
-        // The thread id is Codex's own; the first turn reports it.
-        ...(task.native_session ? ['resume', task.native_session] : []),
-        prompt,
       ];
       return { command: config.codexBin, args, env: sanitizeCodexEnv(process.env, config.profile, agentToolEnv(config, authority), config) };
-    },
-    reader() {
-      const state = { text: '', usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 }, error: null, nativeSession: null };
-      return {
-        state,
-        line(event) {
-          if (event.type === 'thread.started' && event.thread_id) state.nativeSession = String(event.thread_id);
-          if (event.type === 'item.completed' && event.item?.type === 'agent_message' && event.item.text) state.text = String(event.item.text).trim();
-          if (event.type === 'turn.completed' && event.usage) {
-            state.usage.inputTokens += Number(event.usage.input_tokens ?? 0);
-            state.usage.cachedInputTokens += Number(event.usage.cached_input_tokens ?? 0);
-            state.usage.outputTokens += Number(event.usage.output_tokens ?? 0);
-          }
-          if (event.type === 'turn.failed' || event.type === 'error') state.error = String(event.error?.message ?? event.message ?? 'codex turn failed');
-        },
-      };
     },
   },
   claude: {
@@ -143,7 +128,6 @@ const RUNTIMES = {
         ...(effort ? ['--effort', effort] : []),
         ...(model ? ['--model', model] : []),
         ...(task.native_session ? ['--resume', task.native_session] : ['--session-id', task.session_id]),
-        prompt,
       ];
       return { command: config.claudeBin, args, env: sanitizeClaudeEnv(process.env, config.profile, agentToolEnv(config, authority), config) };
     },
@@ -197,20 +181,62 @@ export class WorkerExecutor {
         config: this.config, task, prompt, authority, model, effort, policy, policyFile, scratch,
       });
       if (stopped) return { text: '', error: 'stopped' };
-      const reader = definition.reader();
+      let protocolFinished = false;
+      let killTimer;
+      const stopChild = () => {
+        if (!child || child.exitCode !== null || child.signalCode !== null) return;
+        terminateProcessTree(child, 'SIGTERM');
+        killTimer ??= setTimeout(() => terminateProcessTree(child, 'SIGKILL'), 2_000);
+        killTimer.unref?.();
+      };
+      const reader = task.runtime === 'codex'
+        ? createCodexWorkerProtocol({ task, prompt, policy, model, effort, onComplete: () => {
+          protocolFinished = true;
+          stopChild();
+        } })
+        : definition.reader();
       let stderr = '';
+      let inputError = null;
+      let outputError = null;
       return await new Promise((resolve) => {
         child = this.spawn(command, args, {
-          cwd: task.workdir, env, shell: false, detached: spawnDetached, stdio: ['ignore', 'pipe', 'pipe'],
+          cwd: task.workdir, env, shell: false, detached: spawnDetached, stdio: ['pipe', 'pipe', 'pipe'],
         });
-        jsonLines(child.stdout, (event) => reader.line(event));
+        jsonLines(child.stdout, (event) => reader.line(event), () => {
+          // App-server stays alive after a turn. Dropping its completion event
+          // would leave the worker running forever, so fail the turn explicitly.
+          outputError = `worker stdout exceeded ${MAX_OUTPUT_BYTES} bytes`;
+          reader.dispose?.();
+          stopChild();
+        });
         child.stderr.setEncoding('utf8');
         child.stderr.on('data', (chunk) => { stderr = tail(stderr + chunk, 4_000); });
-        child.once('error', (error) => resolve({ ...reader.state, error: safeError(error), transient: false }));
-        child.once('exit', (code, signal) => {
-          const failed = stopped ? 'stopped' : reader.state.error ?? (code === 0 ? null : `exit ${code ?? signal}: ${tail(stderr, 600)}`);
+        child.once('error', (error) => {
+          reader.dispose?.();
+          clearTimeout(killTimer);
+          resolve({ ...reader.state, error: safeError(error), transient: false });
+        });
+        // close follows the final stdout data; exit may precede it.
+        child.once('close', (code, signal) => {
+          reader.dispose?.();
+          clearTimeout(killTimer);
+          const failed = stopped ? 'stopped' : reader.state.error ?? inputError ?? outputError
+            ?? (protocolFinished || (task.runtime !== 'codex' && code === 0) ? null
+              : `exit ${code ?? signal}: ${tail(stderr, 600) || 'worker exited before completing its turn'}`);
           resolve({ ...reader.state, error: failed, transient: Boolean(failed && !stopped && TRANSIENT.test(failed)) });
         });
+        if (task.runtime === 'codex') reader.start(child);
+        else {
+          // Keep task text out of argv (Windows CreateProcess has a 32K limit).
+          // A CLI may fail before reading; consume EPIPE without crashing the daemon.
+          child.stdin.on('error', (error) => {
+            if (error.code !== 'EPIPE' && error.code !== 'ERR_STREAM_DESTROYED') {
+              inputError = `worker stdin: ${safeError(error)}`;
+              stopChild();
+            }
+          });
+          child.stdin.end(prompt);
+        }
       });
     })();
     return {

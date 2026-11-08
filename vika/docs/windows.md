@@ -71,7 +71,7 @@ apps; it does not update a separate installed release.
   (Windows reports 0666 regardless of ACLs); keep account files in a private,
   user-owned directory.
   Autostart returns an unsupported-preview error. There is no Windows installer,
-  VBS startup entry or Windows CI workflow. Slack has no Windows bundled/default
+  VBS startup entry. Slack has no Windows bundled/default
   executable; it requires an explicit `SLACK_CLI_BIN` and separate validation.
 
 ## Migration and validation
@@ -87,6 +87,34 @@ check uses POSIX shell loops. Platform isolation and POSIX configuration snapsho
 run in the normal suite; macOS configuration selection on Linux is not a macOS
 runtime test. On Windows, test normal-user startup/stop, descendant cleanup,
 occupied pipes, long instructions and each connector/runtime you actually use.
+
+### Router and workers
+
+Set `agents[].scheduler` to `"workers"` in the manifest to enable the router and
+background task sessions. Workers support Pi, Codex and Claude Code and use the
+same runtime as their router. The scheduler must be configured manually; setup
+does not offer it yet. See [scheduler.md](scheduler.md) for task recovery and
+runtime limits. Worker task text is sent through stdin for Pi and Claude Code;
+Codex workers use app-server RPC for both task text and developer instructions.
+Long task briefs and recovery history therefore do not consume command-line
+space. Pi still requires Git Bash for its shell tools.
+
+The [Windows scheduler workflow](../../.github/workflows/vika-windows.yml) runs
+platform, inbox, task-manager and worker-executor tests plus inbox/worker
+integration tests on `windows-latest`. These use real Node subprocesses, local
+pipes and SQLite with fake model and connector CLIs, including forced termination
+at six durable task/report handoff boundaries. They do not certify real runtime
+authentication, model calls, Git Bash tools, PM2 or connector behavior.
+
+To run the same focused suite from PowerShell in `vika`:
+
+```powershell
+node --test --test-concurrency=2 packages/daemon/test/platform.test.mjs packages/daemon/test/inbox.test.mjs packages/daemon/test/tasks.test.mjs packages/daemon/test/worker-executor.test.mjs packages/daemon/test/worker-codex.test.mjs packages/daemon/test/inbox.integration.test.mjs packages/daemon/test/workers.integration.test.mjs
+```
+
+Before using workers with real requests, validate a long task, a follow-up that
+resumes the same task, stopping a task with a running child process, and restarting
+the daemon during a task. Confirm that the report returns to the original chat.
 
 Report issues with the commit, Windows/Node/npm/PM2/Git Bash versions, selected
 runtime and connector, reproduction steps and sanitized error text. Do not post
