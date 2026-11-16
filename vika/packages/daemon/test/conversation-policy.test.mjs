@@ -397,7 +397,10 @@ describe('the workers scheduler', () => {
     assert.ok(workers.startsWith(`${inbox}\n\n## Workers\n`));
     assert.match(workers, /Never rewrite the request or add a plan: the worker reads the original messages\./);
     assert.match(workers, /A similar topic is a new request; when unsure, create a new task\./);
-    assert.match(workers, /A `\[task report\]` line is a worker's result for one task, not an input from a person\./);
+    assert.match(workers, /A `\[task report\]` line is a worker's result, not an input from a person\./);
+    assert.match(workers, /Reports are not one-message-per-worker\./);
+    assert.match(workers, /Merge reports about the same request into one reply/);
+    assert.match(workers, /If a later report says nothing materially new, take no delivery action/);
     assert.match(workers, /for `dropped`, tell the requester in one line why nothing needed doing/);
     assert.match(workers, /a command is cut off after 30 seconds and may not sleep, and a turn gets a few calls of them/);
     assert.match(workers, /Everything else is a task: hand it to a worker with `task_create` before you start on it, not after\./);
@@ -408,6 +411,7 @@ describe('the workers scheduler', () => {
     const text = assembleWorkerPolicy({ ...base, scheduler: 'workers' });
     assert.match(text, /^## Worker\n\nYou are a worker for Tester\./);
     assert.match(text, /Finish every turn with task_report/);
+    assert.match(text, /The daemon preserves any completed earlier report and may bundle the reports for the router/);
     assert.match(text, /You have no tool to send, reply, react or notify/);
     assert.match(text, /## Role\n/);
     assert.doesNotMatch(text, /## Decisions and delivery|stay_silent|message_check|## Inbox/);

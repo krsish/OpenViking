@@ -251,6 +251,7 @@ export class PersonalAgentDaemon {
         onTurnFailed: (info) => {
           this.actions.resetLoopGuard();
           void this.actions.clearTemporaryReactions('turn_end', this.keepReactions());
+          this.tasks?.retryReportReceipts(info?.receiptIds);
           void this.failurePolicy.onTurnFailed(info)
             .catch((error) => {
               this.logger.warn('turn_failure_handler_failed', { error: safeError(error) });
@@ -259,18 +260,21 @@ export class PersonalAgentDaemon {
         onTurnSucceeded: (info) => {
           this.actions.resetLoopGuard();
           void this.actions.clearTemporaryReactions('turn_end', this.keepReactions());
+          this.tasks?.settleReportReceipts(info?.receiptIds);
           this.failurePolicy.onTurnSucceeded(info);
           this.decisionPolicy?.onTurnSucceeded(info);
         },
         onTurnAbandoned: (info) => {
           this.actions.resetLoopGuard();
           void this.actions.clearTemporaryReactions('turn_end', this.keepReactions());
+          this.tasks?.retryReportReceipts(info?.receiptIds);
         },
         // A turn the loop breaker ended: no failure notice, and what it held
         // and left undecided comes back once (on any instance).
         onTurnStopped: (info) => {
           this.actions.resetLoopGuard();
           void this.actions.clearTemporaryReactions('turn_end', this.keepReactions());
+          this.tasks?.retryReportReceipts(info?.receiptIds);
           this.decisionPolicy?.onTurnStopped(info);
         },
         recordActivity: (kind, fields) => this.recordSystemActivity(kind, fields),

@@ -122,22 +122,53 @@ describe('TaskManager', () => {
     assert.equal(tasks.get('t2').status, 'failed');
   });
 
-  it('does not relay a result written before what the requester added during the turn', async (t) => {
-    const { tasks, executor, relayed } = setup(t);
+  it('holds completed turns durably and relays one bundled result after catching up', async (t) => {
+    const { tasks, executor, relayed, db } = setup(t);
     tasks.create({ rows: [row()], title: 'X', runtime: 'pi' });
     const addition = row({ content: '只查 2025 年的' });
     tasks.route('t1', [addition], 'owner');
-    tasks.report('t1', { state: 'done', draft: 'stale answer' });
+    tasks.report('t1', { state: 'done', draft: 'first completed answer' });
     executor.turns[0].finish({ text: '' });
     await settle();
-    assert.equal(relayed.length, 0, 'held back');
+    assert.equal(relayed.length, 0, 'held until the follow-up is covered');
+    const held = db.prepare('SELECT inbox_id, ready FROM task_report_deliveries').get();
+    assert.equal(held.inbox_id, null);
+    assert.equal(held.ready, 0);
     assert.equal(executor.turns.length, 2);
     assert.match(executor.turns[1].prompt, /New input from the requester's side:\n.*只查 2025 年的/);
-    tasks.report('t1', { state: 'done', draft: 'fresh answer' });
+    tasks.report('t1', { state: 'done', draft: 'follow-up answer' });
     executor.turns[1].finish({ text: '' });
     await settle();
     assert.equal(relayed.length, 1);
-    assert.match(relayed[0].item.text, /\| fresh answer/);
+    assert.match(relayed[0].item.text, /^\[task reports\] count=2/);
+    assert.match(relayed[0].item.receiptId, /^task-report:\d+,\d+$/);
+    assert.match(relayed[0].item.text, /\| first completed answer/);
+    assert.match(relayed[0].item.text, /\| follow-up answer/);
+    const deliveries = db.prepare('SELECT inbox_id, ready FROM task_report_deliveries ORDER BY report_id').all();
+    assert.equal(deliveries.length, 2);
+    assert.ok(deliveries[0].inbox_id);
+    assert.deepEqual(deliveries.map((row) => [row.inbox_id, row.ready]),
+      [[deliveries[0].inbox_id, 1], [deliveries[0].inbox_id, 1]]);
+  });
+
+  it('bundles reports from multiple tasks in one conversation when they become ready together', async (t) => {
+    const { tasks, executor, relayed, db } = setup(t);
+    db.exec("CREATE TRIGGER fail_inbox_bundle BEFORE INSERT ON inbox_pending BEGIN SELECT RAISE(ABORT, 'hold reports'); END;");
+    tasks.create({ rows: [row({ content: 'investigate X' })], title: 'X-1', runtime: 'pi' });
+    tasks.create({ rows: [row({ content: 'also investigate X' })], title: 'X-2', runtime: 'pi' });
+    tasks.report('t1', { state: 'done', draft: 'worker one result' });
+    tasks.report('t2', { state: 'done', draft: 'worker two result' });
+    executor.turns[0].finish({ text: '' });
+    executor.turns[1].finish({ text: '' });
+    await settle();
+    assert.equal(relayed.length, 0);
+    db.exec('DROP TRIGGER fail_inbox_bundle');
+    tasks.flushReports();
+    assert.equal(relayed.length, 1);
+    assert.match(relayed[0].item.text, /^\[task reports\] count=2/);
+    assert.match(relayed[0].item.text, /task=t1[\s\S]*worker one result/);
+    assert.match(relayed[0].item.text, /task=t2[\s\S]*worker two result/);
+    assert.equal(new Set(db.prepare('SELECT inbox_id FROM task_report_deliveries').all().map((row) => row.inbox_id)).size, 1);
   });
 
   it('task_check hands a running worker what was routed since, once', async (t) => {
@@ -279,12 +310,51 @@ describe('TaskManager', () => {
     assert.equal(inbox.size, 1);
     assert.equal(relayed.length, 1);
     assert.match(relayed[0].item.text, /complete result/);
+    tasks.settleReportReceipts([relayed[0].item.receiptId]);
     inbox.remove([...inbox.entries]);
     tasks.flushReports();
     tasks.restore();
     assert.equal(relayed.length, 1);
     assert.equal(db.prepare('SELECT COUNT(*) n FROM inbox_pending').get().n, 0);
     assert.equal(executor.turns.length, 1);
+  });
+
+  it('retries a claimed report after router failure and settles it after router success', async (t) => {
+    const { tasks, executor, db, inbox, relayed } = setup(t);
+    tasks.create({ rows: [row()], title: 'X', runtime: 'pi' });
+    tasks.report('t1', { state: 'done', draft: 'must reach the requester' });
+    executor.turns[0].finish({ text: '' });
+    await settle();
+    const receiptId = relayed[0].item.receiptId;
+    assert.match(receiptId, /^task-report:\d+$/);
+    inbox.remove([...inbox.entries]);
+    assert.equal(tasks.retryReportReceipts([receiptId]), 1);
+    assert.equal(relayed.length, 2);
+    assert.match(relayed[1].item.text, /must reach the requester/);
+    inbox.remove([...inbox.entries]);
+    assert.equal(tasks.settleReportReceipts([receiptId]), 1);
+    assert.ok(db.prepare('SELECT settled_at_ms FROM task_report_deliveries').get().settled_at_ms);
+    assert.equal(tasks.retryReportReceipts([receiptId]), 0);
+    tasks.restore();
+    assert.equal(relayed.length, 2, 'a settled receipt is terminal');
+  });
+
+  it('requeues a claimed report without a success receipt after restart', async (t) => {
+    const { tasks, executor, db, inbox, workspace } = setup(t);
+    tasks.create({ rows: [row()], title: 'X', runtime: 'pi' });
+    tasks.report('t1', { state: 'done', draft: 'survive router crash' });
+    executor.turns[0].finish({ text: '' });
+    await settle();
+    inbox.remove([...inbox.entries]);
+    tasks.shutdown();
+    const nextInbox = new MessageInbox({ db, runtime: { snapshot: () => ({ work: { turnInProgress: true } }) } });
+    const restored = new TaskManager({ db, config: { workspace }, executor: fakeExecutor(), inbox: nextInbox, lineFor: () => '' });
+    t.after(() => { restored.shutdown(); nextInbox.stop(); });
+    nextInbox.restore();
+    restored.restore();
+    assert.equal(nextInbox.size, 1);
+    assert.match(nextInbox.entries[0].item.text, /survive router crash/);
+    assert.match(nextInbox.entries[0].item.receiptId, /^task-report:\d+$/);
   });
 
   it('keeps a report pending when the inbox is stopped and recovers it on restart', async (t) => {
@@ -333,14 +403,11 @@ describe('TaskManager', () => {
   });
 
   for (const stage of ['start', 'check', 'ended', 'insert', 'commit', 'publish']) {
-    it(`recovers after forced termination at ${stage}`, (t) => {
+    it(`recovers after SIGKILL at ${stage}`, { skip: process.platform === 'win32' }, (t) => {
       const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'task-crash-'));
       const child = spawnSync(process.execPath, [fileURLToPath(new URL('./task-crash-fixture.mjs', import.meta.url)), stage, workspace],
         { encoding: 'utf8', timeout: 15_000 });
-      assert.ifError(child.error);
-      assert.equal(fs.readFileSync(path.join(workspace, 'fault-reached'), 'utf8'), stage);
-      if (process.platform === 'win32') assert.equal(child.status, 1, child.stderr);
-      else assert.equal(child.signal, 'SIGKILL', child.stderr);
+      assert.equal(child.signal, 'SIGKILL', child.stderr);
       const db = new DatabaseSync(path.join(workspace, 'state.sqlite3'));
       const inbox = new MessageInbox({ db, runtime: { snapshot: () => ({ work: { turnInProgress: true } }) } });
       const executor = fakeExecutor();

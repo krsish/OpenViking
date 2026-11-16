@@ -28,8 +28,9 @@ export const WORKER_SLOTS = 3;
 export const RESERVED_SLOTS = 1;
 // Ended tasks kept in the working set the router is shown; live ones always are.
 export const RECENT_ENDED = 32;
-// Worker turns in a row that may run to catch up with inputs that arrived
-// during the previous one before its report is relayed anyway.
+// Worker turns in a row that may run to catch up with requester inputs that
+// arrived during the previous one. Completed reports are held durably and
+// released to the router together when the task catches up.
 const CATCH_UP_TURNS = 3;
 const TRANSIENT_RETRIES = 2;
 const SUMMARY_CHARS = 600;
@@ -97,12 +98,15 @@ const SCHEMA = `
     created_at_ms INTEGER NOT NULL,
     relayed_at_ms INTEGER
   );
-  -- Durable intent to deliver a selected final report, never a progress or
-  -- superseded report. Retained after delivery as the report -> inbox receipt.
+  -- Durable intent to deliver a turn's selected final report, never a progress
+  -- or same-turn superseded report. Retained after delivery as the report ->
+  -- inbox receipt.
   CREATE TABLE IF NOT EXISTS task_report_deliveries (
     report_id INTEGER PRIMARY KEY,
     inbox_id INTEGER,
-    created_at_ms INTEGER NOT NULL
+    created_at_ms INTEGER NOT NULL,
+    ready INTEGER NOT NULL DEFAULT 1,
+    settled_at_ms INTEGER
   );
 `;
 
@@ -155,6 +159,17 @@ export class TaskManager {
     if (!inbox || inbox.db !== db) throw new TypeError('inbox must share the task database');
     Object.assign(this, { db, config, executor, inbox, lineFor, logger, recordActivity, slots, reservedSlots, now });
     this.db.exec(SCHEMA);
+    const deliveryColumns = this.db.prepare('PRAGMA table_info(task_report_deliveries)').all().map((column) => column.name);
+    if (!deliveryColumns.includes('ready')) {
+      this.db.exec('ALTER TABLE task_report_deliveries ADD COLUMN ready INTEGER NOT NULL DEFAULT 1');
+    }
+    if (!deliveryColumns.includes('settled_at_ms')) {
+      this.db.exec('ALTER TABLE task_report_deliveries ADD COLUMN settled_at_ms INTEGER');
+      // Deliveries created by an older daemon had no runtime receipt. Preserve
+      // their prior terminal meaning instead of replaying historical replies.
+      this.db.exec(`UPDATE task_report_deliveries SET settled_at_ms = created_at_ms
+        WHERE inbox_id IS NOT NULL`);
+    }
     // Worker authority tokens: token -> task id, for the turn that holds it.
     this.tokens = new Map();
     // Tasks with a turn to run, in the order they asked for it.
@@ -528,13 +543,19 @@ export class TaskManager {
       report = this.db.prepare('SELECT * FROM task_reports WHERE id = ?').get(id);
       if (!result.error && result.text) this.db.prepare('UPDATE tasks SET draft = ? WHERE id = ?').run(clip(result.text, 20_000), taskId);
     }
-    // Task-level freshness: what the requester added during the turn must be
-    // in the result before it is relayed.
+    // A requester update that arrived during this turn gets another worker
+    // turn before the router sees a result. Keep this completed report as a
+    // durable, held delivery: the catch-up turn's report will release both in
+    // one router input, so neither work nor context is lost or repeated.
     const fresh = this.undelivered(taskId).filter((row) => row.role === 'owner');
     const caught = this.catchUp.get(taskId) ?? 0;
     if (!result.error && fresh.length > 0 && caught < CATCH_UP_TURNS) {
+      this.transaction(() => {
+        this.db.prepare(`INSERT OR IGNORE INTO task_report_deliveries(report_id, created_at_ms, ready)
+          VALUES (?, ?, 0)`).run(report.id, this.now());
+        this.setStatus(taskId, 'queued');
+      });
       this.catchUp.set(taskId, caught + 1);
-      this.setStatus(taskId, 'queued');
       this.request(taskId);
       return;
     }
@@ -543,7 +564,10 @@ export class TaskManager {
     // atomic. A failed inbox write leaves this durable outbox available to retry.
     this.transaction(() => {
       this.setStatus(taskId, STATUS_FOR[report.state] ?? 'done');
-      this.db.prepare('INSERT OR IGNORE INTO task_report_deliveries(report_id, created_at_ms) VALUES (?, ?)').run(report.id, this.now());
+      this.db.prepare(`INSERT OR IGNORE INTO task_report_deliveries(report_id, created_at_ms, ready)
+        VALUES (?, ?, 1)`).run(report.id, this.now());
+      this.db.prepare(`UPDATE task_report_deliveries SET ready = 1 WHERE inbox_id IS NULL
+        AND report_id IN (SELECT id FROM task_reports WHERE task_id = ?)`).run(taskId);
     });
     this.flushReports();
     if (!result.error && this.undelivered(taskId).some((row) => row.role === 'owner')) {
@@ -552,50 +576,116 @@ export class TaskManager {
     }
   }
 
-  relayReport(task, report) {
-    const text = [
+  reportText(task, report) {
+    return [
       `[task report] task=${task.id} state=${report.state} title="${oneLine(clip(task.title, 80))}" requester=${metadataTag(task.requester_name ?? 'unknown')}${report.structured ? '' : ' unstructured=1'}`,
       `origin: ${task.origin_chat ? `chat=${chatTag(metadataTag(task.origin_chat), task.origin_thread)} ` : ''}source=${task.origin_source} msg=${metadataTag(task.origin_message ?? '')} event=${metadataTag(task.origin_event ?? '')}`,
       ...(report.summary ? ['summary:', quoted(clip(report.summary, SUMMARY_CHARS))] : []),
       ...(report.draft ? ['draft:', quoted(report.draft)] : []),
       ...(report.question ? ['question:', quoted(clip(report.question, SUMMARY_CHARS))] : []),
     ].join('\n');
+  }
+
+  reportIdsFromReceipts(receiptIds = []) {
+    const ids = new Set();
+    for (const value of receiptIds) {
+      const match = /^task-report:([0-9]+(?:,[0-9]+)*)$/.exec(String(value));
+      if (!match) continue;
+      for (const id of match[1].split(',').map(Number)) if (Number.isSafeInteger(id) && id > 0) ids.add(id);
+    }
+    return [...ids];
+  }
+
+  settleReportReceipts(receiptIds = []) {
+    const ids = this.reportIdsFromReceipts(receiptIds);
+    if (ids.length === 0) return 0;
+    let changed = 0;
+    this.transaction(() => {
+      const settle = this.db.prepare(`UPDATE task_report_deliveries SET settled_at_ms = ?
+        WHERE report_id = ? AND inbox_id IS NOT NULL AND settled_at_ms IS NULL`);
+      for (const id of ids) changed += settle.run(this.now(), id).changes;
+    });
+    return changed;
+  }
+
+  retryReportReceipts(receiptIds = []) {
+    const ids = this.reportIdsFromReceipts(receiptIds);
+    if (ids.length === 0) return 0;
+    let changed = 0;
+    this.transaction(() => {
+      const retry = this.db.prepare(`UPDATE task_report_deliveries SET inbox_id = NULL
+        WHERE report_id = ? AND settled_at_ms IS NULL`);
+      const unrelay = this.db.prepare('UPDATE task_reports SET relayed_at_ms = NULL WHERE id = ?');
+      for (const id of ids) {
+        const result = retry.run(id);
+        changed += result.changes;
+        if (result.changes) unrelay.run(id);
+      }
+    });
+    this.flushReports();
+    return changed;
+  }
+
+  relayReports(entries) {
+    const [{ task: firstTask }] = entries;
+    const receiptId = `task-report:${entries.map(({ report }) => report.id).join(',')}`;
+    const text = entries.length === 1 ? this.reportText(entries[0].task, entries[0].report) : [
+      `[task reports] count=${entries.length}`,
+      'These completed reports became ready together in one conversation. Settle every task. Merge reports about the same request into one reply and remove repeated content; keep unrelated requests separate.',
+      ...entries.flatMap(({ task, report }, index) => [`report ${index + 1}:`, this.reportText(task, report)]),
+    ].join('\n');
     const item = {
       text,
       seq: null,
-      scopeKey: task.origin_scope,
+      receiptId,
+      scopeKey: firstTask.origin_scope,
       chatType: 'p2p',
-      scope: { kind: 'task', key: task.origin_scope },
+      scope: { kind: 'task', key: firstTask.origin_scope },
     };
     const meta = {
-      chatId: task.origin_chat, threadId: task.origin_thread, source: task.origin_source, instance: task.origin_instance,
-      kind: 'task.report', chatType: task.origin_chat_type, from: `task ${task.id}`,
+      chatId: firstTask.origin_chat, threadId: firstTask.origin_thread, source: firstTask.origin_source, instance: firstTask.origin_instance,
+      kind: 'task.report', chatType: firstTask.origin_chat_type, from: entries.map(({ task }) => `task ${task.id}`).join(','),
     };
     const entry = this.transaction(() => {
-      const delivery = this.db.prepare('SELECT * FROM task_report_deliveries WHERE report_id = ?').get(report.id);
-      if (!delivery || delivery.inbox_id != null) return null;
+      for (const { report } of entries) {
+        const delivery = this.db.prepare('SELECT * FROM task_report_deliveries WHERE report_id = ?').get(report.id);
+        if (!delivery || delivery.inbox_id != null || !delivery.ready) return null;
+      }
       const entry = this.inbox.persist(item, meta);
-      this.db.prepare('UPDATE task_reports SET relayed_at_ms = ? WHERE id = ?').run(this.now(), report.id);
-      this.db.prepare('UPDATE task_report_deliveries SET inbox_id = ? WHERE report_id = ?').run(entry.id, report.id);
+      for (const { report } of entries) {
+        this.db.prepare('UPDATE task_reports SET relayed_at_ms = ? WHERE id = ?').run(this.now(), report.id);
+        this.db.prepare('UPDATE task_report_deliveries SET inbox_id = ? WHERE report_id = ?').run(entry.id, report.id);
+      }
       return entry;
     });
     if (entry) {
       this.inbox.publish(entry);
-      this.recordActivity('task.reported', { summary: `${task.id} ${report.state}`, inboundSeq: task.origin_seq,
-        metadata: { task: task.id, state: report.state, structured: Boolean(report.structured) } });
+      const latestByTask = new Map(entries.map((value) => [value.task.id, value]));
+      for (const { task, report } of latestByTask.values()) {
+        this.recordActivity('task.reported', { summary: `${task.id} ${report.state}`, inboundSeq: task.origin_seq,
+          metadata: { task: task.id, state: report.state, structured: Boolean(report.structured), bundled: entries.length } });
+      }
     }
   }
 
   flushReports() {
     if (this.stopped) return;
     let failed = false;
+    const groups = new Map();
     for (const report of this.db.prepare(`SELECT r.* FROM task_report_deliveries d JOIN task_reports r ON r.id = d.report_id
-      WHERE d.inbox_id IS NULL ORDER BY r.id`).all()) {
+      WHERE d.inbox_id IS NULL AND d.ready = 1 ORDER BY r.id`).all()) {
+      const task = this.get(report.task_id);
+      if (!task) continue;
+      const group = groups.get(task.origin_scope) ?? [];
+      group.push({ task, report });
+      groups.set(task.origin_scope, group);
+    }
+    for (const entries of groups.values()) {
       try {
-        this.relayReport(this.get(report.task_id), report);
+        this.relayReports(entries);
       } catch (error) {
         failed = true;
-        this.logger?.error('task_report_relay_failed', { task: report.task_id, error: safeError(error) });
+        this.logger?.error('task_report_relay_failed', { tasks: entries.map(({ task }) => task.id), error: safeError(error) });
       }
     }
     if (failed && !this.reportRetry) {
@@ -609,6 +699,17 @@ export class TaskManager {
   restore() {
     this.transaction(() => {
       this.db.exec('DELETE FROM task_input_claims');
+      // A report claimed by a router turn has no inbox row. Without a success
+      // receipt that claim is ambiguous after restart, so make it deliverable
+      // again. A completed outbound decision remains idempotent in the outbox.
+      this.db.exec(`UPDATE task_reports SET relayed_at_ms = NULL WHERE id IN (
+        SELECT d.report_id FROM task_report_deliveries d
+        WHERE d.ready = 1 AND d.settled_at_ms IS NULL AND d.inbox_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM inbox_pending i WHERE i.id = d.inbox_id)
+      )`);
+      this.db.exec(`UPDATE task_report_deliveries SET inbox_id = NULL
+        WHERE ready = 1 AND settled_at_ms IS NULL AND inbox_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM inbox_pending i WHERE i.id = task_report_deliveries.inbox_id)`);
       // Also recover final reports left unmarked by versions before the
       // durable outbox. Only the latest final report of a settled task is eligible.
       this.db.prepare(`INSERT OR IGNORE INTO task_report_deliveries(report_id, created_at_ms)
